@@ -1,2 +1,86 @@
-# nexusdownloader
-A better Nexus Downloader
+# NexusDownloader
+
+Welcome to **NexusDownloader** – your streamlined, no-frills solution for downloading Nexus Mods faster and more efficiently than traditional tools like Nexus Vortex. By keeping things simple and cutting out the excess, NexusDownloader aims to get you what you need without the clutter of a full user interface.
+
+## Why NexusDownloader?
+
+- **Speed and Efficiency**: Designed to work swiftly in the background, it lets you download mods without any waiting around for unnecessary User Interface components.
+- **Lightweight and Focused**: No complicated user interface means less overhead and a cleaner, dedicated downloading experience.
+- **Straight to the Point**: Whether you're a seasoned modder or a newcomer to the scene, NexusDownloader is built to be intuitive and hassle-free.
+- **Intended for use with large Collections**: Large collections are becoming more common on Nexus, but who wants to wait hours for Vortex to download when you can download all the mods in minutes?
+
+## Features
+
+- **Background Operation**: Runs quietly in the background, ensuring you can focus on modding without distractions.
+- **Optimized Downloads**: Streamlined functionality that prioritizes speed and reliability over fancy displays.
+- **Simple Setup**: Easy to integrate with your workflow, making mod downloads smoother and less complicated.
+
+## Getting Started
+I assume you already have python installed, if not, you need to install the latest version from here: https://www.python.org/downloads/
+Bsaed on my research, you do not have to have Nexus Premium User License to get an API Key.
+
+To set up NexusDownloader, follow these simple steps:
+
+1. **Clone the Repository** (Or download the files from the SRC folder)  
+   ```bash
+   git clone https://github.com/jarvann/nexusdownloader.git
+
+
+2. **Go to Nexus and Get or Create your API Key**:
+   * Open Nexus to the following URL: https://next.nexusmods.com/settings/api-keys
+   * Look for "Nexus Mod Manager" Integration, and if necessary, create the key.
+   * Copy the API key for "Nexus Mod Manager" Integration.
+   * Open the config.json fiel located in the ~/nexusdownloader/src folder
+   * Paste the API key in between the quotes for "NexusAPIKey"
+   ```json
+    {
+        "AccessControl": {
+            "NexusAPIKey": "{YOUR API KEY}"
+        }
+    }
+3. **Open Vortex on your machine**
+4. **Configure (or Confirm) your Mods Download folder in Vortex**
+5. **Copy the root folder (not including the game name) and paste it into the DownloadsFolderRoot the config file:**
+    ```json
+    {
+        "VortexSettings" : {
+            "DownloadsFolderRoot": "",
+        }
+    }
+
+## Running the app
+
+### Get the Path to your collection.json
+1. You need to have Nexus Vortex installed, sorry, can't get around this.
+2. Download and enable the collection you want to download in Vortex, but do not start the installation **THIS IS IMPORTANT**
+3. Go to the Mods tab in Vortex
+   * Find Mod for that collection
+   * Right Click, and select "Open in File Manager" (File Explorer window should open and you should see collection.json)
+   * Click on the file to select it
+   * Right-Click the file and in the context menu, select "Copy As Path"
+   * Recommend pasting it into Notepad or other text editor to verify the path.
+4. Close Vortex
+
+### Get the GAMEID from Nexus for the Game you want to mod
+1. Open Vortex (or maybe you still have it open from before)
+2. Click on the Settings tab on the left side.
+3. In the settings, click on the "Mods" tab in the middle top.
+4. In the "Mod Staging folder", look at the rendered path, and then pick the last folder name. 
+   * Example: c:\VortexMods\cyberpunk2077
+   * Example: c:\VortexMods\skyrimse
+5. The last folder ("cyberpunk2077" or "skyrimse") is typically the Game ID. 
+6. Make a note of the Game ID
+
+### Running the downloader
+**I highly recommend you make sure Vortex is closed when you do this**
+1. Open a terminal or command prompt and change the director (cd XXX) to where the python files are located
+   ```powershell
+   cd c:\ThePlaceIPutNexusDownloader\src
+2. Type the following command:
+   ```powershell
+   py .\loadcollection.py "{PASTE PATH TO COLLECTION.JSON FILE HERE}"  [NumberOfThreads]
+3. You will paste the path to the collection.json file as the first parameter. I recommend using the full file path.
+4. You will provide the number of Download Threads you would like to use for the second parameter. I don't recommend going above 15 personally.
+5. Example:
+   ```powershell
+   py .\loadcollection.py "C:\VortexMods\cyberpunk2077\DYSTOPIA-An-NSFW-AIO-pack-by-dae-492875-7-1749633328\collection.json"  10
