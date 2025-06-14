@@ -61,16 +61,6 @@ To set up NexusDownloader, follow these simple steps:
    * Recommend pasting it into Notepad or other text editor to verify the path.
 4. Close Vortex
 
-### Get the GAMEID from Nexus for the Game you want to mod
-1. Open Vortex (or maybe you still have it open from before)
-2. Click on the Settings tab on the left side.
-3. In the settings, click on the "Mods" tab in the middle top.
-4. In the "Mod Staging folder", look at the rendered path, and then pick the last folder name. 
-   * Example: c:\VortexMods\cyberpunk2077
-   * Example: c:\VortexMods\skyrimse
-5. The last folder ("cyberpunk2077" or "skyrimse") is typically the Game ID. 
-6. Make a note of the Game ID
-
 ### Running the downloader
 **I highly recommend you make sure Vortex is closed when you do this**
 1. Open a terminal or command prompt and change the director (cd XXX) to where the python files are located
