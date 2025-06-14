@@ -84,3 +84,22 @@ To set up NexusDownloader, follow these simple steps:
 5. Example:
    ```powershell
    py .\loadcollection.py "C:\VortexMods\cyberpunk2077\DYSTOPIA-An-NSFW-AIO-pack-by-dae-492875-7-1749633328\collection.json"  10
+
+6. Watch the output:
+   * I will tell you how many downloads to expect at the beginning.
+   * The system will spawn the number of threads that you set in the command line.
+   * System manages the threads, each one will spawn a download for one of the files.
+   * The system will make two web requests for each download
+     ** One to get the download URI (this counts against the daily max API calls)
+     ** One to download the file.
+   * When the download completes, you will see it in the Vortex download folder for that game
+   * I have put timers in for each download, and one timer for the whole system.
+7. When download is complete, you can close the command line.
+
+## Finish installing the collection
+1. Open Vortex
+2. Give it a moment, the Vortex client will notice all of the new downloads and add them to the catalog. You are back in slow Vortex, so please be patient, this isn't my fault.
+3. Open the Collection Tab.
+4. Install the Collection
+   * The collection will recognize all of the downloads and not try to redownload them
+   * Offsite mods may not work, so those likely will still need to be downloaded
