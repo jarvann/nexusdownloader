@@ -16,8 +16,8 @@ Welcome to **NexusDownloader** – your streamlined, no-frills solution for down
 - **Simple Setup**: Easy to integrate with your workflow, making mod downloads smoother and less complicated.
 
 ## Getting Started
-I assume you already have python installed, if not, you need to install the latest version from here: https://www.python.org/downloads/
-Bsaed on my research, you do not have to have Nexus Premium User License to get an API Key.
+* I assume you already have python installed, if not, you need to install the latest version from here: https://www.python.org/downloads/
+* Based on my research, you do not have to have Nexus Premium User License to get an API Key.
 
 To set up NexusDownloader, follow these simple steps:
 
