@@ -80,8 +80,8 @@ To set up NexusDownloader, follow these simple steps:
    * The system will spawn the number of threads that you set in the command line.
    * System manages the threads, each one will spawn a download for one of the files.
    * The system will make two web requests for each download
-     ** One to get the download URI (this counts against the daily max API calls)
-     ** One to download the file.
+     * One to get the download URI (this counts against the daily max API calls)
+     * One to download the file.
    * When the download completes, you will see it in the Vortex download folder for that game
    * I have put timers in for each download, and one timer for the whole system.
 7. When download is complete, you can close the command line.
