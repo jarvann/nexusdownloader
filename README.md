@@ -30,7 +30,7 @@ To set up NexusDownloader, follow these simple steps:
    * Open Nexus to the following URL: https://next.nexusmods.com/settings/api-keys
    * Look for "Nexus Mod Manager" Integration, and if necessary, create the key.
    * Copy the API key for "Nexus Mod Manager" Integration.
-   * Open the config.json fiel located in the ~/nexusdownloader/src folder
+   * Open the config.json file located in the ~/nexusdownloader/src folder
    * Paste the API key in between the quotes for "NexusAPIKey"
    ```json
     {
@@ -52,7 +52,7 @@ To set up NexusDownloader, follow these simple steps:
 
 ### Get the Path to your collection.json
 1. You need to have Nexus Vortex installed, sorry, can't get around this.
-2. Download and enable the collection you want to download in Vortex, but do not start the installation **THIS IS IMPORTANT**
+2. Download and enable the collection you want to download in Vortex, but do not start the installation (**THIS IS IMPORTANT**)
 3. Go to the Mods tab in Vortex
    * Find Mod for that collection
    * Right Click, and select "Open in File Manager" (File Explorer window should open and you should see collection.json)
