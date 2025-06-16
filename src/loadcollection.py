@@ -1,6 +1,7 @@
 import json
 import argparse
 import concurrent.futures
+from endorse import endorse_mod  # Importing the endorse function from endorse.py
 from download import download_file  # Importing the download function from download.py
 import threading
 import time
@@ -40,12 +41,11 @@ def load_mods_from_json(file_path):
 
 
 # Main function to execute concurrent downloads
-def main(json_file, max_threads=10):
+def main(mods, max_threads=10):
     overall_start = time.time()
 
     # Load mods from the provided JSON file
-    mods = load_mods_from_json(json_file)
-    print(f"Loaded {len(mods)} mods from the JSON file.")
+
 
     # Using ThreadPoolExecutor to download files asynchronously, max 10 threads
     with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_threads)) as executor:
@@ -70,10 +70,28 @@ def main(json_file, max_threads=10):
 if __name__ == '__main__':
     # Set up argument parsing
     parser = argparse.ArgumentParser(description="Parse JSON and download mods asynchronously")
-    parser.add_argument('json_file', help="Path to the JSON file containing mod data")
-    parser.add_argument('max_threads', help="The total number of active download threads you want, it's 1:1 for files",
-                        default=10)
+    parser.add_argument('--json', help="Path to the JSON file containing mod data", required=False, default='')
+    parser.add_argument('--max_threads', help="The total number of active download threads you want, it's 1:1 for files",
+                        required=False, default=10)
+    parser.add_argument('--endorseonly', help="Endorse mods only without downloading them", default=False)
     args = parser.parse_args()
 
-    # Run the main function with the provided JSON file
-    main(args.json_file, args.max_threads)
+    mods = load_mods_from_json(args.json) 
+    print(f"Loaded {len(mods)} mods from the JSON file.")
+    
+    if args.endorseonly:
+        print("Endorsing mods only, no downloads will be performed.")
+        for mod_id, file_id in mods:
+            endorse_mod(GAME_DOMAIN, mod_id, file_id)
+        print("Finished endorsing all mods.")
+        exit(0)
+    else:
+        # Run the main function with the provided JSON file
+        main(mods, args.max_threads)
+
+        print("Finished processing all mods. Do you want to endorse them? (y/n)")
+        endorse = input().strip().lower()
+
+        if endorse == 'y':
+            for mod_id, file_id in mods:
+                endorse_mod(GAME_DOMAIN, mod_id, file_id)
