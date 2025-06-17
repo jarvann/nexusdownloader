@@ -17,6 +17,10 @@ Welcome to **NexusDownloader** – your streamlined, no-frills solution for down
 
 ## Getting Started
 * I assume you already have python installed, if not, you need to install the latest version from here: https://www.python.org/downloads/
+   * If you are installing python for the first time, after the installation, open a shell to the location that you downloaded the files
+   * Run this command: 
+   ```bash
+   pip install -r requirements.txt
 * Based on my research, you do not have to have Nexus Premium User License to get an API Key.
 
 To set up NexusDownloader, follow these simple steps:
