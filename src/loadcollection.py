@@ -87,7 +87,7 @@ if __name__ == '__main__':
     parser.add_argument('--json', help="Path to the JSON file containing mod data", required=False, default='')
     parser.add_argument('--maxthreads', help="The total number of active download threads you want, it's 1:1 for files",
                         required=False, default=10)
-    parser.add_argument('--endorseonly', help="Endorse mods only without downloading them", default=False)
+    parser.add_argument('--endorseonly', action='store_true', help="Endorse mods only without downloading them", default=False)
     args = parser.parse_args()
 
     mods = load_mods_from_json(args.json) 
