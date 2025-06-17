@@ -17,9 +17,12 @@ Welcome to **NexusDownloader** – your streamlined, no-frills solution for down
 
 ## Getting Started
 * I assume you already have python installed, if not, you need to install the latest version from here: https://www.python.org/downloads/
-   * If you are installing python for the first time, after the installation, open a shell to the location that you downloaded the files
-   * Run this command: 
+   * If you are installing python for the first time, I highly recommend you add the Python directory to your PATH environment variables. The instructions below assume that.
+   * After the installation, open a shell to the location that you downloaded the files
+   * Run these two commands: 
    ```bash
+   python -m pip install --upgrade pip
+
    pip install -r requirements.txt
 * Based on my research, you do not have to have Nexus Premium User License to get an API Key.
 
@@ -28,8 +31,6 @@ To set up NexusDownloader, follow these simple steps:
 1. **Clone the Repository** (Or download the files from the SRC folder)  
    ```bash
    git clone https://github.com/jarvann/nexusdownloader.git
-
-
 2. **Go to Nexus and Get or Create your API Key**:
    * Open Nexus to the following URL: https://next.nexusmods.com/settings/api-keys
    * Look for "Nexus Mod Manager" Integration, and if necessary, create the key.

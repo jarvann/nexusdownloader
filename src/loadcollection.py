@@ -84,10 +84,10 @@ def endorse_mods(mods, max_threads=10):
 if __name__ == '__main__':
     # Set up argument parsing
     parser = argparse.ArgumentParser(description="Parse JSON and download mods asynchronously")
-    parser.add_argument('--json', help="Path to the JSON file containing mod data", required=False, default='')
-    parser.add_argument('--maxthreads', help="The total number of active download threads you want, it's 1:1 for files",
-                        required=False, default=10)
-    parser.add_argument('--endorseonly', action='store_true', help="Endorse mods only without downloading them", default=False)
+    parser.add_argument('-j', '--json', help="Path to the JSON file containing mod data", required=True, default='', type=str)
+    parser.add_argument('-t', '--maxthreads', help="The total number of active download threads you want, it's 1:1 for files",
+                        required=False, default=10, type=int)
+    parser.add_argument('-e', '--endorseonly', action='store_true', help="Endorse mods only without downloading them", default=False)
     args = parser.parse_args()
 
     mods = load_mods_from_json(args.json) 
