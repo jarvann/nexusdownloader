@@ -46,6 +46,7 @@ To set up NexusDownloader, follow these simple steps:
 3. **Open Vortex on your machine**
 4. **Configure (or Confirm) your Mods Download folder in Vortex**
 5. **Copy the root folder (not including the game name) and paste it into the DownloadsFolderRoot the config file:**
+   * Ensure that the file paths have double '\' character for each part of the path: "C:\\\VortexDownloads" and not "C:\VortexDownloads".
     ```json
     {
         "VortexSettings" : {
@@ -73,12 +74,13 @@ To set up NexusDownloader, follow these simple steps:
    cd c:\ThePlaceIPutNexusDownloader\src
 2. Type the following command:
    ```powershell
-   py .\loadcollection.py --json "{PASTE PATH TO COLLECTION.JSON FILE HERE}" --maxthreads [NumberOfThreads]
+   py .\loadcollection.py --json "{PASTE PATH TO COLLECTION.JSON FILE HERE}" --gamefolder "{JUST THE FOLDER NAME OF THE GAME IN THE VORTEX DOWNLOADS}" --maxthreads [NumberOfThreads]
 3. You will paste the path to the collection.json file as the first parameter. I recommend using the full file path.
 4. You will provide the number of Download Threads you would like to use for the second parameter. I don't recommend going above 15 personally.
 5. Example:
    ```powershell
-   py .\loadcollection.py --json "C:\VortexMods\cyberpunk2077\DYSTOPIA-An-NSFW-AIO-pack-by-dae-492875-7-1749633328\collection.json"  --maxthreads 15
+   py .\loadcollection.py --json "C:\VortexMods\cyberpunk2077\DYSTOPIA-An-NSFW-AIO-pack-by-dae-492875-7-1749633328\collection.json" --gamefolder "cyberpunk2077"  --maxthreads 15
+   py .\loadcollection.py --json "C:\VortexMods\skyrimse\DOMAIN-An-AE-NSFW-AIO-pack-by-dae-485687-195-1748399387\collection.json" --gamefolder "skyrimse"  --maxthreads 15
 
 6. **[Optional]**: If you would like to endorse the mods, you can do so at the end of the app run. The system will prompt you. I have noticed that there is a 24hr minimum from time of download for endorsing a mod, so it might not work immediately. You can type 'y' and hit enter to give it a shot. Assuming it doesn't work, and you are just altruistic because the Mod Authors deserve that recognition, wait a day or two, and then run the command like this, but adding the "--endorseonly" parameter. This will run the collection again, but with no downloads, and will use the number of threads you set, or 10 by default. It only takes a few seconds to run, but it will make a Mod Author's day!
    ```powershell

@@ -22,10 +22,10 @@ def get_download_url(game_domain, mod_id, file_id):
     return download_info[0]['URI'] if download_info else None
 
 
-def download_file(game_domain, mod_id, file_id, current_counter):
+def download_file(game_domain, gamefolder, mod_id, file_id, current_counter):
     download_start = time.time()
 
-    download_dir = f"{CONFIG.VortexSettings.DownloadsFolderRoot}\\{game_domain}"  # Path to where you want to download files (Vortex Downloads Folder)
+    download_dir = f"{CONFIG.VortexSettings.DownloadsFolderRoot}\\{gamefolder}"  # Path to where you want to download files (Vortex Downloads Folder)
     # Get download URL
     url = get_download_url(game_domain, mod_id, file_id)
     if not url:

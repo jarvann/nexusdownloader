@@ -41,7 +41,7 @@ def load_mods_from_json(file_path):
 
 
 # Main function to execute concurrent downloads
-def main(mods, max_threads=10):
+def main(mods, gamefolder, max_threads=10):
     overall_start = time.time()
 
     # Load mods from the provided JSON file
@@ -52,7 +52,7 @@ def main(mods, max_threads=10):
         futures = []
         for mod_id, file_id in mods:
             current_counter = increment()
-            futures.append(executor.submit(download_file, GAME_DOMAIN, mod_id, file_id, current_counter))
+            futures.append(executor.submit(download_file, GAME_DOMAIN, gamefolder, mod_id, file_id, current_counter))
 
         # Wait for all futures to complete
         for future in concurrent.futures.as_completed(futures):
@@ -84,6 +84,7 @@ def endorse_mods(mods, max_threads=10):
 if __name__ == '__main__':
     # Set up argument parsing
     parser = argparse.ArgumentParser(description="Parse JSON and download mods asynchronously")
+    parser.add_argument('-f', '--gamefolder', help="The folder name where the downloads will be saved. This needs to match Vortex", required=True, default='', type=str)
     parser.add_argument('-j', '--json', help="Path to the JSON file containing mod data", required=True, default='', type=str)
     parser.add_argument('-t', '--maxthreads', help="The total number of active download threads you want, it's 1:1 for files",
                         required=False, default=10, type=int)
@@ -99,7 +100,7 @@ if __name__ == '__main__':
         exit(0)
     else:
         # Run the main function with the provided JSON file
-        main(mods, args.maxthreads)
+        main(mods, args.gamefolder, args.maxthreads)
 
         print("Finished processing all mods. Do you want to endorse them? (y/n)")
         endorse = input().strip().lower()
