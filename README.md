@@ -14,7 +14,7 @@ Whether you prefer a click-and-go interface or want to automate everything from 
 - **Speed and Efficiency**: Designed to work swiftly in the background, it lets you download mods without any waiting around for unnecessary User Interface components.
 - **Lightweight and Focused**: No complicated user interface means less overhead and a cleaner, dedicated downloading experience.
 - **Straight to the Point**: Whether you're a seasoned modder or a newcomer to the scene, NexusDownloader is built to be intuitive and hassle-free.
-- **Intended for use with large Collections**: Large collections are becoming more common on Nexus, but who wants to wait hours for Vortex to download when you can download all the mods in minutes?
+- **Intended for use with large Collections**: Large collections are becoming more common on Nexus, but who wants to wait hours for Vortex to download when you can download all the mods in minutes? (Subject to your own bandwidth restrictions)
 
 ---
 
