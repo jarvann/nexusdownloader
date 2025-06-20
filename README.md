@@ -70,7 +70,7 @@ Whether you prefer a click-and-go interface or want to automate everything from 
              "NexusAPIKey": "YOUR_API_KEY_HERE"
          },
          "VortexSettings": {
-             "DownloadsFolderRoot": "C:\\VortexDownloads"
+             "DownloadsFolderRoot": "YOUR_DOWNLOAD_ROOT_FOLDER_HERE"
          }
      }
      ```
