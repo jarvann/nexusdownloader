@@ -1,9 +1,9 @@
 {
   "AccessControl": {
-    "NexusAPIKey": "{REPLACE_WITH_YOUR_API_KEY}"
+    "NexusAPIKey": "y2id62uLksxHWjEsfdEJ+Z5Kpiub81hiSbBEHTf9Hrj8--3dXbmDMj0j3zbEpl--MsraD9P700WqjlI2RHYw4A=="
   },
-  "VortexSettings" : {
-    "DownloadsFolderRoot": "{REPLACE_WITH_YOUR_FOLDER_ROOT}",
+  "VortexSettings": {
+    "DownloadsFolderRoot": "C:\\VortexDownloads",
     "ModsFolderRoot": "{NOT_USED}"
   }
 }

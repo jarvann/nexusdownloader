@@ -2,12 +2,18 @@ import os
 import requests
 import time
 from datetime import timedelta
-from config import get_config 
+from config import get_config
 
 CONFIG = get_config()
 
-def get_download_url(game_domain, mod_id, file_id):
+# Add this global variable to hold the logger instance
+LOGGER = None
 
+def set_download_logger(logger):
+    global LOGGER
+    LOGGER = logger
+
+def get_download_url(game_domain, mod_id, file_id):
     header = {
         'apikey': CONFIG.AccessControl.NexusAPIKey,
         'Accept': 'application/json',
@@ -21,15 +27,15 @@ def get_download_url(game_domain, mod_id, file_id):
     # Pick the first CDN link
     return download_info[0]['URI'] if download_info else None
 
-
 def download_file(game_domain, gamefolder, mod_id, file_id, current_counter):
     download_start = time.time()
 
-    download_dir = f"{CONFIG.VortexSettings.DownloadsFolderRoot}\\{gamefolder}"  # Path to where you want to download files (Vortex Downloads Folder)
+    download_dir = os.path.join(CONFIG.VortexSettings.DownloadsFolderRoot, gamefolder)
     # Get download URL
     url = get_download_url(game_domain, mod_id, file_id)
     if not url:
-        print(f"{str(current_counter).zfill(4)}\tNo download URL found for mod {mod_id}, file {file_id}")
+        if LOGGER:
+            LOGGER.verbose(f"{str(current_counter).zfill(4)}\tNo download URL found for mod {mod_id}, file {file_id}")
         return
 
     filename = os.path.basename(url.split('?')[0])
@@ -37,12 +43,14 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter):
 
     # Check if the file already exists
     if os.path.exists(file_path):
-        print(
-            f"{str(current_counter).zfill(4)}\tTime({timedelta(seconds=time.time() - download_start)})\tFile {filename} already exists. Skipping download.")
+        if LOGGER:
+            LOGGER.verbose(
+                f"{str(current_counter).zfill(4)}\tTime({timedelta(seconds=time.time() - download_start)})\tFile {filename} already exists. Skipping download.")
         return
 
-    print(
-        f"{str(current_counter).zfill(4)}\tTime({timedelta(seconds=time.time() - download_start)})\tDownloading {filename}...")
+    if LOGGER:
+        LOGGER.verbose(
+            f"{str(current_counter).zfill(4)}\tTime({timedelta(seconds=time.time() - download_start)})\tDownloading {filename}")
 
     # Proceed with downloading if the file doesn't exist
     with requests.get(url, stream=True) as r:
@@ -51,5 +59,6 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter):
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
 
-    print(
-        f"{str(current_counter).zfill(4)}\tTime({timedelta(seconds=time.time() - download_start)})\tDownloaded {filename} to {file_path}")
+    if LOGGER:
+        LOGGER.verbose(
+            f"{str(current_counter).zfill(4)}\tTime({timedelta(seconds=time.time() - download_start)})\tDownloaded {filename} to {file_path}")
