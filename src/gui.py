@@ -224,6 +224,27 @@ class MainWindow(QWidget):
         self.file_path_button.clicked.connect(self.pick_file)
         self.downloads_folder_button.clicked.connect(self.pick_downloads_folder)
 
+        # Check API key on startup
+        self.check_api_key_on_startup()
+
+    def check_api_key_on_startup(self):
+        api_key = ""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    api_key = config.get("AccessControl", {}).get("NexusAPIKey", "")
+            except Exception:
+                pass
+        # Basic check: Nexus API keys are typically 32+ hex chars, but you can adjust as needed
+        if not api_key or len(api_key.strip()) < 20:
+            QMessageBox.warning(
+                self,
+                "Configuration Required",
+                "Your Nexus API key is not set or invalid. Please configure the application before proceeding."
+            )
+            self.open_settings()
+
     def open_settings(self):
         dlg = SettingsDialog(self.config_path, self)
         if dlg.exec():
