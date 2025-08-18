@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+screenshots/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -199,3 +200,4 @@ mykeys.log
 build_dist/
 *.collection_resume.json
 .nexusdownloader_state/
+nul

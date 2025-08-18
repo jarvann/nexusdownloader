@@ -130,14 +130,49 @@ class Builder:
         dirs_to_clean = [self.dist_dir, self.build_dir]
         for dir_path in dirs_to_clean:
             if dir_path.exists():
-                shutil.rmtree(dir_path)
+                try:
+                    # Try to remove read-only attributes on Windows
+                    if self.system == "windows":
+                        self._make_writable(dir_path)
+                    shutil.rmtree(dir_path)
+                except PermissionError as e:
+                    self.log(f"Permission error cleaning {dir_path}: {e}", "WARNING")
+                    # Try alternative cleanup method
+                    if self.system == "windows":
+                        try:
+                            subprocess.run(f'rmdir /S /Q "{dir_path}"', shell=True, check=False)
+                        except:
+                            self.log(f"Could not clean {dir_path}. Please close any open files and try again.", "ERROR")
+                            return False
+                except Exception as e:
+                    self.log(f"Error cleaning {dir_path}: {e}", "WARNING")
         
         # Clean Python cache
         for cache_dir in self.root_dir.rglob("__pycache__"):
             shutil.rmtree(cache_dir, ignore_errors=True)
         
         for pyc_file in self.root_dir.rglob("*.pyc"):
-            pyc_file.unlink(ignore_errors=True)
+            pyc_file.unlink(missing_ok=True)
+    
+    def _make_writable(self, path):
+        """Make files writable on Windows"""
+        import stat
+        try:
+            for root, dirs, files in os.walk(path):
+                for dir_name in dirs:
+                    dir_path = os.path.join(root, dir_name)
+                    try:
+                        os.chmod(dir_path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+                    except:
+                        pass
+                for file_name in files:
+                    file_path = os.path.join(root, file_name)
+                    try:
+                        os.chmod(file_path, stat.S_IWRITE | stat.S_IREAD)
+                    except:
+                        pass
+        except Exception:
+            pass  # Ignore errors in permission changes
     
     def create_assets(self):
         """Create or verify assets directory"""

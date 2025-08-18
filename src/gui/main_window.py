@@ -803,18 +803,54 @@ class MainWindow(QMainWindow):
         self.logger = None
         if PHASE1_AVAILABLE:
             try:
-                # Use the repository's src/config.json (one level up from gui) so
-                # the GUI reads/writes the same configuration file shipped with the package.
-                config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../config.json")
+                # Handle both executable and source code environments
+                if getattr(sys, 'frozen', False):
+                    # Running as PyInstaller executable
+                    # Config should be in the same directory as the executable
+                    app_dir = os.path.dirname(sys.executable)
+                    config_path = os.path.join(app_dir, "config.json")
+                else:
+                    # Running from source - use src/config.json
+                    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../config.json")
                 
                 if not os.path.exists(config_path):
-                    # Provide a clear error message if the config file is missing
-                    QMessageBox.critical(
-                        self, "Configuration Error",
-                        f"The configuration file could not be found at the expected path:\n{config_path}\n\nPlease ensure 'config.json' exists in the 'src' directory."
-                    )
-                    # Exit gracefully if config is essential for startup
-                    sys.exit(1)
+                    # Try alternative locations for config file
+                    alternative_paths = []
+                    if getattr(sys, 'frozen', False):
+                        # For executable, also try next to the exe in a src folder
+                        app_dir = os.path.dirname(sys.executable)
+                        alternative_paths = [
+                            os.path.join(app_dir, "src", "config.json"),
+                            os.path.join(app_dir, "..", "src", "config.json")
+                        ]
+                    else:
+                        # For source, try current directory
+                        alternative_paths = [
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+                            os.path.join(os.getcwd(), "src", "config.json"),
+                            os.path.join(os.getcwd(), "config.json")
+                        ]
+                    
+                    # Try alternative locations
+                    config_found = False
+                    for alt_path in alternative_paths:
+                        if os.path.exists(alt_path):
+                            config_path = alt_path
+                            config_found = True
+                            break
+                    
+                    if not config_found:
+                        # Provide a clear error message if the config file is missing
+                        error_msg = f"The configuration file could not be found.\n\nSearched locations:\n- {config_path}"
+                        for alt_path in alternative_paths:
+                            error_msg += f"\n- {alt_path}"
+                        error_msg += "\n\nPlease ensure 'config.json' exists in one of these locations."
+                        
+                        QMessageBox.critical(
+                            self, "Configuration Error", error_msg
+                        )
+                        # Exit gracefully if config is essential for startup
+                        sys.exit(1)
 
                 self.config_manager = ConfigManager(config_path)
                 # Pass the entire logging config object to setup_logging
