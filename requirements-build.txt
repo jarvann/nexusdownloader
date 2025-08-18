@@ -1,0 +1,19 @@
+# Build and packaging dependencies for NexusDownloader
+# Use: pip install -r requirements-build.txt
+
+# PyInstaller for creating executables
+pyinstaller[encryption]>=5.6.0
+
+# Additional packaging tools
+wheel>=0.37.0
+setuptools>=60.0.0
+
+# Windows-specific build dependencies
+pywin32>=227; sys_platform == "win32"
+pywin32-ctypes>=0.2.0; sys_platform == "win32"
+
+# Linux-specific build dependencies  
+distro>=1.8.0; sys_platform == "linux"
+
+# Development tools
+twine>=4.0.0  # For uploading to PyPI if needed

@@ -192,3 +192,10 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# NexusDownloader specific ignores
+logs/
+mykeys.log
+build_dist/
+*.collection_resume.json
+.nexusdownloader_state/

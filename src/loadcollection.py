@@ -2,6 +2,7 @@ import json
 import argparse
 import concurrent.futures
 import logging
+import sys
 from endorse import endorse_mod  # Importing the endorse function from endorse.py
 from download import download_file  # Importing the download function from download.py
 from download import set_download_logger  # Importing the set_download_logger function from download.py
@@ -28,13 +29,13 @@ def verbose(self, message, *args, **kws):
         self._log(VERBOSE_LEVEL_NUM, message, args, **kws)
 logging.Logger.verbose = verbose
 
-def setup_logger(game_domain):
+def setup_logger(game_domain, operation_type="download"):
     # Ensure logs directory exists at project root
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     logs_dir = os.path.join(root_dir, "logs")
     os.makedirs(logs_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    log_filename = os.path.join(logs_dir, f"log_{game_domain}_{timestamp}.log")
+    log_filename = os.path.join(logs_dir, f"log_{operation_type}_{game_domain}_{timestamp}.log")
     logger = logging.getLogger("nexusdownloader")
     logger.setLevel(VERBOSE_LEVEL_NUM)
     fh = logging.FileHandler(log_filename, mode='a', encoding='utf-8')
@@ -112,10 +113,12 @@ def main(mods, gamefolder, max_threads=10, logger=None):
                 incrementCOMPLETED_COUNTER_ThreadSafe()
                 # This print statement is intentionally left as print for GUI progress parsing
                 print(f"0000\tCompleted download for file {COMPLETED_COUNTER} of {len(mods)}")
+                sys.stdout.flush()  # Ensure immediate output to GUI
                 if logger:
                     logger.verbose(f"Completed download for file {COMPLETED_COUNTER} of {len(mods)}")
-                
+
                 print(f"PROGRESS: {COMPLETED_COUNTER}/{len(mods)}")
+                sys.stdout.flush()  # Ensure immediate output to GUI
             except Exception as e:
                 incrementERROR_COUNTER_ThreadSafe()
 
@@ -158,8 +161,9 @@ if __name__ == '__main__':
     # Temporary logger for loading JSON to get game domain
     temp_logger = logging.getLogger("temp")
     mods = load_mods_from_json(args.json, temp_logger)
-    # Now setup logger with game domain
-    logger = setup_logger(GAME_DOMAIN if GAME_DOMAIN else "unknown")
+    # Setup logger with game domain and operation type
+    operation_type = "endorse" if args.endorseonly else "download"
+    logger = setup_logger(GAME_DOMAIN if GAME_DOMAIN else "unknown", operation_type)
     # Reload mods with logger for proper error logging
     mods = load_mods_from_json(args.json, logger)
 
