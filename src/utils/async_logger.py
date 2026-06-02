@@ -154,15 +154,22 @@ class AsyncLogger(QObject):
         """Log a critical message asynchronously."""
         self.log(logging.CRITICAL, message, *args, **kwargs)
     
-    def flush(self):
+    def flush(self, timeout: float = 2.0):
         """
-        Flush all pending log messages synchronously.
-        
-        This blocks until all queued messages are processed.
-        Use sparingly, typically only during shutdown.
+        Best-effort flush of pending log messages, bounded by ``timeout`` seconds.
+
+        Called on shutdown from the GUI thread, so it must never block
+        indefinitely: ``Queue.join()`` has no timeout and will hang the UI if the
+        consumer is slow or stuck writing to a log file. Instead, poll until the
+        queue drains or the deadline passes.
         """
-        if self.async_thread.running:
-            self.async_thread.log_queue.join()
+        import time
+        q = self.async_thread.log_queue
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.async_thread.running and getattr(q, "unfinished_tasks", 0) > 0:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
     
     def stop(self):
         """Stop the async logger and clean up resources."""

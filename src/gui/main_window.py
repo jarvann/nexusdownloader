@@ -2029,24 +2029,33 @@ Operation Statistics:
         Args:
             event: Qt close event
         """
-        if self.download_thread and self.download_thread.isRunning():
+        download_running = bool(self.download_thread and self.download_thread.isRunning())
+        install_thread = getattr(getattr(self, 'install_tab', None), 'install_thread', None)
+        install_running = bool(install_thread and install_thread.isRunning())
+
+        if download_running or install_running:
+            op = "download" if download_running else "install"
             reply = QMessageBox.question(
                 self,
                 "Close Application",
-                "A download operation is in progress. Cancel and exit?",
+                f"A {op} operation is in progress. Cancel and exit?",
                 QMessageBox.Yes | QMessageBox.No
             )
-            
-            if reply == QMessageBox.Yes:
-                self.download_thread.cancel_operation()
-                self.download_thread.wait(5000)  # Wait up to 5 seconds
-                self._cleanup_async_logger()
-                event.accept()
-            else:
+            if reply != QMessageBox.Yes:
                 event.ignore()
-        else:
-            self._cleanup_async_logger()
-            event.accept()
+                return
+
+            # Ask each worker to stop, then wait a bounded time. We accept the
+            # close regardless so the UI can never get stuck on a slow worker.
+            if download_running:
+                self.download_thread.cancel_operation()
+                self.download_thread.wait(5000)
+            if install_running:
+                install_thread.cancel()
+                install_thread.wait(5000)
+
+        self._cleanup_async_logger()
+        event.accept()
     
     def _cleanup_async_logger(self):
         """Clean up async logger resources."""
