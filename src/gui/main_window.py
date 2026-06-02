@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from progress_tracking import ProgressTracker, DownloadProgress
 from gui.settings_dialog import SettingsDialog
 from gui.progress_monitor import ProgressMonitorWidget
+from gui.install_tab import InstallTab
+from utils.vortex_config import get_vortex_config_reader
 
 # Import Phase 1 modules
 try:
@@ -269,8 +271,10 @@ class DownloadWorkerThread(QThread):
                 
                 line = line.strip()
                 if line:
-                    # Output subprocess line to logging instead of direct print
-                    self.log_message_received.emit("DEBUG", f"Subprocess output: {line}")
+                    # Don't log high-frequency @DL progress records (up to ~100/sec
+                    # across threads) -- they'd flood the log. Other lines are logged.
+                    if not line.startswith("@DL\t"):
+                        self.log_message_received.emit("DEBUG", f"Subprocess output: {line}")
                     self._parse_output_line(line)
             
             process.wait()
@@ -305,6 +309,11 @@ class DownloadWorkerThread(QThread):
             line: Output line from the download process
         """
         try:
+            # Real per-thread progress records emitted by download.py
+            if line.startswith("@DL\t"):
+                self._handle_dl_record(line)
+                return
+
             # Only debug key parsing events
             if "Starting download of" in line or "Successfully downloaded" in line or "Completed download for file" in line:
                 self.log_message_received.emit("DEBUG", f"Key event - {line[:120]}")
@@ -336,85 +345,13 @@ class DownloadWorkerThread(QThread):
                     # Save state when files complete
                     self._save_download_state()
                     
-                    # Update progress tracker and emit progress signal
-                    if hasattr(self, 'progress_tracker'):
-                        # Calculate average speed from recent downloads
-                        avg_speed = 0
-                        if hasattr(self, '_recent_speeds') and self._recent_speeds:
-                            avg_speed = sum(self._recent_speeds) / len(self._recent_speeds)
-                            self.log_message_received.emit("DEBUG", f"Calculated average speed: {avg_speed:.2f} MB/s from {len(self._recent_speeds)} samples")
-                        
-                        # Calculate ETA based on remaining files and current speed
-                        eta_formatted = 'Calculating...'
-                        if avg_speed > 0 and total > current:
-                            remaining_files = total - current
-                            # Estimate 2 seconds per file as baseline, adjusted by speed
-                            estimated_seconds = remaining_files * (2 / max(avg_speed, 0.1))
-                            eta_formatted = f"{int(estimated_seconds // 60)}:{int(estimated_seconds % 60):02d}"
-                        
-                        # Get current active downloads for the Download Monitor
-                        # Since subprocess doesn't provide detailed individual download info,
-                        # create simulated active downloads based on progress
-                        active_downloads = []
-                        downloading_files_count = 0
-                        
-                        # Simulate active downloads based on concurrent thread count
-                        max_concurrent = getattr(self, 'max_threads', 10)
-                        remaining_files = adjusted_total - adjusted_current
-                        
-                        # Show progress bars for estimated concurrent downloads
-                        concurrent_count = min(max_concurrent, remaining_files)
-                        if concurrent_count > 0:
-                            from progress_tracking import DownloadProgress
-                            import random
-                            
-                            # Try to get actual mod names from the JSON if available
-                            # adjusted_current is the number of completed files (1-based count)
-                            # We want names for the next files to be downloaded (0-based indexing)
-                            mod_names = self._get_upcoming_mod_names(adjusted_current, concurrent_count)
-                            self.log_message_received.emit("DEBUG", f"Requested {concurrent_count} mod names starting from index {adjusted_current}, got {len(mod_names)} names")
-                            
-                            for i in range(concurrent_count):
-                                # Create simulated download progress with varying progress
-                                progress_percent = random.randint(20, 80)  # Random progress between 20-80%
-                                file_index = adjusted_current + i + 1
-                                
-                                # Use actual mod name if available, otherwise fallback
-                                if i < len(mod_names):
-                                    filename = mod_names[i]
-                                else:
-                                    filename = f"Downloading file {file_index}..."
-                                
-                                download_progress = DownloadProgress(
-                                    mod_id=file_index,
-                                    file_id=0,
-                                    filename=filename,
-                                    total_size=100,  # Mock size
-                                    downloaded_size=progress_percent  # Dynamic progress
-                                )
-                                active_downloads.append(download_progress)
-                            
-                            downloading_files_count = len(active_downloads)
-                        
-                        self.log_message_received.emit("DEBUG", f"Progress update - {downloading_files_count} simulated active downloads")
-                        
-                        # Create progress update with calculated values (use adjusted numbers for display)
-                        overall_progress = {
-                            'completed_files': adjusted_current,
-                            'total_files': adjusted_total,
-                            'overall_progress_percent': (adjusted_current / adjusted_total) * 100 if adjusted_total > 0 else 0,
-                            'downloading_files': downloading_files_count,
-                            'failed_files': 0,
-                            'overall_speed': round(avg_speed, 2),
-                            'eta_formatted': eta_formatted
-                        }
-                        
-                        # Emit the progress update
-                        update_data = {
-                            'overall_progress': overall_progress,
-                            'active_downloads': active_downloads
-                        }
-                        self._handle_progress_update(update_data)
+                    # Record file counts and refresh the display from real per-thread
+                    # lane data (emitted as @DL records by download.py). The Download
+                    # Monitor table and aggregate speed are driven entirely by those
+                    # records now -- no simulated progress.
+                    self._completed_files = adjusted_current
+                    self._total_files = adjusted_total
+                    self._emit_lane_progress(force=True)
             
             elif "Starting download for mod" in line:
                 # Extract mod_id and file_id from log line
@@ -540,10 +477,106 @@ class DownloadWorkerThread(QThread):
         except Exception as e:
             self.log_message_received.emit("ERROR", f"Error parsing output: {str(e)}")
     
+    def _handle_dl_record(self, line: str):
+        """
+        Parse a machine-readable @DL per-thread progress record from download.py
+        and update the live lane state.
+
+        Record formats (tab-delimited):
+            @DL  START  <lane>  <total_bytes>  <filename>
+            @DL  PROG   <lane>  <downloaded>   <total>  <speed_bps>
+            @DL  DONE   <lane>  <downloaded>   <speed_bps>
+            @DL  ERR    <lane>  <filename>
+        """
+        from progress_tracking import DownloadProgress
+
+        parts = line.split("\t")
+        if len(parts) < 3:
+            return
+        kind, lane = parts[1], parts[2]
+
+        if not hasattr(self, '_lanes'):
+            self._lanes = {}
+        if not hasattr(self, '_dl_start_time'):
+            self._dl_start_time = time.time()
+
+        try:
+            if kind == "START" and len(parts) >= 5:
+                total = int(parts[3])
+                filename = parts[4]
+                self._lanes[lane] = DownloadProgress(
+                    mod_id=0, file_id=0, filename=filename,
+                    total_size=total, downloaded_size=0, download_speed=0.0,
+                    status="downloading", thread_id=lane, start_time=time.time())
+                self._emit_lane_progress(force=True)
+
+            elif kind == "PROG" and len(parts) >= 6:
+                downloaded, total, speed_bps = int(parts[3]), int(parts[4]), float(parts[5])
+                lane_info = self._lanes.get(lane)
+                if lane_info is None:
+                    lane_info = DownloadProgress(
+                        mod_id=0, file_id=0, filename="(downloading)",
+                        total_size=total, downloaded_size=downloaded,
+                        status="downloading", thread_id=lane, start_time=time.time())
+                    self._lanes[lane] = lane_info
+                lane_info.downloaded_size = downloaded
+                lane_info.total_size = total
+                lane_info.download_speed = speed_bps
+                lane_info.status = "downloading"
+                if speed_bps > 0 and total > downloaded:
+                    lane_info.eta_seconds = (total - downloaded) / speed_bps
+                self._emit_lane_progress()
+
+            elif kind in ("DONE", "ERR"):
+                self._lanes.pop(lane, None)
+                self._emit_lane_progress(force=True)
+        except (ValueError, IndexError) as e:
+            self.log_message_received.emit("DEBUG", f"Bad @DL record '{line}': {e}")
+
+    def _emit_lane_progress(self, force: bool = False):
+        """
+        Push the current set of active download lanes plus aggregate stats to the
+        GUI. Throttled to avoid flooding the Qt event loop when many threads emit
+        progress at once; START/DONE/ERR pass force=True for immediate refresh.
+        """
+        now = time.time()
+        if not force and now - getattr(self, '_last_lane_emit', 0.0) < 0.25:
+            return
+        self._last_lane_emit = now
+
+        active = list(getattr(self, '_lanes', {}).values())
+        # True aggregate throughput = sum of every active thread's byte rate
+        total_bps = sum(d.download_speed for d in active if d.download_speed > 0)
+
+        completed = getattr(self, '_completed_files', 0)
+        total = getattr(self, '_total_files', 0)
+
+        # Files-based ETA: extrapolate from average time per completed file
+        eta_formatted = 'Calculating...'
+        start = getattr(self, '_dl_start_time', None)
+        if start and completed > 0 and total > completed:
+            per_file = (now - start) / completed
+            remaining = (total - completed) * per_file
+            eta_formatted = f"{int(remaining // 60)}:{int(remaining % 60):02d}"
+
+        overall_progress = {
+            'completed_files': completed,
+            'total_files': total,
+            'overall_progress_percent': (completed / total * 100) if total > 0 else 0,
+            'downloading_files': len(active),
+            'failed_files': 0,
+            'overall_speed': round(total_bps / (1024 * 1024), 2),  # MB/s
+            'eta_formatted': eta_formatted,
+        }
+        self._handle_progress_update({
+            'overall_progress': overall_progress,
+            'active_downloads': active,
+        })
+
     def _handle_progress_update(self, update_data: Dict[str, Any]):
         """
         Handle progress updates from the progress tracker.
-        
+
         Args:
             update_data: Dictionary containing progress information
         """
@@ -884,12 +917,32 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
         
-        # Main layout with sections
+        # Main layout with tab widget
         main_layout = QVBoxLayout(central_widget)
+        
+        # Create tabbed interface
+        self.tab_widget = QTabWidget()
+        main_layout.addWidget(self.tab_widget)
+        
+        # Download tab (original functionality)
+        self.download_tab = self._create_download_tab()
+        self.tab_widget.addTab(self.download_tab, "Download")
+        
+        # Install tab (new FOMOD functionality)
+        self.install_tab = InstallTab()
+        self.tab_widget.addTab(self.install_tab, "Install")
+        
+        # Connect tabs for data sharing
+        self._setup_tab_connections()
+    
+    def _create_download_tab(self):
+        """Create the download tab with original functionality."""
+        download_widget = QWidget()
+        download_layout = QVBoxLayout(download_widget)
         
         # File selection section
         file_section = self._create_file_selection_section()
-        main_layout.addWidget(file_section)
+        download_layout.addWidget(file_section)
         
         # Progress monitoring section
         splitter = QSplitter(Qt.Horizontal)
@@ -906,11 +959,19 @@ class MainWindow(QMainWindow):
         
         # Set splitter proportions
         splitter.setSizes([400, 500])
-        main_layout.addWidget(splitter)
+        download_layout.addWidget(splitter)
         
         # Control buttons section
         control_section = self._create_control_section()
-        main_layout.addWidget(control_section)
+        download_layout.addWidget(control_section)
+        
+        return download_widget
+    
+    def _setup_tab_connections(self):
+        """Setup connections between tabs for data sharing."""
+        # When downloads folder is selected in download tab, update install tab
+        # This would need to be connected to the file dialog signals
+        pass
 
     def _create_menu_bar(self):
         """Create the application menu bar with all actions."""
@@ -978,6 +1039,12 @@ class MainWindow(QMainWindow):
         folder_browse_btn = QPushButton("Browse...")
         folder_browse_btn.clicked.connect(self._browse_game_folder)
         folder_layout.addWidget(folder_browse_btn)
+        
+        # Auto-detect button for Vortex integration
+        auto_detect_btn = QPushButton("Auto-Detect from Vortex")
+        auto_detect_btn.clicked.connect(self._auto_detect_vortex_paths)
+        auto_detect_btn.setToolTip("Automatically detect download and mod paths from Vortex installation")
+        folder_layout.addWidget(auto_detect_btn)
         
         layout.addRow("Game Folder:", folder_layout)
         
@@ -1192,6 +1259,153 @@ class MainWindow(QMainWindow):
         )
         if folder_path:
             self.game_folder_edit.setText(folder_path)
+            # Update install tab with downloads path
+            if hasattr(self, 'install_tab'):
+                self.install_tab.set_downloads_path(folder_path)
+    
+    def _auto_detect_vortex_paths(self):
+        """Auto-detect game paths from Vortex installation."""
+        try:
+            # Create Vortex config reader
+            vortex_reader = get_vortex_config_reader(self.logger)
+            
+            # First check if we can determine game domain from collection
+            game_domain = self._extract_game_domain_from_collection()
+            
+            if not game_domain:
+                # Show dialog to let user select game
+                game_domain = self._show_game_selection_dialog(vortex_reader)
+                
+            if not game_domain:
+                QMessageBox.information(
+                    self,
+                    "Auto-Detection",
+                    "Could not determine game domain. Please select a collection file first or choose a game manually."
+                )
+                return
+            
+            # Auto-detect paths
+            paths = vortex_reader.auto_detect_paths(game_domain)
+            
+            if not paths['vortex_found']:
+                QMessageBox.warning(
+                    self,
+                    "Vortex Not Found",
+                    "Could not find Vortex Mod Manager installation.\n\n"
+                    "Please ensure Vortex is installed and has been run at least once.\n\n"
+                    "If Vortex is currently running, please close it and try again."
+                )
+                return
+            
+            # Update paths if found
+            updates = []
+            if paths['downloads_folder']:
+                self.game_folder_edit.setText(paths['downloads_folder'])
+                updates.append(f"Downloads: {paths['downloads_folder']}")
+                
+                # Update install tab with downloads path
+                if hasattr(self, 'install_tab'):
+                    self.install_tab.set_downloads_path(paths['downloads_folder'])
+            
+            if paths['mods_folder'] and hasattr(self, 'install_tab'):
+                self.install_tab.set_game_path(paths['mods_folder'])
+                updates.append(f"Mods: {paths['mods_folder']}")
+            
+            if updates:
+                QMessageBox.information(
+                    self,
+                    "Auto-Detection Successful",
+                    f"Successfully detected paths from Vortex:\n\n" + "\n".join(updates)
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Auto-Detection Failed",
+                    f"Found Vortex installation but could not detect paths for game '{game_domain}'.\n\n"
+                    "The game may not be managed by Vortex or may use custom paths."
+                )
+        
+        except Exception as e:
+            error_msg = str(e)
+            if hasattr(self.logger, 'error'):
+                self.logger.error(f"Failed to auto-detect Vortex paths: {e}")
+            else:
+                print(f"ERROR: Failed to auto-detect Vortex paths: {e}")
+            
+            if "Permission denied" in error_msg or "Errno 13" in error_msg:
+                QMessageBox.warning(
+                    self,
+                    "Vortex Access Error",
+                    "Cannot access Vortex configuration files.\n\n"
+                    "This usually happens when Vortex is currently running.\n"
+                    "Please close Vortex and try auto-detection again.\n\n"
+                    f"Technical details: {error_msg}"
+                )
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Auto-Detection Error",
+                    f"An error occurred while trying to detect Vortex paths:\n\n{error_msg}"
+                )
+    
+    def _extract_game_domain_from_collection(self) -> Optional[str]:
+        """Extract game domain from the selected collection file."""
+        json_path = self.json_file_edit.text().strip()
+        if not json_path or not os.path.exists(json_path):
+            return None
+        
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            info = data.get('info', {})
+            domain = info.get('domainName')
+            
+            if domain:
+                if hasattr(self.logger, 'info'):
+                    self.logger.info(f"Extracted game domain from collection: {domain}")
+                return domain
+        
+        except Exception as e:
+            if hasattr(self.logger, 'warning'):
+                self.logger.warning(f"Could not extract game domain from collection: {e}")
+            else:
+                print(f"WARNING: Could not extract game domain from collection: {e}")
+        
+        return None
+    
+    def _show_game_selection_dialog(self, vortex_reader) -> Optional[str]:
+        """Show dialog for user to select a game from Vortex managed games."""
+        try:
+            managed_games = vortex_reader.list_managed_games()
+            if not managed_games:
+                return None
+            
+            from PySide6.QtWidgets import QInputDialog
+            
+            game_names = [f"{game.game_name} ({game.game_id})" for game in managed_games]
+            
+            selected, ok = QInputDialog.getItem(
+                self,
+                "Select Game",
+                "Select the game to configure paths for:",
+                game_names,
+                0,
+                False
+            )
+            
+            if ok and selected:
+                # Extract game_id from the selected item
+                game_id = selected.split('(')[-1].rstrip(')')
+                return game_id
+        
+        except Exception as e:
+            if hasattr(self.logger, 'error'):
+                self.logger.error(f"Error showing game selection dialog: {e}")
+            else:
+                print(f"ERROR: Error showing game selection dialog: {e}")
+        
+        return None
 
     def _on_thread_count_changed(self, value: int):
         """
