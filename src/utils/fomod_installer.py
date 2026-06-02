@@ -9,6 +9,7 @@ import os
 import json
 import shutil
 import tempfile
+import time
 import logging
 import threading
 import concurrent.futures
@@ -90,16 +91,70 @@ class FomodInstaller:
         # Create temporary directory for extractions
         self.temp_dir = Path(tempfile.mkdtemp(prefix="nexusdownloader_install_"))
         self.logger.debug(f"Created temp directory: {self.temp_dir}")
-        
+
+        # Space-aware extraction throttle. The temp volume is often small (e.g. a
+        # RAM-disk %TEMP%), and many parallel workers each unpacking a multi-GB
+        # archive can exhaust it ("No space left on device"). Workers wait on this
+        # condition for free space before extracting; whoever finishes and cleans
+        # up notifies the waiters. Concurrency self-adjusts to available space.
+        self._space_cond = threading.Condition()
+        self._temp_min_headroom = 1 * 1024 ** 3   # always keep >= 1 GiB free
+        self._temp_safety_factor = 3              # extracted size ~= 3x compressed
+
     def __enter__(self):
         """Context manager entry."""
         return self
-        
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup temp directory."""
         if self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
             self.logger.debug(f"Cleaned up temp directory: {self.temp_dir}")
+
+    def _estimate_extract_size(self, archive_path) -> int:
+        """Estimate extracted size from the compressed archive size (conservative)."""
+        try:
+            return Path(archive_path).stat().st_size * self._temp_safety_factor
+        except OSError:
+            return 0
+
+    def _acquire_temp_space(self, archive_path, mod_name: str = "", timeout: float = 600.0) -> bool:
+        """Block until the temp volume has room to extract ``archive_path``.
+
+        Throttles concurrent extractions by real free space rather than a fixed
+        worker count. Returns True when space is available; returns False (and lets
+        the caller proceed best-effort) if the archive is larger than the whole
+        temp volume or we time out -- never blocks forever, and re-checks every 2s
+        so a missed notify can't deadlock it.
+        """
+        needed = self._estimate_extract_size(archive_path)
+        if needed <= 0:
+            return True
+        deadline = time.monotonic() + timeout
+        with self._space_cond:
+            while True:
+                try:
+                    usage = shutil.disk_usage(self.temp_dir)
+                except OSError:
+                    return True
+                if usage.free >= needed + self._temp_min_headroom:
+                    return True
+                if needed + self._temp_min_headroom > usage.total:
+                    # Won't ever fit on this volume; don't wait, let it try/fail cleanly.
+                    self.logger.warning(
+                        f"{mod_name}: needs ~{needed // (1024**2)}MB temp but volume holds "
+                        f"~{usage.total // (1024**2)}MB; extracting without throttle")
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.logger.warning(f"{mod_name}: timed out waiting for temp space; proceeding")
+                    return False
+                self._space_cond.wait(timeout=min(2.0, remaining))
+
+    def _release_temp_space(self):
+        """Wake workers waiting on temp space (call after cleaning up an extraction)."""
+        with self._space_cond:
+            self._space_cond.notify_all()
     
     def install_mod(self, mod_data: Dict[str, Any], downloads_path: Union[str, Path]) -> InstallationResult:
         """
@@ -326,6 +381,8 @@ class FomodInstaller:
             temp_extract = self.temp_dir / f"e_{folder_hash}"
             self.logger.debug(f"Using temp extraction directory: {temp_extract} for mod: {mod_name}")
             
+            # Wait for room on the (often small/ramdisk) temp volume before extracting
+            self._acquire_temp_space(archive_path, mod_name)
             try:
                 self.archive_handler.extract_archive(archive_path, temp_extract)
             except Exception as extract_error:
@@ -339,14 +396,16 @@ class FomodInstaller:
                     try:
                         self.archive_handler.extract_archive(archive_path, temp_extract)
                     except Exception:
+                        self._release_temp_space()
                         return InstallationResult(
                             mod_name=mod_name,
                             status=InstallResult.FAILED,
                             error_message=f"Failed to extract archive due to path length issues: {error_msg}"
                         )
                 else:
+                    self._release_temp_space()
                     raise  # Re-raise other extraction errors (including BCJ2 with helpful message from archive handler)
-            
+
             # Copy files to install location with smart path detection
             installed_files = []
             root_path = self._find_mod_root(temp_extract)
@@ -379,7 +438,9 @@ class FomodInstaller:
                 except Exception as cleanup_error:
                     self.logger.debug(f" Cleanup failed for {mod_name}: {cleanup_error}")
                     self.logger.warning(f"Failed to cleanup temp extraction {temp_extract}: {cleanup_error}")
-            
+            # Freed temp space -> wake any workers throttled waiting for room
+            self._release_temp_space()
+
             # Validate installation is not empty
             if not installed_files:
                 error_msg = f"Installation completed but no files were installed for {mod_name}. This could be due to path length issues, file filtering, or extraction problems."
@@ -417,7 +478,9 @@ class FomodInstaller:
                 except Exception:
                     self.logger.debug(f" Error cleanup failed for {mod_name}")
                     pass  # Don't let cleanup errors mask the original error
-                    
+            # Wake any workers throttled waiting for temp room
+            self._release_temp_space()
+
             return InstallationResult(
                 mod_name=mod_name,
                 status=InstallResult.FAILED,
@@ -443,6 +506,8 @@ class FomodInstaller:
             temp_extract = self.temp_dir / f"e_{folder_hash}"
             self.logger.debug(f"Using temp extraction directory: {temp_extract} for mod: {mod_name}")
             
+            # Wait for room on the (often small/ramdisk) temp volume before extracting
+            self._acquire_temp_space(archive_path, mod_name)
             try:
                 self.archive_handler.extract_archive(archive_path, temp_extract)
             except Exception as extract_error:
@@ -456,14 +521,16 @@ class FomodInstaller:
                     try:
                         self.archive_handler.extract_archive(archive_path, temp_extract)
                     except Exception:
+                        self._release_temp_space()
                         return InstallationResult(
                             mod_name=mod_name,
                             status=InstallResult.FAILED,
                             error_message=f"Failed to extract archive due to path length issues: {error_msg}"
                         )
                 else:
+                    self._release_temp_space()
                     raise  # Re-raise other extraction errors (including BCJ2 with helpful message from archive handler)
-            
+
             # Resolve which files to install by parsing the real FOMOD
             # ModuleConfig.xml and mapping the collection's recorded choices onto
             # it (see utils.fomod_engine). If the archive has no parseable FOMOD,
@@ -535,7 +602,9 @@ class FomodInstaller:
                 except Exception as cleanup_error:
                     self.logger.debug(f" Cleanup failed for {mod_name}: {cleanup_error}")
                     self.logger.warning(f"Failed to cleanup temp extraction {temp_extract}: {cleanup_error}")
-            
+            # Freed temp space -> wake any workers throttled waiting for room
+            self._release_temp_space()
+
             # Validate installation is not empty
             if not installed_files:
                 error_msg = f"FOMOD installation completed but no files were installed for {mod_name}. Check FOMOD choices and file mapping."
@@ -573,7 +642,9 @@ class FomodInstaller:
                 except Exception:
                     self.logger.debug(f" Error cleanup failed for {mod_name}")
                     pass  # Don't let cleanup errors mask the original error
-                    
+            # Wake any workers throttled waiting for temp room
+            self._release_temp_space()
+
             return InstallationResult(
                 mod_name=mod_name,
                 status=InstallResult.FAILED,
