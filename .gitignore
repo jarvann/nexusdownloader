@@ -205,8 +205,5 @@ build_dist/
 .nexusdownloader_state/
 nul
 
-# Vortex DB tooling (Node) + spike scratch
+# Node deps for the Vortex DB bridge (vortex_leveldb.js / vortex_sync.js are tracked)
 node_modules/
-package.json
-package-lock.json
-vortex_*.js

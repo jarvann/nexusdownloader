@@ -33,5 +33,8 @@ defusedxml>=0.7.1
 PySide6>=6.11.1  # For enhanced GUI
 # tkinter is included with Python standard library (legacy GUI)
 
+# Process / lock detection (is Vortex running before we touch its DB?)
+psutil>=6.0.0
+
 # Windows-specific dependencies
 pywin32>=311; sys_platform == "win32"
