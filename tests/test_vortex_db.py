@@ -71,5 +71,24 @@ def test_read_prefix_decodes_json(monkeypatch):
 
 
 def test_is_vortex_running_without_psutil(monkeypatch):
-    monkeypatch.setattr(vdb, "_PSUTIL", False)
+    monkeypatch.setattr(vdb, "psutil", None)
     assert vdb.is_vortex_running() is False
+
+
+def test_read_active_profile(monkeypatch):
+    monkeypatch.setattr(vdb, "read_prefix",
+                        lambda *a, **k: {"settings###profiles###activeProfileId": "PROF1"})
+    assert vdb.read_active_profile("/db") == "PROF1"
+
+
+def test_read_collection_identity(monkeypatch):
+    monkeypatch.setattr(vdb, "read_prefix", lambda *a, **k: {
+        "persistent###mods###skyrimse###Coll###attributes###collectionId": 26945,
+        "persistent###mods###skyrimse###Coll###attributes###collectionSlug": "gnfjwh",
+    })
+    assert vdb.read_collection_identity("/db") == (26945, "gnfjwh")
+
+
+def test_read_collection_identity_none_when_absent(monkeypatch):
+    monkeypatch.setattr(vdb, "read_prefix", lambda *a, **k: {})
+    assert vdb.read_collection_identity("/db") is None

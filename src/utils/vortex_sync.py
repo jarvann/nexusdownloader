@@ -220,6 +220,37 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     return SyncResult(True, plan, risk, res.keys_written, res.backup_path, "applied")
 
 
+def sync_collection(collection_path: str, downloads_dir: str, staging_dir: str, *,
+                    apply: bool = False, force: bool = False,
+                    node: str = "node") -> SyncResult:
+    """High-level entry for the GUI: auto-discover the Vortex DB, active profile,
+    and collection identity, then run the sync.
+
+    Raises a clear error if Vortex's DB can't be found or the collection identity
+    can't be determined (e.g. a brand-new collection Vortex has never seen).
+    """
+    from utils import vortex_db
+
+    db_path = vortex_db.find_state_db()
+    if not db_path:
+        raise FileNotFoundError(
+            "Could not find Vortex's database (state.v2). Is Vortex installed?")
+
+    profile_id = vortex_db.read_active_profile(db_path, node=node)
+    if not profile_id:
+        raise RuntimeError("Could not determine the active Vortex profile.")
+
+    identity = vortex_db.read_collection_identity(db_path, node=node)
+    if not identity:
+        raise RuntimeError(
+            "Could not determine the collection's id/slug from Vortex. Add the "
+            "collection in Vortex once so it knows it, then re-sync.")
+    collection_id, slug = identity
+
+    return run(db_path, collection_path, downloads_dir, staging_dir, profile_id,
+               collection_id=collection_id, slug=slug, apply=apply, force=force, node=node)
+
+
 def _main(argv=None):
     """Standalone CLI: dry-run by default; --apply writes (backs up first)."""
     import argparse

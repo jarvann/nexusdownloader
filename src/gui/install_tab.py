@@ -30,9 +30,39 @@ from utils.archive_handler import get_archive_handler
 from utils.vortex_config import get_vortex_config_reader
 
 
+class VortexSyncWorkerThread(QThread):
+    """Runs the Vortex DB sync off the UI thread (dry-run or apply)."""
+
+    finished_result = Signal(object)   # SyncResult
+    failed = Signal(str)
+    busy = Signal(str)                 # Vortex running / DB locked -> close Vortex
+
+    def __init__(self, collection_path, downloads_path, staging_path, apply, force):
+        super().__init__()
+        self.collection_path = collection_path
+        self.downloads_path = downloads_path
+        self.staging_path = staging_path
+        self.apply = apply
+        self.force = force
+
+    def run(self):
+        try:
+            from utils import vortex_sync
+            from utils.vortex_db import VortexBusyError
+            try:
+                res = vortex_sync.sync_collection(
+                    self.collection_path, self.downloads_path, self.staging_path,
+                    apply=self.apply, force=self.force)
+                self.finished_result.emit(res)
+            except VortexBusyError as e:
+                self.busy.emit(str(e))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class InstallWorkerThread(QThread):
     """Worker thread for mod installation operations."""
-    
+
     progress_updated = Signal(int, int, str)  # current, total, mod_name
     installation_complete = Signal(str, bool, str)  # mod_name, success, message
     log_message = Signal(str, str)  # level, message
@@ -282,7 +312,14 @@ class InstallTab(QWidget):
         self.cancel_install_btn = QPushButton("Cancel Installation")
         self.cancel_install_btn.setEnabled(False)
         control_layout.addWidget(self.cancel_install_btn)
-        
+
+        self.link_vortex_btn = QPushButton("Link to Vortex")
+        self.link_vortex_btn.setToolTip(
+            "Register the installed mods + collection in Vortex's database so it "
+            "shows them as installed/enabled. Close Vortex completely first.")
+        self.link_vortex_btn.setEnabled(False)
+        control_layout.addWidget(self.link_vortex_btn)
+
         control_layout.addStretch()
         layout.addLayout(control_layout)
         
@@ -342,7 +379,8 @@ class InstallTab(QWidget):
         self.start_install_btn.clicked.connect(self.start_installation)
         self.cancel_install_btn.clicked.connect(self.cancel_installation)
         self.clear_log_btn.clicked.connect(self.clear_log)
-    
+        self.link_vortex_btn.clicked.connect(self.link_to_vortex)
+
     def browse_collection_file(self):
         """Browse for collection JSON file."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -395,7 +433,84 @@ class InstallTab(QWidget):
             not (self.install_thread and self.install_thread.isRunning())
         )
         self.start_install_btn.setEnabled(can_start)
-    
+        # Linking needs the same three paths; available whether or not an install ran.
+        self.link_vortex_btn.setEnabled(can_start)
+
+    def link_to_vortex(self):
+        """Register installed mods + the collection into Vortex's DB (two-phase:
+        dry-run for a preview + drift check, then apply on confirmation)."""
+        if not (self.collection_path and self.downloads_path and self.game_path):
+            QMessageBox.warning(self, "Link to Vortex",
+                                "Select the collection, downloads, and staging folders first.")
+            return
+        self.link_vortex_btn.setEnabled(False)
+        self.log_message("INFO", "Planning Vortex sync (dry-run)...")
+        self._sync_thread = VortexSyncWorkerThread(
+            self.collection_path, self.downloads_path, self.game_path, apply=False, force=False)
+        self._sync_thread.finished_result.connect(self._on_sync_dryrun)
+        self._sync_thread.failed.connect(self._on_sync_error)
+        self._sync_thread.busy.connect(self._on_sync_busy)
+        self._sync_thread.start()
+
+    def _on_sync_dryrun(self, res):
+        p = res.plan
+        force = bool(p.violations) or (not res.risk.safe)
+        lines = [
+            f"This will register {p.mod_count} mods and link the collection in Vortex.",
+            "",
+            f"  New downloads to register : {p.new_downloads}",
+            f"  Collection requires-rules : {p.rule_count}",
+            f"  Skipped (no files on disk): {p.skipped_no_disk}",
+            f"  Total DB keys to write    : {p.total_keys}",
+            "",
+        ]
+        if not res.risk.safe:
+            lines += ["RISK: " + res.risk.message,
+                      "This Vortex version has not been validated -- writing could corrupt "
+                      "your Vortex setup. A backup is made first. Proceed anyway?", ""]
+        else:
+            lines += [f"Vortex check: {res.risk.message}",
+                      "Make sure Vortex is fully CLOSED, then proceed.", ""]
+        if p.violations:
+            lines.append(f"WARNING: {len(p.violations)} schema issue(s) detected.")
+        reply = QMessageBox.question(self, "Link to Vortex", "\n".join(lines),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self.link_vortex_btn.setEnabled(True)
+            self.log_message("INFO", "Vortex sync cancelled by user.")
+            return
+        self.log_message("INFO", "Applying Vortex sync...")
+        self._sync_thread = VortexSyncWorkerThread(
+            self.collection_path, self.downloads_path, self.game_path, apply=True, force=force)
+        self._sync_thread.finished_result.connect(self._on_sync_applied)
+        self._sync_thread.failed.connect(self._on_sync_error)
+        self._sync_thread.busy.connect(self._on_sync_busy)
+        self._sync_thread.start()
+
+    def _on_sync_applied(self, res):
+        self.link_vortex_btn.setEnabled(True)
+        if res.applied:
+            self.log_message("INFO", f"Vortex sync applied: {res.plan.mod_count} mods, "
+                                     f"{res.keys_written} keys. Backup: {res.backup_path}")
+            QMessageBox.information(
+                self, "Linked to Vortex",
+                f"Linked {res.plan.mod_count} mods and the collection into Vortex.\n\n"
+                f"Backup of your Vortex DB: {res.backup_path}\n\n"
+                f"Now open Vortex and click Deploy Mods.")
+        else:
+            self.log_message("WARNING", f"Vortex sync not applied: {res.message}")
+            QMessageBox.warning(self, "Not applied", res.message)
+
+    def _on_sync_busy(self, msg):
+        self.link_vortex_btn.setEnabled(True)
+        self.log_message("WARNING", f"Vortex sync blocked: {msg}")
+        QMessageBox.warning(self, "Close Vortex", msg)
+
+    def _on_sync_error(self, msg):
+        self.link_vortex_btn.setEnabled(True)
+        self.log_message("ERROR", f"Vortex sync failed: {msg}")
+        QMessageBox.critical(self, "Vortex sync failed", msg)
+
     def start_installation(self):
         """Start the installation process."""
         # Log debug information

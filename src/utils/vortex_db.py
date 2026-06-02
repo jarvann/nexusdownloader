@@ -27,13 +27,13 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Optional, Tuple
 
 try:
     import psutil
-    _PSUTIL = True
 except ImportError:  # pragma: no cover - psutil is a listed dependency
-    _PSUTIL = False
+    psutil = None
+_PSUTIL = psutil is not None
 
 
 class VortexBusyError(RuntimeError):
@@ -65,7 +65,7 @@ def probe(db_path: str, node: str = "node") -> bool:
 
 def is_vortex_running() -> bool:
     """Best-effort check for a running Vortex process."""
-    if not _PSUTIL:
+    if psutil is None:
         return False
     for proc in psutil.process_iter(["name"]):
         try:
@@ -141,3 +141,45 @@ def read_prefix(db_path: str, prefix: str, node: str = "node") -> Dict[str, obje
         raise RuntimeError(f"DB read failed: {res.stderr.strip()}")
     raw = json.loads(res.stdout or "{}")
     return {k: json.loads(v) for k, v in raw.items()}
+
+
+# --------------------------------------------------------------------------- #
+# Discovery helpers (find the DB, active profile, and collection identity)
+# --------------------------------------------------------------------------- #
+def find_state_db() -> Optional[str]:
+    """Locate Vortex's ``state.v2`` directory (APPDATA/Vortex, possibly a junction)."""
+    candidates = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(os.path.join(appdata, "Vortex", "state.v2"))
+    home = os.path.expanduser("~")
+    candidates.append(os.path.join(home, "AppData", "Roaming", "Vortex", "state.v2"))
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
+
+def read_active_profile(db_path: str, node: str = "node") -> Optional[str]:
+    """Return the id of the currently active Vortex profile."""
+    data = read_prefix(db_path, "settings###profiles###activeProfileId", node=node)
+    val = data.get("settings###profiles###activeProfileId")
+    return val if isinstance(val, str) else None
+
+
+def read_collection_identity(db_path: str, game: str = "skyrimse",
+                             node: str = "node") -> Optional[Tuple[int, str]]:
+    """Find an installed collection's ``(collectionId, slug)`` from existing state.
+
+    Works when a prior revision of the collection is already known to Vortex
+    (the common "update" case). Returns None if no collection is present.
+    """
+    data = read_prefix(db_path, f"persistent###mods###{game}###", node=node)
+    cid: Optional[int] = None
+    slug: Optional[str] = None
+    for k, v in data.items():
+        if k.endswith("###attributes###collectionId") and isinstance(v, int):
+            cid = v
+        elif k.endswith("###attributes###collectionSlug") and isinstance(v, str):
+            slug = v
+    return (cid, slug) if (cid is not None and slug) else None
