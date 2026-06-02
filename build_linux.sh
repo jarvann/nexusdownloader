@@ -65,7 +65,7 @@ setup_venv() {
 install_deps() {
     log_info "Installing build dependencies..."
     python -m pip install --upgrade pip
-    pip install pyinstaller[encryption]
+    pip install "pyinstaller>=6.20.0"
     
     if [[ -f "requirements.txt" ]]; then
         pip install -r requirements.txt

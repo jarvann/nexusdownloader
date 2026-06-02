@@ -103,7 +103,7 @@ class Builder:
         
         # Install build dependencies
         self.log("Installing build dependencies...")
-        build_deps = ["pyinstaller[encryption]"]
+        build_deps = ["pyinstaller>=6.20.0"]
         
         if not self.run_command([self.pip_cmd, "install"] + build_deps):
             return False
