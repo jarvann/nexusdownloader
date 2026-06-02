@@ -204,3 +204,9 @@ build_dist/
 *.collection_resume.json
 .nexusdownloader_state/
 nul
+
+# Vortex DB tooling (Node) + spike scratch
+node_modules/
+package.json
+package-lock.json
+vortex_*.js
