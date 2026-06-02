@@ -838,21 +838,26 @@ class MainWindow(QMainWindow):
             try:
                 # Handle both executable and source code environments
                 if getattr(sys, 'frozen', False):
-                    # Running as PyInstaller executable
-                    # Config should be in the same directory as the executable
+                    # Running as a PyInstaller bundle. Bundled data lives under
+                    # sys._MEIPASS (the _internal/ folder in onedir builds), where
+                    # the spec places src/config.json.
                     app_dir = os.path.dirname(sys.executable)
-                    config_path = os.path.join(app_dir, "config.json")
+                    bundle_dir = getattr(sys, '_MEIPASS', app_dir)
+                    config_path = os.path.join(bundle_dir, "src", "config.json")
                 else:
                     # Running from source - use src/config.json
                     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../config.json")
-                
+
                 if not os.path.exists(config_path):
                     # Try alternative locations for config file
                     alternative_paths = []
                     if getattr(sys, 'frozen', False):
-                        # For executable, also try next to the exe in a src folder
+                        # For executable, try the bundle dir and next to the exe
                         app_dir = os.path.dirname(sys.executable)
+                        bundle_dir = getattr(sys, '_MEIPASS', app_dir)
                         alternative_paths = [
+                            os.path.join(bundle_dir, "config.json"),
+                            os.path.join(app_dir, "config.json"),
                             os.path.join(app_dir, "src", "config.json"),
                             os.path.join(app_dir, "..", "src", "config.json")
                         ]
