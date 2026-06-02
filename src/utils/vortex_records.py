@@ -87,6 +87,81 @@ def build_profile_modstate(profile_id: str, folder: str) -> Tuple[str, Dict[str,
     return base, _flatten({"enabled": True, "enabledTime": 0})
 
 
+def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[str, Any]:
+    """Build one ``requires`` rule for the collection mod's ``rules`` array.
+
+    ``reference.tag`` matches the member mod's ``attributes.referenceTag`` (both
+    are the collection.json ``source.tag``), which is how Vortex links an
+    installed mod to its collection slot.
+    """
+    s = mod.get("source", {})
+    return {
+        "type": "requires",
+        "reference": {
+            "description": mod.get("name", ""), "fileMD5": s.get("md5", ""),
+            "gameId": GAME_ID, "fileSize": s.get("fileSize", 0),
+            "versionMatch": f">={mod.get('version', '0')}+{s.get('updatePolicy', 'prefer')}",
+            "logicalFileName": s.get("logicalFilename") or mod.get("name", ""),
+            "tag": s.get("tag", ""), "md5Hint": s.get("md5", ""),
+            "repo": {
+                "repository": "nexus", "gameId": NEXUS_DOMAIN,
+                "modId": str(s.get("modId", "")), "fileId": str(s.get("fileId", "")),
+                "campaign": "collection",
+            },
+        },
+        "extra": {
+            "author": mod.get("author", ""),
+            "type": (mod.get("details") or {}).get("type", ""),
+            "category": (mod.get("details") or {}).get("category", ""),
+            "version": str(mod.get("version", "")), "name": mod.get("name", ""),
+            "phase": mod.get("phase", 0), "fileName": archive_name,
+        },
+    }
+
+
+def build_collection_mod(info: Dict[str, Any], coll_folder: str, archive_id: str,
+                         rules: list, revision_id: int, revision_number: int,
+                         collection_id: int, slug: str) -> Tuple[str, Dict[str, Any]]:
+    """Build the ``type:collection`` mod record at a given revision."""
+    tree = {
+        "id": coll_folder, "installationPath": coll_folder, "state": "installed",
+        "type": "collection", "archiveId": archive_id, "fileOverrides": [], "rules": rules,
+        "attributes": {
+            "source": "nexus", "downloadGame": GAME_ID, "endorsed": "Undecided",
+            "name": coll_folder, "customFileName": info.get("name", coll_folder),
+            "collectionId": collection_id, "collectionSlug": slug,
+            "revisionId": revision_id, "revisionNumber": revision_number,
+            "version": str(revision_number), "newestVersion": str(revision_number),
+            "installInstructions": info.get("installInstructions", ""),
+            "author": info.get("author", ""),
+        },
+    }
+    base = f"persistent{P}mods{P}{GAME_ID}{P}{coll_folder}"
+    return base, _flatten(tree)
+
+
+def build_collection_revision(info: Dict[str, Any], mods: list, revision_id: int,
+                              revision_number: int, collection_id: int,
+                              slug: str) -> Tuple[str, Dict[str, Any]]:
+    """Build the cached ``persistent.collections.revisions.<id>`` manifest."""
+    mod_files = [
+        {"file": {"modId": m["source"]["modId"], "fileId": m["source"]["fileId"],
+                  "size": m["source"].get("fileSize", 0), "name": m.get("name", "")}}
+        for m in mods if (m.get("source") or {}).get("type") == "nexus"
+    ]
+    tree = {
+        "timestamp": 0,
+        "info": {
+            "id": revision_id, "revisionNumber": revision_number,
+            "adultContent": True, "status": "published",
+            "collection": {"id": collection_id, "slug": slug},
+            "modFiles": mod_files,
+        },
+    }
+    base = f"persistent{P}collections{P}revisions{P}{revision_id}"
+    return base, _flatten(tree)
+
+
 def to_absolute(base: str, relative_leaves: Dict[str, Any]) -> Dict[str, str]:
     """Expand ``(base, {dotted.rel: value})`` into ``{full###key: json_value}``."""
     out: Dict[str, str] = {}

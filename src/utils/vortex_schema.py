@@ -104,6 +104,24 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "type": {"", "collection"},
         },
     ),
+    "collection": RecordSchema(
+        name="collection",
+        base_prefix=f"persistent{P}mods{P}{GAME_ID}",
+        required={
+            "id": "str", "installationPath": "str", "state": "enum", "type": "enum",
+            "attributes.source": "str", "attributes.name": "str",
+            "attributes.collectionId": "int", "attributes.collectionSlug": "str",
+            "attributes.revisionId": "int", "attributes.revisionNumber": "int",
+        },
+        optional={
+            "archiveId": "str", "fileOverrides": "array", "rules": "array",
+            "attributes.version": "str", "attributes.newestVersion": "str",
+            "attributes.customFileName": "str", "attributes.installInstructions": "str",
+            "attributes.author": "str", "attributes.downloadGame": "str",
+            "attributes.endorsed": "str",
+        },
+        enums={"state": {"installed", "installing"}, "type": {"collection"}},
+    ),
     "profile_modstate": RecordSchema(
         name="profile_modstate",
         base_prefix=f"persistent{P}profiles",  # full base is profiles###<id>###modState###<mod>
