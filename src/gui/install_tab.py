@@ -1,0 +1,693 @@
+"""
+Installation tab for the NexusDownloader GUI.
+
+Provides interface for installing downloaded mods using FOMOD technology
+with collection-based automation.
+"""
+
+import os
+import json
+import threading
+import logging
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog,
+    QTextEdit, QProgressBar, QGroupBox, QGridLayout, QListWidget, QSplitter,
+    QListWidgetItem, QMessageBox, QComboBox, QSpinBox, QCheckBox, QInputDialog
+)
+from PySide6.QtCore import QThread, Signal, Qt, QTimer
+from PySide6.QtGui import QFont
+
+# Import installation utilities
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from utils.fomod_installer import create_fomod_installer, create_parallel_fomod_installer, InstallationResult, InstallResult
+from utils.unified_logging import get_logger, create_operation_logger
+from utils.archive_handler import get_archive_handler
+from utils.vortex_config import get_vortex_config_reader
+
+
+class InstallWorkerThread(QThread):
+    """Worker thread for mod installation operations."""
+    
+    progress_updated = Signal(int, int, str)  # current, total, mod_name
+    installation_complete = Signal(str, bool, str)  # mod_name, success, message
+    log_message = Signal(str, str)  # level, message
+    installation_finished = Signal(list)  # List of InstallationResult
+    
+    def __init__(self, collection_path: str, downloads_path: str, staging_path: str, 
+                 use_parallel: bool = True, max_workers: int = 4):
+        super().__init__()
+        self.collection_path = collection_path
+        self.downloads_path = downloads_path
+        self.staging_path = staging_path
+        self.is_cancelled = False
+        self.use_parallel = use_parallel
+        self.max_workers = max_workers
+    
+    def cancel(self):
+        """Cancel the installation process."""
+        self.is_cancelled = True
+    
+    def run(self):
+        """Run the installation process."""
+        try:
+            self.log_message.emit("DEBUG", "InstallWorkerThread.run() started")
+            self.log_message.emit("INFO", f"Starting installation from {self.collection_path}")
+            
+            # Load collection data
+            self.log_message.emit("DEBUG", f"Loading collection from {self.collection_path}")
+            with open(self.collection_path, 'r', encoding='utf-8') as f:
+                collection_data = json.load(f)
+            self.log_message.emit("DEBUG", "Collection loaded successfully")
+            
+            mods = collection_data.get("mods", [])
+            total_mods = len(mods)
+            self.log_message.emit("DEBUG", f"Found {total_mods} mods in collection")
+            
+            if self.use_parallel:
+                self.log_message.emit("DEBUG", f"Using parallel installation with {self.max_workers} workers")
+                self.log_message.emit("INFO", f"Found {total_mods} mods to install using {self.max_workers} parallel threads")
+            else:
+                self.log_message.emit("DEBUG", "Using sequential installation")
+                self.log_message.emit("INFO", f"Found {total_mods} mods to install (sequential)")
+            
+            # Create installer
+            self.log_message.emit("DEBUG", "Creating installer logger")
+            # Setup installer logger using unified logging system
+            logger = create_operation_logger("install", "skyrimse")
+            self.log_message.emit("DEBUG", f"Logger created with handlers: {[type(h).__name__ for h in logger.handlers]}")
+            logger.info("Installation process started from GUI")
+            
+            if self.use_parallel and total_mods > 1:
+                self.log_message.emit("DEBUG", "Starting parallel installation")
+                # Use parallel installer for multiple mods
+                config = {
+                    "installation_timeout_seconds": 600
+                }
+                self.log_message.emit("DEBUG", "Creating parallel installer")
+                # Pass None as logger so installer creates its own file logger
+                with create_parallel_fomod_installer(self.staging_path, None, self.max_workers, config) as installer:
+                    # Set up callbacks for real-time progress updates
+                    self.log_message.emit("DEBUG", "Setting up callbacks")
+                    installer.set_progress_callback(self._on_progress_update)
+                    installer.set_installation_callback(self._on_installation_complete)
+                    
+                    # Run parallel installation (includes pre-scan)
+                    self.log_message.emit("DEBUG", "Starting install_collection_parallel with pre-scan")
+                    self.log_message.emit("INFO", f"Scanning staging folder for existing installations...")
+                    results = installer.install_collection_parallel(collection_data, self.downloads_path)
+                    self.log_message.emit("DEBUG", f"Parallel installation completed with {len(results)} results")
+                    
+                    # Report scan results
+                    skipped_count = sum(1 for r in results if r.status == InstallResult.SKIPPED)
+                    if skipped_count > 0:
+                        self.log_message.emit("INFO", f"Found {skipped_count} mods already installed - skipped reinstallation")
+                    
+                    if not self.is_cancelled:
+                        self.progress_updated.emit(total_mods, total_mods, "Complete")
+                        self.installation_finished.emit(results)
+                        
+                        successful = sum(1 for r in results if r.status == InstallResult.SUCCESS)
+                        failed = sum(1 for r in results if r.status == InstallResult.FAILED)
+                        skipped = sum(1 for r in results if r.status == InstallResult.SKIPPED)
+                        self.log_message.emit("INFO", f"Parallel installation finished: {successful} successful, {failed} failed, {skipped} skipped")
+            else:
+                self.log_message.emit("DEBUG", "Starting sequential installation")
+                # Use sequential installer for single mod or when parallel is disabled
+                self.log_message.emit("DEBUG", "Creating sequential installer")
+                self.log_message.emit("INFO", f"Scanning staging folder for existing installations...")
+                # Pass None as logger so installer creates its own file logger
+                with create_fomod_installer(self.staging_path, None) as installer:
+                    # Run sequential installation (includes pre-scan)
+                    results = installer.install_collection(collection_data, self.downloads_path)
+                    
+                    # Report scan results
+                    skipped_count = sum(1 for r in results if r.status == InstallResult.SKIPPED)
+                    if skipped_count > 0:
+                        self.log_message.emit("INFO", f"Found {skipped_count} mods already installed - skipped reinstallation")
+                    
+                    # Skip the old manual loop since install_collection now handles everything
+                    if not self.is_cancelled:
+                        self.progress_updated.emit(total_mods, total_mods, "Complete")
+                        self.installation_finished.emit(results)
+                        
+                        successful = sum(1 for r in results if r.status == InstallResult.SUCCESS)
+                        failed = sum(1 for r in results if r.status == InstallResult.FAILED)
+                        skipped = sum(1 for r in results if r.status == InstallResult.SKIPPED)
+                        self.log_message.emit("INFO", f"Installation finished: {successful} successful, {failed} failed, {skipped} skipped")
+                
+                return  # Exit early since install_collection handled everything
+        
+        except Exception as e:
+            self.log_message.emit("ERROR", f"Exception in InstallWorkerThread.run(): {e}")
+            import traceback
+            traceback.print_exc()
+            self.log_message.emit("ERROR", f"Installation failed: {str(e)}")
+    
+    def _on_progress_update(self, current: int, total: int, mod_name: str):
+        """Callback for parallel installer progress updates."""
+        if not self.is_cancelled:
+            self.progress_updated.emit(current, total, mod_name)
+    
+    def _on_installation_complete(self, mod_name: str, success: bool, message: str):
+        """Callback for individual mod installation completion."""
+        if not self.is_cancelled:
+            self.installation_complete.emit(mod_name, success, message)
+
+
+class InstallTab(QWidget):
+    """Installation tab widget."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.install_thread = None
+        self.collection_path = ""
+        self.downloads_path = ""
+        self.game_path = ""
+        
+        # Load configuration
+        self.config = self._load_config()
+        
+        self.setup_ui()
+        self.setup_connections()
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration from config.json."""
+        default_config = {
+            "installation": {
+                "max_concurrent_installs": 4,
+                "enable_parallel_installation": True,
+                "thread_safety_enabled": True,
+                "installation_timeout_seconds": 600
+            }
+        }
+        
+        try:
+            config_path = Path(__file__).parent.parent / "config.json"
+            if config_path.exists():
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                    # Merge with defaults to ensure all required keys exist
+                    if "installation" not in loaded_config:
+                        loaded_config["installation"] = default_config["installation"]
+                    return loaded_config
+        except Exception as e:
+            print(f"WARNING: Failed to load config: {e}")  # Use print since log_message might not be available yet
+        
+        # Return default configuration
+        return default_config
+    
+    def setup_ui(self):
+        """Setup the user interface."""
+        layout = QVBoxLayout(self)
+        
+        # Configuration section
+        config_group = QGroupBox("Installation Configuration")
+        config_layout = QGridLayout(config_group)
+        
+        # Collection file selection
+        config_layout.addWidget(QLabel("Collection File:"), 0, 0)
+        self.collection_path_edit = QLabel("No file selected")
+        self.collection_path_edit.setStyleSheet("QLabel { border: 1px solid gray; padding: 5px; }")
+        config_layout.addWidget(self.collection_path_edit, 0, 1)
+        self.browse_collection_btn = QPushButton("Browse...")
+        config_layout.addWidget(self.browse_collection_btn, 0, 2)
+        
+        # Downloads folder
+        config_layout.addWidget(QLabel("Downloads Folder:"), 1, 0)
+        self.downloads_path_edit = QLabel("No folder selected")
+        self.downloads_path_edit.setStyleSheet("QLabel { border: 1px solid gray; padding: 5px; }")
+        config_layout.addWidget(self.downloads_path_edit, 1, 1)
+        self.browse_downloads_btn = QPushButton("Browse...")
+        config_layout.addWidget(self.browse_downloads_btn, 1, 2)
+        
+        # Mod staging folder
+        config_layout.addWidget(QLabel("Mod Staging Folder:"), 2, 0)
+        self.game_path_edit = QLabel("No folder selected")
+        self.game_path_edit.setStyleSheet("QLabel { border: 1px solid gray; padding: 5px; }")
+        config_layout.addWidget(self.game_path_edit, 2, 1)
+        self.browse_game_btn = QPushButton("Browse...")
+        config_layout.addWidget(self.browse_game_btn, 2, 2)
+        
+        # Auto-detect button for Vortex integration
+        self.auto_detect_btn = QPushButton("Auto-Detect from Vortex")
+        self.auto_detect_btn.setToolTip("Automatically detect download and mod paths from Vortex installation")
+        config_layout.addWidget(self.auto_detect_btn, 3, 1, 1, 2)  # Span 2 columns
+        
+        layout.addWidget(config_group)
+        
+        # Options section
+        options_group = QGroupBox("Installation Options")
+        options_layout = QGridLayout(options_group)
+        
+        # First row - Basic options
+        self.overwrite_existing = QCheckBox("Overwrite existing files")
+        self.overwrite_existing.setChecked(True)
+        options_layout.addWidget(self.overwrite_existing, 0, 0)
+        
+        self.create_backup = QCheckBox("Create backup of existing files")
+        options_layout.addWidget(self.create_backup, 0, 1)
+        
+        self.skip_optional = QCheckBox("Skip optional mods")
+        options_layout.addWidget(self.skip_optional, 0, 2)
+        
+        # Second row - Parallel installation options
+        install_config = self.config.get("installation", {})
+        
+        self.parallel_install = QCheckBox("Enable parallel installation")
+        self.parallel_install.setChecked(install_config.get("enable_parallel_installation", True))
+        self.parallel_install.setToolTip("Install multiple mods simultaneously for faster processing")
+        options_layout.addWidget(self.parallel_install, 1, 0)
+        
+        options_layout.addWidget(QLabel("Max concurrent installs:"), 1, 1)
+        self.max_workers_spinbox = QSpinBox()
+        self.max_workers_spinbox.setMinimum(1)
+        self.max_workers_spinbox.setMaximum(16)
+        self.max_workers_spinbox.setValue(install_config.get("max_concurrent_installs", 4))
+        self.max_workers_spinbox.setToolTip("Number of mods to install simultaneously (1-16)")
+        options_layout.addWidget(self.max_workers_spinbox, 1, 2)
+        
+        layout.addWidget(options_group)
+        
+        # Control buttons
+        control_layout = QHBoxLayout()
+        self.start_install_btn = QPushButton("Start Installation")
+        self.start_install_btn.setEnabled(False)
+        control_layout.addWidget(self.start_install_btn)
+        
+        self.cancel_install_btn = QPushButton("Cancel Installation")
+        self.cancel_install_btn.setEnabled(False)
+        control_layout.addWidget(self.cancel_install_btn)
+        
+        control_layout.addStretch()
+        layout.addLayout(control_layout)
+        
+        # Progress section
+        progress_group = QGroupBox("Installation Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        
+        # Overall progress
+        self.overall_progress = QProgressBar()
+        self.overall_progress.setVisible(False)
+        progress_layout.addWidget(self.overall_progress)
+        
+        self.progress_label = QLabel("Ready to install")
+        progress_layout.addWidget(self.progress_label)
+        
+        # Splitter for mod list and log
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Mod installation status list
+        mod_status_group = QGroupBox("Mod Installation Status")
+        mod_status_layout = QVBoxLayout(mod_status_group)
+        
+        self.mod_status_list = QListWidget()
+        mod_status_layout.addWidget(self.mod_status_list)
+        
+        splitter.addWidget(mod_status_group)
+        
+        # Installation log
+        log_group = QGroupBox("Installation Log")
+        log_layout = QVBoxLayout(log_group)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        # Note: PySide6 QTextEdit doesn't have setMaximumBlockCount, using document().setMaximumBlockCount instead
+        self.log_text.document().setMaximumBlockCount(1000)  # Limit log size
+        log_layout.addWidget(self.log_text)
+        
+        # Log controls
+        log_controls = QHBoxLayout()
+        self.clear_log_btn = QPushButton("Clear Log")
+        log_controls.addWidget(self.clear_log_btn)
+        log_controls.addStretch()
+        log_layout.addLayout(log_controls)
+        
+        splitter.addWidget(log_group)
+        splitter.setSizes([300, 500])  # Set initial sizes
+        
+        progress_layout.addWidget(splitter)
+        layout.addWidget(progress_group)
+    
+    def setup_connections(self):
+        """Setup signal connections."""
+        self.browse_collection_btn.clicked.connect(self.browse_collection_file)
+        self.browse_downloads_btn.clicked.connect(self.browse_downloads_folder)
+        self.browse_game_btn.clicked.connect(self.browse_game_folder)
+        self.auto_detect_btn.clicked.connect(self.auto_detect_vortex_paths)
+        self.start_install_btn.clicked.connect(self.start_installation)
+        self.cancel_install_btn.clicked.connect(self.cancel_installation)
+        self.clear_log_btn.clicked.connect(self.clear_log)
+    
+    def browse_collection_file(self):
+        """Browse for collection JSON file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Collection File",
+            "",
+            "JSON files (*.json);;All files (*.*)"
+        )
+        
+        if file_path:
+            self.collection_path = file_path
+            self.collection_path_edit.setText(file_path)
+            self.update_start_button_state()
+            self.log_message("INFO", f"Selected collection: {file_path}")
+    
+    def browse_downloads_folder(self):
+        """Browse for downloads folder."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Downloads Folder",
+            ""
+        )
+        
+        if folder_path:
+            self.downloads_path = folder_path
+            self.downloads_path_edit.setText(folder_path)
+            self.update_start_button_state()
+            self.log_message("INFO", f"Selected downloads folder: {folder_path}")
+    
+    def browse_game_folder(self):
+        """Browse for mod staging folder."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Mod Staging Folder",
+            ""
+        )
+        
+        if folder_path:
+            self.game_path = folder_path
+            self.game_path_edit.setText(folder_path)
+            self.update_start_button_state()
+            self.log_message("INFO", f"Selected game folder: {folder_path}")
+    
+    def update_start_button_state(self):
+        """Update the state of the start installation button."""
+        can_start = bool(
+            self.collection_path and os.path.exists(self.collection_path) and
+            self.downloads_path and os.path.exists(self.downloads_path) and
+            self.game_path and os.path.exists(self.game_path) and
+            not (self.install_thread and self.install_thread.isRunning())
+        )
+        self.start_install_btn.setEnabled(can_start)
+    
+    def start_installation(self):
+        """Start the installation process."""
+        # Log debug information
+        if self.install_thread and self.install_thread.isRunning():
+            self.log_message("WARNING", "Installation already running, returning")
+            return
+        
+        # Clear previous results
+        self.mod_status_list.clear()
+        self.overall_progress.setValue(0)
+        self.overall_progress.setVisible(True)
+        
+        # Create and start installation thread
+        use_parallel = self.parallel_install.isChecked()
+        max_workers = self.max_workers_spinbox.value()
+        
+        self.log_message("DEBUG", f"Creating InstallWorkerThread with parallel={use_parallel}, workers={max_workers}")
+        self.log_message("DEBUG", f"Paths - collection: {self.collection_path}")
+        self.log_message("DEBUG", f"Paths - downloads: {self.downloads_path}")
+        self.log_message("DEBUG", f"Paths - staging: {self.game_path}")
+        
+        self.install_thread = InstallWorkerThread(
+            self.collection_path,
+            self.downloads_path,
+            self.game_path,
+            use_parallel,
+            max_workers
+        )
+        
+        # Connect signals
+        self.log_message("DEBUG", "Connecting signals")
+        self.install_thread.progress_updated.connect(self.update_progress)
+        self.install_thread.installation_complete.connect(self.on_mod_installed)
+        self.install_thread.log_message.connect(self.log_message)
+        self.install_thread.installation_finished.connect(self.on_installation_finished)
+        
+        self.log_message("DEBUG", "Starting thread")
+        self.install_thread.start()
+        
+        # Update UI state
+        self.start_install_btn.setEnabled(False)
+        self.cancel_install_btn.setEnabled(True)
+        
+        self.log_message("DEBUG", "Installation process started")
+        self.log_message("INFO", "Starting installation process...")
+    
+    def cancel_installation(self):
+        """Cancel the current installation."""
+        if self.install_thread and self.install_thread.isRunning():
+            self.install_thread.cancel()
+            self.log_message("WARNING", "Installation cancelled by user")
+            
+            # Update UI state
+            self.cancel_install_btn.setEnabled(False)
+            self.progress_label.setText("Cancelling...")
+    
+    def update_progress(self, current: int, total: int, mod_name: str):
+        """Update installation progress."""
+        if total > 0:
+            progress_percent = int((current / total) * 100)
+            self.overall_progress.setValue(progress_percent)
+            
+        if current < total:
+            self.progress_label.setText(f"Installing {current+1}/{total}: {mod_name}")
+        else:
+            self.progress_label.setText(f"Installation complete: {current}/{total}")
+    
+    def on_mod_installed(self, mod_name: str, success: bool, message: str):
+        """Handle individual mod installation completion."""
+        item = QListWidgetItem(f"{mod_name}: {message}")
+        if success:
+            item.setBackground(Qt.green)
+        else:
+            item.setBackground(Qt.red)
+        
+        self.mod_status_list.addItem(item)
+        self.mod_status_list.scrollToBottom()
+    
+    def on_installation_finished(self, results: List[InstallationResult]):
+        """Handle completion of entire installation process."""
+        # Update UI state
+        self.start_install_btn.setEnabled(True)
+        self.cancel_install_btn.setEnabled(False)
+        self.overall_progress.setVisible(False)
+        
+        # Show summary
+        successful = sum(1 for r in results if r.status == InstallResult.SUCCESS)
+        failed = sum(1 for r in results if r.status == InstallResult.FAILED)
+        skipped = sum(1 for r in results if r.status == InstallResult.SKIPPED)
+        
+        self.progress_label.setText(f"Installation finished: {successful} successful, {failed} failed, {skipped} skipped")
+        
+        # Show completion dialog
+        if failed == 0:
+            if skipped > 0:
+                QMessageBox.information(
+                    self,
+                    "Installation Complete",
+                    f"Installation completed successfully!\n\n"
+                    f"• {successful} mods installed\n"
+                    f"• {skipped} mods already installed (skipped)"
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Installation Complete",
+                    f"Successfully installed all {successful} mods!"
+                )
+        else:
+            summary_parts = [f"{successful} successful", f"{failed} failed"]
+            if skipped > 0:
+                summary_parts.append(f"{skipped} skipped")
+            
+            QMessageBox.warning(
+                self,
+                "Installation Complete with Errors",
+                f"Installation finished with {', '.join(summary_parts)} installations.\n"
+                "Check the log for details."
+            )
+    
+    def log_message(self, level: str, message: str):
+        """Add a message to the log."""
+        # Color code by log level
+        color_map = {
+            "DEBUG": "gray",
+            "INFO": "black",
+            "WARNING": "orange",
+            "ERROR": "red"
+        }
+        
+        color = color_map.get(level, "black")
+        formatted_message = f'<span style="color: {color};">[{level}] {message}</span>'
+        
+        self.log_text.append(formatted_message)
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+    
+    def clear_log(self):
+        """Clear the installation log."""
+        self.log_text.clear()
+    
+    def set_downloads_path(self, path: str):
+        """Set the downloads path from external source."""
+        if path and os.path.exists(path):
+            self.downloads_path = path
+            self.downloads_path_edit.setText(path)
+            self.update_start_button_state()
+    
+    def set_game_path(self, path: str):
+        """Set the game path from external source."""
+        if path and os.path.exists(path):
+            self.game_path = path
+            self.game_path_edit.setText(path)
+            self.update_start_button_state()
+    
+    def auto_detect_vortex_paths(self):
+        """Auto-detect game paths from Vortex installation."""
+        try:
+            # Create Vortex config reader
+            vortex_reader = get_vortex_config_reader()
+            
+            # First check if we can determine game domain from collection
+            game_domain = self._extract_game_domain_from_collection()
+            
+            if not game_domain:
+                # Show dialog to let user select game
+                game_domain = self._show_game_selection_dialog(vortex_reader)
+                
+            if not game_domain:
+                QMessageBox.information(
+                    self,
+                    "Auto-Detection",
+                    "Could not determine game domain. Please select a collection file first or choose a game manually."
+                )
+                return
+            
+            # Auto-detect paths
+            paths = vortex_reader.auto_detect_paths(game_domain)
+            
+            if not paths['vortex_found']:
+                QMessageBox.warning(
+                    self,
+                    "Vortex Not Found",
+                    "Could not find Vortex Mod Manager installation.\n\n"
+                    "Please ensure Vortex is installed and has been run at least once.\n\n"
+                    "If Vortex is currently running, please close it and try again."
+                )
+                return
+            
+            # Update paths if found
+            updates = []
+            if paths['downloads_folder']:
+                self.downloads_path = paths['downloads_folder']
+                self.downloads_path_edit.setText(paths['downloads_folder'])
+                updates.append(f"Downloads: {paths['downloads_folder']}")
+                
+            if paths['mods_folder']:
+                self.game_path = paths['mods_folder']
+                self.game_path_edit.setText(paths['mods_folder'])
+                updates.append(f"Mod Staging: {paths['mods_folder']}")
+            
+            self.update_start_button_state()
+            
+            if updates:
+                QMessageBox.information(
+                    self,
+                    "Auto-Detection Successful",
+                    f"Successfully detected paths for {game_domain}:\n\n" + "\n".join(updates)
+                )
+                self.log_message("INFO", f"Auto-detected Vortex paths for {game_domain}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Paths Not Found",
+                    f"Vortex was found but no paths could be detected for {game_domain}.\n\n"
+                    "This may be because the game is not managed by Vortex or paths are not configured."
+                )
+        
+        except Exception as e:
+            error_msg = str(e)
+            if "Permission denied" in error_msg or "Errno 13" in error_msg:
+                QMessageBox.warning(
+                    self,
+                    "Vortex Access Error",
+                    "Cannot access Vortex configuration files.\n\n"
+                    "This usually happens when Vortex is currently running.\n"
+                    "Please close Vortex and try auto-detection again.\n\n"
+                    f"Technical details: {error_msg}"
+                )
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Auto-Detection Error",
+                    f"An error occurred during auto-detection:\n\n{error_msg}"
+                )
+            self.log_message("ERROR", f"Auto-detection failed: {error_msg}")
+    
+    def _extract_game_domain_from_collection(self) -> Optional[str]:
+        """Extract game domain from the selected collection file."""
+        if not self.collection_path or not os.path.exists(self.collection_path):
+            return None
+        
+        try:
+            with open(self.collection_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            info = data.get('info', {})
+            domain = info.get('domainName')
+            
+            if domain:
+                self.log_message("INFO", f"Extracted game domain from collection: {domain}")
+                return domain
+        
+        except Exception as e:
+            self.log_message("WARNING", f"Could not extract game domain from collection: {e}")
+        
+        return None
+    
+    def _show_game_selection_dialog(self, vortex_reader) -> Optional[str]:
+        """Show dialog for user to select a game from Vortex managed games."""
+        try:
+            managed_games = vortex_reader.list_managed_games()
+            if not managed_games:
+                QMessageBox.information(
+                    self,
+                    "No Games Found",
+                    "No games found in Vortex configuration.\n\n"
+                    "Please ensure Vortex is installed and has discovered at least one game."
+                )
+                return None
+            
+            game_names = [f"{game.game_name} ({game.game_id})" for game in managed_games]
+            
+            selected, ok = QInputDialog.getItem(
+                self,
+                "Select Game",
+                "Select the game to configure paths for:",
+                game_names,
+                0,
+                False
+            )
+            
+            if ok and selected:
+                # Extract game_id from the selected item
+                game_id = selected.split('(')[-1].rstrip(')')
+                return game_id
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Error showing game selection dialog:\n\n{str(e)}"
+            )
+            self.log_message("ERROR", f"Error showing game selection dialog: {e}")
+        
+        return None
