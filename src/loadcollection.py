@@ -3,10 +3,9 @@ import argparse
 import concurrent.futures
 import logging
 import sys
-from endorse import endorse_mod  # Importing the endorse function from endorse.py
-from download import download_file  # Importing the download function from download.py
-from download import set_download_logger  # Importing the set_download_logger function from download.py
-from endorse import set_endorse_logger  # Importing the endorse function from endorse.py
+import download, endorse  # Import modules
+from download import download_file, set_download_logger  # Importing functions from download.py
+from endorse import endorse_mod, set_endorse_logger  # Importing functions from endorse.py
 import threading
 import time
 import os
@@ -30,23 +29,12 @@ def verbose(self, message, *args, **kws):
 logging.Logger.verbose = verbose
 
 def setup_logger(game_domain, operation_type="download"):
-    # Ensure logs directory exists at project root
-    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    logs_dir = os.path.join(root_dir, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    log_filename = os.path.join(logs_dir, f"log_{operation_type}_{game_domain}_{timestamp}.log")
-    logger = logging.getLogger("nexusdownloader")
-    logger.setLevel(VERBOSE_LEVEL_NUM)
-    fh = logging.FileHandler(log_filename, mode='a', encoding='utf-8')
-    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(threadName)s: %(message)s')
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    # Ensure all threads flush after each log
-    # for handler in logger.handlers:
-    #     handler.flush = True
-
+    """Setup logger for collection operations using unified logging system."""
+    from utils.unified_logging import create_operation_logger
+    
+    logger = create_operation_logger(operation_type, game_domain)
     set_download_logger(logger)  # Set the logger for download.py
+    return logger
     set_endorse_logger(logger) # Set the logger for endorse.py
     logger.verbose(f"Logger initialized for game domain: {game_domain}")    
     
