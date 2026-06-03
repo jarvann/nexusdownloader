@@ -50,7 +50,11 @@ def _run_bridge(cmd: str, db_path: str, *args: Optional[str],
                 node: str = "node", timeout: float = 120.0) -> subprocess.CompletedProcess:
     argv = [node, _bridge_path(), cmd, db_path]
     argv.extend(a for a in args if a is not None)
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    # The bridge emits UTF-8 JSON (mod names contain non-ASCII chars). Decode as
+    # UTF-8 explicitly -- on Windows text=True defaults to cp1252, which crashes
+    # the stdout reader thread on bytes like 0x81/0x9d and returns empty output.
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                          encoding="utf-8", errors="replace")
 
 
 def probe(db_path: str, node: str = "node") -> bool:
