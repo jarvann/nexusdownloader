@@ -125,7 +125,16 @@ class VortexConfigReader:
         if not state_file.exists():
             self._log("WARNING", f"State file not found: {state_file}")
             return None
-        
+
+        # Modern Vortex stores state.v2 as a LevelDB *directory*, not a JSON file.
+        # Opening a directory throws a misleading "permission denied", so detect
+        # it and skip the JSON path-detection quietly (paths are set manually, and
+        # the Vortex sync reads the DB through its Node bridge instead).
+        if state_file.is_dir():
+            self._log("DEBUG", "state.v2 is a LevelDB directory (modern Vortex); "
+                               "skipping JSON config parse")
+            return None
+
         try:
             # Try reading as plain JSON first
             with open(state_file, 'r', encoding='utf-8') as f:

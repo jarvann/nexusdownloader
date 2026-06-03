@@ -25,10 +25,40 @@ class CustomRotatingFileHandler(logging.handlers.RotatingFileHandler):
     Uses: nexusdownloader_001.log, nexusdownloader_002.log
     """
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # When a rollover can't happen (file locked by another process), pause
+        # rollover attempts for a bit instead of retrying -- and crashing -- on
+        # every record. Unix time after which we may try to roll over again.
+        self._rollover_paused_until = 0.0
+
+    def shouldRollover(self, record):
+        if time.time() < self._rollover_paused_until:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self):
+        """Rotate, but survive Windows file locks.
+
+        The GUI process and the download subprocess both log to the same file, so
+        on Windows os.rename() can fail with "used by another process". When that
+        happens, don't crash/spam: reopen the current file, keep appending, and
+        back off rollover attempts for a while.
+        """
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            self._rollover_paused_until = time.time() + 60
+            if self.stream is None and not self.delay:
+                try:
+                    self.stream = self._open()
+                except OSError:
+                    pass
+
     def rotation_filename(self, default_name):
         """
         Generate backup filename with number before extension.
-        
+
         RotatingFileHandler calls this with names like 'filename.ext.1', 'filename.ext.2'
         We convert them to 'filename_001.ext', 'filename_002.ext'
         """
