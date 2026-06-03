@@ -192,3 +192,20 @@ def read_collection_identity(db_path: str, game: str = "skyrimse",
     cid = next((v for v in cid_data.values() if isinstance(v, int)), None)
     slug = next((v for v in slug_data.values() if isinstance(v, str)), None)
     return (cid, slug) if (cid is not None and slug) else None
+
+
+def collection_diagnostic(db_path: str, game: str = "skyrimse", node: str = "node") -> str:
+    """Short diagnostic of what the DB read sees -- included in errors so a failure
+    is self-explaining (db path, how many mods / collection records were found)."""
+    try:
+        states = read_prefix(db_path, f"persistent###mods###{game}###",
+                             node=node, suffix="###state")
+        types = read_prefix(db_path, f"persistent###mods###{game}###",
+                            node=node, suffix="###type")
+        cids = read_prefix(db_path, f"persistent###mods###{game}###",
+                          node=node, suffix="###attributes###collectionId")
+        collections = sum(1 for v in types.values() if v == "collection")
+        return (f"db={db_path}; mods={len(states)}, collections={collections}, "
+                f"collectionId_keys={len(cids)}")
+    except Exception as e:
+        return f"db={db_path}; diagnostic read failed: {e}"

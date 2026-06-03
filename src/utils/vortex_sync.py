@@ -284,9 +284,11 @@ def sync_collection(collection_path: str, downloads_dir: str, staging_dir: str, 
 
     identity = vortex_db.read_collection_identity(db_path, node=node)
     if not identity:
+        diag = vortex_db.collection_diagnostic(db_path, node=node)
         raise RuntimeError(
-            "Could not determine the collection's id/slug from Vortex. Add the "
-            "collection in Vortex once so it knows it, then re-sync.")
+            "Could not determine the collection's id/slug from Vortex. "
+            f"[{diag}] If the collection isn't in Vortex yet, add it once so it "
+            "knows it, then re-sync.")
     collection_id, slug = identity
 
     return run(db_path, collection_path, downloads_dir, staging_dir, profile_id,
