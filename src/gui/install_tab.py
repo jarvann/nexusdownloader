@@ -491,10 +491,15 @@ class InstallTab(QWidget):
         self.link_vortex_btn.setEnabled(True)
         if res.applied:
             self.log_message("INFO", f"Vortex sync applied: {res.plan.mod_count} mods, "
-                                     f"{res.keys_written} keys. Backup: {res.backup_path}")
+                                     f"{res.keys_written} keys, replaced "
+                                     f"{res.replaced_collections} old revision(s). "
+                                     f"Backup: {res.backup_path}")
+            replaced = (f"Replaced {res.replaced_collections} old collection revision(s).\n"
+                        if res.replaced_collections else "")
             QMessageBox.information(
                 self, "Linked to Vortex",
-                f"Linked {res.plan.mod_count} mods and the collection into Vortex.\n\n"
+                f"Linked {res.plan.mod_count} mods and the collection into Vortex.\n"
+                f"{replaced}\n"
                 f"Backup of your Vortex DB: {res.backup_path}\n\n"
                 f"Now open Vortex and click Deploy Mods.")
         else:

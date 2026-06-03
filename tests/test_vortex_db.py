@@ -1,4 +1,5 @@
 """Tests for the Vortex DB guard layer (lock/concurrency checks, guarded writes)."""
+import json
 import subprocess
 
 import pytest
@@ -61,6 +62,23 @@ def test_write_records_aborts_if_locked_midwrite(monkeypatch, tmp_path):
     monkeypatch.setattr(vdb, "_run_bridge", lambda *a, **k: _completed(3, "", "LOCKED"))
     with pytest.raises(vdb.VortexBusyError):
         vdb.write_records("/db", {"a": "1"})
+
+
+def test_write_records_includes_delete_prefixes(monkeypatch, tmp_path):
+    monkeypatch.setattr(vdb, "ensure_available", lambda *a, **k: None)
+    monkeypatch.setattr(vdb, "backup_db", lambda db: str(tmp_path / "bak"))
+    captured = {}
+
+    def fake_bridge(cmd, db, arg=None, **k):
+        if cmd == "write":
+            with open(arg) as fh:
+                captured["batch"] = json.load(fh)
+        return _completed(0, "3\n")
+
+    monkeypatch.setattr(vdb, "_run_bridge", fake_bridge)
+    vdb.write_records("/db", {"a": "1"}, delete_prefixes=["p1", "p2"])
+    assert captured["batch"]["put"] == {"a": "1"}
+    assert captured["batch"]["delPrefixes"] == ["p1", "p2"]
 
 
 def test_read_prefix_decodes_json(monkeypatch):

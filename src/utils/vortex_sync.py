@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Tuple
 
 from utils import vortex_records as vr
 from utils.vortex_schema import (
-    validate_record, assess_risk, RiskAssessment, RECORD_SCHEMAS,
+    GAME_ID, validate_record, assess_risk, RiskAssessment, RECORD_SCHEMAS,
 )
 
 ARCHIVE_RE = re.compile(r"\.(7z|zip|rar)$", re.IGNORECASE)
@@ -144,6 +144,33 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
 # --------------------------------------------------------------------------- #
 # I/O orchestration
 # --------------------------------------------------------------------------- #
+def find_replaceable_collections(mods_data: Dict[str, object], collection_id: int,
+                                 keep_folder: str, profile_id: str,
+                                 game: str = GAME_ID) -> List[str]:
+    """Prefixes to delete for OLD revisions of the same collection.
+
+    Given ``persistent.mods.<game>.*`` data, find collection-type mod records that
+    share ``collection_id`` but aren't the folder we're writing now, and return
+    the prefixes (the old collection mod + its profile modState) to remove -- so a
+    198 -> 232 update doesn't leave two collection entries behind.
+    """
+    by_folder: Dict[str, Dict[str, object]] = {}
+    for k, v in mods_data.items():
+        parts = k.split("###")
+        if len(parts) < 5:
+            continue
+        by_folder.setdefault(parts[3], {})[".".join(parts[4:])] = v
+
+    prefixes: List[str] = []
+    for folder, leaves in by_folder.items():
+        if folder == keep_folder:
+            continue
+        if leaves.get("type") == "collection" and leaves.get("attributes.collectionId") == collection_id:
+            prefixes.append(f"persistent###mods###{game}###{folder}")
+            prefixes.append(f"persistent###profiles###{profile_id}###modState###{folder}")
+    return prefixes
+
+
 @dataclass
 class SyncResult:
     applied: bool
@@ -152,6 +179,7 @@ class SyncResult:
     keys_written: int = 0
     backup_path: str = ""
     message: str = ""
+    replaced_collections: int = 0   # old collection revisions removed
 
 
 def _sample_live_records(read_prefix, db_path) -> Dict[str, Dict[str, Any]]:
@@ -177,8 +205,13 @@ def _sample_live_records(read_prefix, db_path) -> Dict[str, Dict[str, Any]]:
 
 def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str,
         profile_id: str, *, collection_id: int, slug: str,
-        apply: bool = False, force: bool = False, node: str = "node") -> SyncResult:
-    """Read state, assess drift, check the lock, build+validate, and (optionally) write."""
+        apply: bool = False, force: bool = False, replace: bool = True,
+        node: str = "node") -> SyncResult:
+    """Read state, assess drift, check the lock, build+validate, and (optionally) write.
+
+    When ``replace`` is set, old revisions of the same collection are removed in
+    the same write so the update doesn't leave a stale collection record behind.
+    """
     import json
     from utils import vortex_db
 
@@ -216,12 +249,21 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
         return SyncResult(False, plan, risk,
                           message=f"aborted: {risk.message} (use force=True to override)")
 
-    res = vortex_db.write_records(db_path, plan.records, backup=True, node=node)
-    return SyncResult(True, plan, risk, res.keys_written, res.backup_path, "applied")
+    # Replace old revisions of the same collection (delete in the same batch).
+    delete_prefixes: List[str] = []
+    if replace:
+        mods_data = vortex_db.read_prefix(db_path, f"persistent###mods###{GAME_ID}###", node=node)
+        delete_prefixes = find_replaceable_collections(
+            mods_data, collection_id, collection_folder, profile_id)
+
+    res = vortex_db.write_records(db_path, plan.records, backup=True, node=node,
+                                  delete_prefixes=delete_prefixes)
+    return SyncResult(True, plan, risk, res.keys_written, res.backup_path, "applied",
+                      replaced_collections=len(delete_prefixes) // 2)
 
 
 def sync_collection(collection_path: str, downloads_dir: str, staging_dir: str, *,
-                    apply: bool = False, force: bool = False,
+                    apply: bool = False, force: bool = False, replace: bool = True,
                     node: str = "node") -> SyncResult:
     """High-level entry for the GUI: auto-discover the Vortex DB, active profile,
     and collection identity, then run the sync.
@@ -248,7 +290,8 @@ def sync_collection(collection_path: str, downloads_dir: str, staging_dir: str, 
     collection_id, slug = identity
 
     return run(db_path, collection_path, downloads_dir, staging_dir, profile_id,
-               collection_id=collection_id, slug=slug, apply=apply, force=force, node=node)
+               collection_id=collection_id, slug=slug, apply=apply, force=force,
+               replace=replace, node=node)
 
 
 def _main(argv=None):

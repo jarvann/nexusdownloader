@@ -73,6 +73,29 @@ def test_revision_manifest_written():
     assert p.records[mid] == "232"
 
 
+def test_find_replaceable_collections():
+    mods = {
+        # old rev-198 collection -> should be replaced
+        "persistent###mods###skyrimse###Coll-498825-198-x###type": "collection",
+        "persistent###mods###skyrimse###Coll-498825-198-x###attributes###collectionId": 26945,
+        # a normal mod sharing the id field -> must NOT be deleted (type != collection)
+        "persistent###mods###skyrimse###SomeMod-1-2-3###type": "",
+        "persistent###mods###skyrimse###SomeMod-1-2-3###attributes###collectionId": 26945,
+        # the current rev-232 collection (keep_folder) -> must NOT be deleted
+        "persistent###mods###skyrimse###Coll-689581-232-y###type": "collection",
+        "persistent###mods###skyrimse###Coll-689581-232-y###attributes###collectionId": 26945,
+        # a different collection -> must NOT be touched
+        "persistent###mods###skyrimse###Other-111-1-z###type": "collection",
+        "persistent###mods###skyrimse###Other-111-1-z###attributes###collectionId": 999,
+    }
+    prefixes = vs.find_replaceable_collections(mods, 26945, "Coll-689581-232-y", "PROF")
+    assert "persistent###mods###skyrimse###Coll-498825-198-x" in prefixes
+    assert "persistent###profiles###PROF###modState###Coll-498825-198-x" in prefixes
+    assert not any("SomeMod" in p for p in prefixes)   # normal mod untouched
+    assert not any("689581" in p for p in prefixes)    # current revision kept
+    assert not any("Other" in p for p in prefixes)     # different collection untouched
+
+
 def test_helpers():
     assert vs.parse_revision_from_folder("X-689581-232-1777961508") == (689581, 232)
     idx = vs.index_by_modid(["A-100-1-0.zip", "B-200-1.7z", "notes.txt"], archives_only=True)

@@ -50,11 +50,23 @@ async function open(db) {
       for await (const [k, v] of lvl.iterator({ gte: prefix, lte: prefix + '\xff' })) out[k] = v;
       process.stdout.write(JSON.stringify(out));
     } else if (cmd === 'write') {
+      // Batch can be a plain {key: value} put-map, OR a structured
+      // {put: {...}, delPrefixes: [...]} that also deletes every key under each
+      // prefix (used to replace an old collection revision atomically).
       const batchObj = JSON.parse(fs.readFileSync(arg, 'utf8'));
+      const structured = ('put' in batchObj) || ('delPrefixes' in batchObj);
+      const puts = structured ? (batchObj.put || {}) : batchObj;
+      const delPrefixes = structured ? (batchObj.delPrefixes || []) : [];
       const batch = lvl.batch();
-      for (const [k, v] of Object.entries(batchObj)) batch.put(k, v);
+      let delCount = 0;
+      for (const pfx of delPrefixes) {
+        for await (const [k] of lvl.iterator({ gte: pfx, lte: pfx + '\xff' })) {
+          batch.del(k); delCount++;
+        }
+      }
+      for (const [k, v] of Object.entries(puts)) batch.put(k, v);
       await batch.write({ sync: true });
-      console.log(Object.keys(batchObj).length);
+      console.log(Object.keys(puts).length + delCount);
     } else {
       console.error('unknown command', cmd); process.exit(1);
     }

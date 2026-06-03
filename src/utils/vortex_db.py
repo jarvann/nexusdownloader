@@ -104,11 +104,14 @@ def backup_db(db_path: str) -> str:
 
 
 def write_records(db_path: str, records: Dict[str, str], *,
-                  backup: bool = True, node: str = "node") -> WriteResult:
+                  backup: bool = True, node: str = "node",
+                  delete_prefixes: Optional[list] = None) -> WriteResult:
     """Atomically write ``{full###key: json_value}`` records after safety checks.
 
-    Re-checks availability immediately before writing (defends against Vortex
-    being launched between an earlier check and this call).
+    ``delete_prefixes`` (optional) removes every key under each prefix in the same
+    batch -- used to replace an old collection revision cleanly. Re-checks
+    availability immediately before writing (defends against Vortex being
+    launched between an earlier check and this call).
     """
     ensure_available(db_path, node=node)
     bak = backup_db(db_path) if backup else ""
@@ -116,10 +119,11 @@ def write_records(db_path: str, records: Dict[str, str], *,
     # Re-check right before the write to narrow the race window.
     ensure_available(db_path, node=node)
 
+    batch = {"put": records, "delPrefixes": list(delete_prefixes or [])}
     fd, batch_file = tempfile.mkstemp(suffix=".json", prefix="vortex_batch_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(records, fh)
+            json.dump(batch, fh)
         res = _run_bridge("write", db_path, batch_file, node=node)
         if res.returncode == 3:
             raise VortexBusyError(
