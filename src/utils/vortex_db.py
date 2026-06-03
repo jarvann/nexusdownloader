@@ -46,11 +46,10 @@ def _bridge_path() -> str:
     return os.path.normpath(os.path.join(here, "..", "..", "vortex_leveldb.js"))
 
 
-def _run_bridge(cmd: str, db_path: str, arg: Optional[str] = None,
+def _run_bridge(cmd: str, db_path: str, *args: Optional[str],
                 node: str = "node", timeout: float = 120.0) -> subprocess.CompletedProcess:
     argv = [node, _bridge_path(), cmd, db_path]
-    if arg is not None:
-        argv.append(arg)
+    argv.extend(a for a in args if a is not None)
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
@@ -138,9 +137,15 @@ def write_records(db_path: str, records: Dict[str, str], *,
             pass
 
 
-def read_prefix(db_path: str, prefix: str, node: str = "node") -> Dict[str, object]:
-    """Read all keys under ``prefix``; returns ``{key: decoded_value}``."""
-    res = _run_bridge("read", db_path, prefix, node=node)
+def read_prefix(db_path: str, prefix: str, node: str = "node",
+                suffix: Optional[str] = None) -> Dict[str, object]:
+    """Read keys under ``prefix`` (optionally only those ending with ``suffix``).
+
+    The ``suffix`` filter keeps reads small -- e.g. fetching just collectionId
+    keys instead of the whole (huge) mods section -- which is far more robust
+    under heavy disk load.
+    """
+    res = _run_bridge("read", db_path, prefix, suffix, node=node)
     if res.returncode != 0:
         raise RuntimeError(f"DB read failed: {res.stderr.strip()}")
     raw = json.loads(res.stdout or "{}")
@@ -178,12 +183,12 @@ def read_collection_identity(db_path: str, game: str = "skyrimse",
     Works when a prior revision of the collection is already known to Vortex
     (the common "update" case). Returns None if no collection is present.
     """
-    data = read_prefix(db_path, f"persistent###mods###{game}###", node=node)
-    cid: Optional[int] = None
-    slug: Optional[str] = None
-    for k, v in data.items():
-        if k.endswith("###attributes###collectionId") and isinstance(v, int):
-            cid = v
-        elif k.endswith("###attributes###collectionSlug") and isinstance(v, str):
-            slug = v
+    base = f"persistent###mods###{game}###"
+    # Two small, filtered reads instead of pulling the whole mods section (which
+    # includes the multi-hundred-KB collection `rules` value and can choke a read
+    # under heavy disk load).
+    cid_data = read_prefix(db_path, base, node=node, suffix="###attributes###collectionId")
+    slug_data = read_prefix(db_path, base, node=node, suffix="###attributes###collectionSlug")
+    cid = next((v for v in cid_data.values() if isinstance(v, int)), None)
+    slug = next((v for v in slug_data.values() if isinstance(v, str)), None)
     return (cid, slug) if (cid is not None and slug) else None

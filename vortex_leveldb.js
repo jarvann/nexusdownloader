@@ -46,8 +46,17 @@ async function open(db) {
   try {
     if (cmd === 'read') {
       const prefix = arg || '';
+      const suffix = process.argv[5] || '';   // optional: only return keys ending with this
       const out = {};
-      for await (const [k, v] of lvl.iterator({ gte: prefix, lte: prefix + '\xff' })) out[k] = v;
+      if (suffix) {
+        // Keys-only scan, then fetch values for matches only -- avoids reading
+        // huge values (e.g. a collection's `rules`) we don't want.
+        for await (const k of lvl.keys({ gte: prefix, lte: prefix + '\xff' })) {
+          if (k.endsWith(suffix)) out[k] = await lvl.get(k);
+        }
+      } else {
+        for await (const [k, v] of lvl.iterator({ gte: prefix, lte: prefix + '\xff' })) out[k] = v;
+      }
       process.stdout.write(JSON.stringify(out));
     } else if (cmd === 'write') {
       // Batch can be a plain {key: value} put-map, OR a structured
