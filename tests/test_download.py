@@ -82,6 +82,34 @@ def test_truncation_guard_retries_then_raises(monkeypatch, tmp_path):
     assert not (tmp_path / "skyrimse" / "test-1-0.7z").exists()
 
 
+def test_get_download_url_retries_on_timeout(monkeypatch):
+    import logging
+    download.set_download_logger(logging.getLogger("t"))
+    cfg = types.SimpleNamespace(AccessControl=types.SimpleNamespace(NexusAPIKey="k"))
+    monkeypatch.setattr(download, "CONFIG", cfg, raising=False)
+    monkeypatch.setattr(download.time, "sleep", lambda *a, **k: None)
+
+    class R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{"URI": "http://dl/file.7z"}]
+
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(timeout)
+        if len(calls) < 3:
+            raise requests.exceptions.Timeout("read timed out")
+        return R()
+
+    monkeypatch.setattr(download.requests, "get", fake_get)
+    assert download.get_download_url("skyrimspecialedition", 1, 2) == "http://dl/file.7z"
+    assert len(calls) == 3              # two timeouts, then success
+    assert all(t == 30 for t in calls)  # timeout is actually set on the request
+
+
 def test_existing_file_is_skipped(monkeypatch, tmp_path):
     (tmp_path / "skyrimse").mkdir()
     (tmp_path / "skyrimse" / "test-1-0.7z").write_bytes(b"already")

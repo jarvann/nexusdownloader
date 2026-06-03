@@ -91,27 +91,41 @@ def get_download_url(game_domain, mod_id, file_id):
     }
 
     url = f'https://api.nexusmods.com/v1/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json'
-    
-    try:
-        logger.debug(f"Making API request to: {url}")
-        response = requests.get(url, headers=header)
-        response.raise_for_status()
-        download_info = response.json()
-        
-        if download_info:
-            download_url = download_info[0]['URI']
-            logger.info(f"Successfully obtained download URL for mod {mod_id}, file {file_id}")
-            return download_url
-        else:
+
+    # Retry transient API failures (timeouts, 5xx, dropped connections). Without
+    # this a single slow Nexus API response would skip the mod entirely -- and a
+    # missing timeout could hang a worker thread forever.
+    last_error = None
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        try:
+            logger.debug(f"Making API request to: {url}")
+            response = requests.get(url, headers=header, timeout=30)
+            response.raise_for_status()
+            download_info = response.json()
+
+            if download_info:
+                logger.info(f"Successfully obtained download URL for mod {mod_id}, file {file_id}")
+                return download_info[0]['URI']
             logger.warning(f"No download links available for mod {mod_id}, file {file_id}")
             return None
-            
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to get download URL for mod {mod_id}, file {file_id}: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error getting download URL: {e}")
-        raise
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < MAX_DOWNLOAD_RETRIES:
+                backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(f"URL fetch failed for mod {mod_id}, file {file_id} "
+                               f"(attempt {attempt}/{MAX_DOWNLOAD_RETRIES}): {e}. Retrying in {backoff}s...")
+                time.sleep(backoff)
+                continue
+            logger.error(f"Failed to get download URL for mod {mod_id}, file {file_id} "
+                         f"after {MAX_DOWNLOAD_RETRIES} attempts: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error getting download URL for mod {mod_id}, file {file_id}: {e}")
+            raise
+
+    if last_error:
+        raise last_error
 
 def download_file(game_domain, gamefolder, mod_id, file_id, current_counter):
     """Download a specific mod file."""
