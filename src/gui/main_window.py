@@ -949,24 +949,18 @@ class MainWindow(QMainWindow):
         file_section = self._create_file_selection_section()
         download_layout.addWidget(file_section)
         
-        # Progress monitoring section
-        splitter = QSplitter(Qt.Horizontal)
-        
-        # Overall progress
+        # Overall progress -- full width, fixed height (no vertical stretch).
         progress_section = self._create_overall_progress_section()
-        splitter.addWidget(progress_section)
-        
-        # Active downloads monitor
-        # Initialize with current max threads from config
+        download_layout.addWidget(progress_section)
+
+        # Active downloads monitor -- full width, and the ONLY section that
+        # expands vertically (stretch factor 1). Make the window taller -> more
+        # rows; File Selection / Overall Progress / Controls stay compact.
         current_max_threads = self.config_manager.get_config().downloads.max_concurrent_downloads if self.config_manager else 10
         self.progress_monitor = ProgressMonitorWidget(current_max_threads)
-        splitter.addWidget(self.progress_monitor)
-        
-        # Set splitter proportions
-        splitter.setSizes([400, 500])
-        download_layout.addWidget(splitter)
-        
-        # Control buttons section
+        download_layout.addWidget(self.progress_monitor, 1)
+
+        # Control buttons section -- full width, fixed height.
         control_section = self._create_control_section()
         download_layout.addWidget(control_section)
         
