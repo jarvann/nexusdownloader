@@ -78,9 +78,16 @@ class SyncPlan:
 def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List[str]],
                folders_by_modid: Dict[str, List[str]], existing_dl_by_path: Dict[str, str],
                profile_id: str, collection_folder: str, collection_id: int, slug: str,
-               revision_id: int, revision_number: int) -> SyncPlan:
-    """Build + validate every record for the sync (pure, no I/O)."""
+               revision_id: int, revision_number: int,
+               install_time_iso: str = "", install_ms: int = 0) -> SyncPlan:
+    """Build + validate every record for the sync (pure, no I/O).
+
+    ``install_time_iso``/``install_ms`` (passed in by :func:`run` so this stays
+    deterministic) stamp the install-time / install-completed fields Vortex writes.
+    """
     plan = SyncPlan()
+    info = collection.get("info", {})
+    coll_name = info.get("name", collection_folder)   # the mods' "variant"
 
     def add(record_type: str, base: str, leaves: Dict[str, Any]):
         plan.violations.extend(
@@ -102,11 +109,14 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         dl_id = existing_dl_by_path.get(archive)
         if not dl_id:
             dl_id = _gen_id(f"{s['modId']}-{s['fileId']}")
-            base, leaves = vr.build_download(s, mod.get("name", ""), archive, dl_id)
+            base, leaves = vr.build_download(s, mod.get("name", ""), archive, dl_id,
+                                             folder=folder, collection_id=collection_id)
             add("download", base, leaves)
             plan.new_downloads += 1
 
-        base, leaves = vr.build_mod(s, mod, folder, dl_id, archive)
+        base, leaves = vr.build_mod(s, mod, folder, dl_id, archive,
+                                    variant=coll_name, installed_as_dependency=True,
+                                    install_time=install_time_iso)
         add("mod", base, leaves)
         base, leaves = vr.build_profile_modstate(profile_id, folder)
         add("profile_modstate", base, leaves)
@@ -114,7 +124,6 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         plan.profile_enables += 1
 
     # Phase 2: collection mod @ revision + rules + manifest
-    info = collection.get("info", {})
     rules = []
     for mod in collection.get("mods", []):
         s = mod.get("source", {})
@@ -130,7 +139,9 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         plan.new_downloads += 1
 
     base, leaves = vr.build_collection_mod(info, collection_folder, coll_dl_id, rules,
-                                           revision_id, revision_number, collection_id, slug)
+                                           revision_id, revision_number, collection_id, slug,
+                                           install_completed_ms=install_ms,
+                                           install_time=install_time_iso)
     add("collection", base, leaves)
     base, leaves = vr.build_profile_modstate(profile_id, collection_folder)
     add("profile_modstate", base, leaves)
@@ -213,7 +224,11 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     the same write so the update doesn't leave a stale collection record behind.
     """
     import json
+    import time
     from utils import vortex_db
+
+    install_ms = int(time.time() * 1000)
+    install_time_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
     with open(collection_path, "r", encoding="utf-8") as fh:
         collection = json.load(fh)
@@ -238,7 +253,8 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     plan = build_plan(collection, downloads_by_modid=downloads, folders_by_modid=folders,
                       existing_dl_by_path=existing_dl_by_path, profile_id=profile_id,
                       collection_folder=collection_folder, collection_id=collection_id,
-                      slug=slug, revision_id=revision_id, revision_number=revision_number)
+                      slug=slug, revision_id=revision_id, revision_number=revision_number,
+                      install_time_iso=install_time_iso, install_ms=install_ms)
 
     if not apply:
         return SyncResult(False, plan, risk, message="dry-run")

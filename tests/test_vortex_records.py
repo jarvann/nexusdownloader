@@ -17,16 +17,45 @@ def test_download_record_is_schema_valid():
     assert validate_record("download", leaves) == []
     assert leaves["state"] == "finished"
     assert leaves["modInfo.nexus.ids.modId"] == 122495
+    # received == size so Vortex doesn't run a "Finalizing downloads" pass
+    assert leaves["received"] == leaves["size"] == 11309496
+    # urls is the real nxm link, not empty
+    assert leaves["urls"] and "campaign=collection" in leaves["urls"][0]
+
+
+def test_download_record_links_to_installed_mod_and_collection():
+    _, leaves = vr.build_download(SAMPLE_NEXUS_MOD["source"], SAMPLE_NEXUS_MOD["name"],
+                                  ARCHIVE, "NXDabc123def", folder=FOLDER, collection_id=30366)
+    assert validate_record("download", leaves) == []
+    # the installed-link is what flips it from "Never Installed" to recognized
+    assert leaves["installed.modId"] == FOLDER
+    assert leaves["installed.gameId"] == "skyrimse"
+    assert leaves["modInfo.nexus.parentCollectionId"] == "30366"
+    # download's referenceTag matches the mod/rule tag
+    assert leaves["modInfo.referenceTag"] == "m1z8V2E5s"
 
 
 def test_mod_record_is_schema_valid():
     base, leaves = vr.build_mod(SAMPLE_NEXUS_MOD["source"], SAMPLE_NEXUS_MOD,
-                                FOLDER, "NXDabc123def", ARCHIVE)
+                                FOLDER, "NXDabc123def", ARCHIVE,
+                                variant="Test Collection", installed_as_dependency=True)
     assert validate_record("mod", leaves) == []
     assert leaves["state"] == "installed"
     assert leaves["installationPath"] == FOLDER
     # referenceTag must carry the collection tag so the collection can link it
     assert leaves["attributes.referenceTag"] == "m1z8V2E5s"
+    # variant + installedAsDependency nest the mod under its collection
+    assert leaves["attributes.variant"] == "Test Collection"
+    assert leaves["attributes.installedAsDependency"] is True
+    # non-numeric category label is dropped (Vortex stores a numeric id)
+    assert "attributes.category" not in leaves
+
+
+def test_mod_record_keeps_numeric_category():
+    mod = dict(SAMPLE_NEXUS_MOD, details={"category": "62"})
+    _, leaves = vr.build_mod(mod["source"], mod, FOLDER, "DL", ARCHIVE)
+    assert validate_record("mod", leaves) == []
+    assert leaves["attributes.category"] == 62
 
 
 def test_profile_modstate_is_schema_valid():

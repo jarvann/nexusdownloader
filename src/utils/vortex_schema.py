@@ -63,8 +63,12 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "modInfo.nexus.ids.gameId": "str",
         },
         optional={
+            "id": "str", "pausable": "bool",
             "chunks": "array", "urls": "array", "source": "str", "fileTime": "int",
-            "modInfo.source": "str",
+            # download -> installed-mod link (flips "Never Installed" to recognized)
+            "installed.gameId": "str", "installed.modId": "str",
+            "modInfo.source": "str", "modInfo.game": "str", "modInfo.name": "str",
+            "modInfo.referenceTag": "str", "modInfo.nexus.parentCollectionId": "str",
             "modInfo.meta.fileName": "str", "modInfo.meta.fileMD5": "str",
             "modInfo.meta.gameId": "str", "modInfo.meta.domainName": "str",
             "modInfo.meta.source": "str", "modInfo.meta.logicalFileName": "str",
@@ -93,8 +97,9 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "attributes.fileSize": "int", "attributes.logicalFileName": "str",
             "attributes.version": "str", "attributes.modVersion": "str",
             "attributes.referenceTag": "str", "attributes.customFileName": "str",
-            "attributes.author": "str", "attributes.category": "str",
+            "attributes.author": "str", "attributes.category": "int",
             "attributes.downloadGame": "str", "attributes.endorsed": "str",
+            "attributes.installTime": "str", "attributes.isPrimary": "bool",
             # 2.0.x additions
             "attributes.installedAsDependency": "bool", "attributes.variant": "str",
             # collection-only attributes (present when type == "collection")
@@ -122,6 +127,9 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "attributes.customFileName": "str", "attributes.installInstructions": "str",
             "attributes.author": "str", "attributes.downloadGame": "str",
             "attributes.endorsed": "str",
+            # marks the collection install finished + UI/profile flags
+            "attributes.installCompleted": "int", "attributes.installTime": "str",
+            "attributes.excludePluginRules": "bool", "attributes.recommendNewProfile": "bool",
         },
         enums={"state": {"installed", "installing"}, "type": {"collection"}},
     ),
