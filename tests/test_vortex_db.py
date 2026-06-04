@@ -93,6 +93,28 @@ def test_is_vortex_running_without_psutil(monkeypatch):
     assert vdb.is_vortex_running() is False
 
 
+def test_find_state_db_picks_most_recently_used_mode(monkeypatch, tmp_path):
+    import time
+    appdata = tmp_path / "Roaming"
+    programdata = tmp_path / "ProgramData"
+    per_user = appdata / "Vortex" / "state.v2"
+    shared = programdata / "vortex" / "state.v2"
+    per_user.mkdir(parents=True)
+    shared.mkdir(parents=True)
+    (per_user / "000001.log").write_text("x")
+    time.sleep(0.02)
+    (shared / "000001.log").write_text("y")   # shared written more recently
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("PROGRAMDATA", str(programdata))
+    # HOME candidate won't exist -> ignored
+    assert vdb.find_state_db() == str(shared)
+
+    # now make per-user the most recent -> it should win
+    time.sleep(0.02)
+    (per_user / "000001.log").write_text("xx")
+    assert vdb.find_state_db() == str(per_user)
+
+
 def test_read_active_profile(monkeypatch):
     monkeypatch.setattr(vdb, "read_prefix",
                         lambda *a, **k: {"settings###profiles###activeProfileId": "PROF1"})

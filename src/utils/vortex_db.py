@@ -159,18 +159,47 @@ def read_prefix(db_path: str, prefix: str, node: str = "node",
 # --------------------------------------------------------------------------- #
 # Discovery helpers (find the DB, active profile, and collection identity)
 # --------------------------------------------------------------------------- #
+def _db_recency(db_dir: str) -> float:
+    """Most-recent mtime among a state.v2's files (dir mtime is unreliable)."""
+    try:
+        return max((os.path.getmtime(os.path.join(db_dir, f)) for f in os.listdir(db_dir)),
+                   default=0.0)
+    except OSError:
+        return 0.0
+
+
 def find_state_db() -> Optional[str]:
-    """Locate Vortex's ``state.v2`` directory (APPDATA/Vortex, possibly a junction)."""
+    """Locate Vortex's active ``state.v2``.
+
+    Vortex runs in two modes with different data dirs, and a user may switch
+    between them:
+      * per-user (default): ``%APPDATA%/Vortex``
+      * shared:            ``%PROGRAMDATA%/vortex``
+    Both are checked (each may itself be a junction); when both exist we return
+    the **most recently written** one -- i.e. the mode currently in use.
+    """
     candidates = []
     appdata = os.environ.get("APPDATA")
     if appdata:
-        candidates.append(os.path.join(appdata, "Vortex", "state.v2"))
-    home = os.path.expanduser("~")
-    candidates.append(os.path.join(home, "AppData", "Roaming", "Vortex", "state.v2"))
+        candidates.append(os.path.join(appdata, "Vortex", "state.v2"))          # per-user
+    programdata = os.environ.get("PROGRAMDATA")
+    if programdata:
+        candidates.append(os.path.join(programdata, "vortex", "state.v2"))       # shared
+    candidates.append(os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
+                                   "Vortex", "state.v2"))
+
+    seen, existing = set(), []
     for c in candidates:
+        real = os.path.realpath(c)   # collapse junctions so we don't double-count
+        if real in seen:
+            continue
+        seen.add(real)
         if os.path.isdir(c):
-            return c
-    return None
+            existing.append(c)
+    if not existing:
+        return None
+    existing.sort(key=_db_recency, reverse=True)
+    return existing[0]
 
 
 def read_active_profile(db_path: str, node: str = "node") -> Optional[str]:
