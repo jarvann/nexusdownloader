@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Set
 
 # The exact Vortex version whose schema these definitions were captured and
 # validated against. Bump this (and re-capture goldens) when we test a new one.
-VALIDATED_VORTEX_VERSION = "1.14.8"
+VALIDATED_VORTEX_VERSION = "2.0.2"
 
 GAME_ID = "skyrimse"           # Vortex internal game id for Skyrim SE
 NEXUS_DOMAIN = "skyrimspecialedition"
@@ -57,6 +57,7 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "game": "array",
             "localPath": "str",
             "size": "int",
+            "received": "int",   # 2.0.x: bytes received; == size when finalized
             "modInfo.nexus.ids.modId": "int",
             "modInfo.nexus.ids.fileId": "int",
             "modInfo.nexus.ids.gameId": "str",
@@ -94,6 +95,8 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "attributes.referenceTag": "str", "attributes.customFileName": "str",
             "attributes.author": "str", "attributes.category": "str",
             "attributes.downloadGame": "str", "attributes.endorsed": "str",
+            # 2.0.x additions
+            "attributes.installedAsDependency": "bool", "attributes.variant": "str",
             # collection-only attributes (present when type == "collection")
             "attributes.collectionId": "int", "attributes.collectionSlug": "str",
             "attributes.revisionId": "int", "attributes.revisionNumber": "int",

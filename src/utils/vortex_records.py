@@ -36,10 +36,15 @@ def build_download(source: Dict[str, Any], mod_name: str,
                    archive_name: str, dl_id: str) -> Tuple[str, Dict[str, Any]]:
     """Build a ``persistent.downloads.files.<id>`` record (state: finished)."""
     mod_id, file_id, md5 = source["modId"], source["fileId"], source.get("md5", "")
+    size = source.get("fileSize", 0)
     tree = {
         "chunks": [], "urls": [], "state": "finished", "source": "nexus",
         "fileMD5": md5, "fileTime": source.get("fileTime", 0),
-        "game": [GAME_ID], "localPath": archive_name, "size": source.get("fileSize", 0),
+        "game": [GAME_ID], "localPath": archive_name, "size": size,
+        # received == size marks the download fully received/finalized. Without it
+        # Vortex 2.0.x treats the record as unfinalized and runs a "Finalizing
+        # downloads" pass on startup.
+        "received": size,
         "modInfo": {
             "source": "nexus",
             "meta": {

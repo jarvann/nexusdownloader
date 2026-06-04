@@ -61,7 +61,7 @@ def test_different_version_but_schema_intact_is_version_drift():
         "mod": _valid_mod_leaves(),
         "download": {
             "state": "finished", "fileMD5": "x", "game": ["skyrimse"],
-            "localPath": "a.zip", "size": 1,
+            "localPath": "a.zip", "size": 1, "received": 1,
             "modInfo.nexus.ids.modId": 1, "modInfo.nexus.ids.fileId": 2,
             "modInfo.nexus.ids.gameId": "skyrimspecialedition",
         },
