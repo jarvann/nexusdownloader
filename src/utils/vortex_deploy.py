@@ -216,19 +216,41 @@ def mark_deployed_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "no
     return vortex_db.write_records(db_path, records, backup=True, node=node)
 
 
+def order_folders_for_deploy(staging_dir: str, collection: Optional[Dict[str, Any]],
+                             folder_by_modid: Optional[Dict[str, list]] = None
+                             ) -> list:
+    """Resolve the staging folders into deploy order via the collection's modRules.
+
+    Falls back to sorted folder order when no collection/rules are available. The
+    returned order is ascending priority (later folders win file conflicts), which
+    is what the collection author's "after" rules intend.
+    """
+    folders = sorted(d for d in os.listdir(staging_dir)
+                     if os.path.isdir(os.path.join(staging_dir, d)))
+    if not collection:
+        return folders
+
+    from utils import vortex_loadorder as lo
+    from utils.vortex_sync import index_by_modid
+    if folder_by_modid is None:
+        folder_by_modid = index_by_modid(folders)
+    resolve = lo.build_mod_resolver(collection.get("mods", []), folder_by_modid)
+    return lo.order_mods(folders, collection.get("modRules", []), resolve)
+
+
 def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                       enabled_folders: Optional[Iterable[str]] = None,
-                      game_id: str = GAME_ID, *, node: str = "node",
-                      deployment_time_ms: int = 0) -> Tuple[DeployResult, Any]:
+                      game_id: str = GAME_ID, *, collection: Optional[Dict[str, Any]] = None,
+                      node: str = "node", deployment_time_ms: int = 0
+                      ) -> Tuple[DeployResult, Any]:
     """High-level: hard-link + write manifest, then mark the deployment in the DB.
 
-    ``enabled_folders`` defaults to every mod folder in ``staging_dir`` (sorted).
-    Pass an explicit load-ordered list for correct override resolution.
+    Deploy order (which decides file-conflict winners) comes from the collection's
+    modRules when ``collection`` is supplied; otherwise from an explicit
+    ``enabled_folders`` list, else sorted folder order.
     """
     if enabled_folders is None:
-        enabled_folders = sorted(
-            d for d in os.listdir(staging_dir)
-            if os.path.isdir(os.path.join(staging_dir, d)))
+        enabled_folders = order_folders_for_deploy(staging_dir, collection)
     result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
                     deployment_time_ms=deployment_time_ms)
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
