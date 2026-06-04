@@ -25,15 +25,20 @@ the load-order files Vortex writes:
 
 from __future__ import annotations
 
+import os
+import shutil
 import struct
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-# Skyrim SE base masters that are always loaded and never listed in plugins.txt
-# (they still appear in loadorder.txt). CC content (cc*.es[lmp]) is treated as
-# vanilla-ish via the cc-prefix check in :func:`is_vanilla_master`.
-SKYRIMSE_VANILLA = {
-    "skyrim.esm", "update.esm", "dawnguard.esm", "hearthfires.esm", "dragonborn.esm",
-}
+# Skyrim SE base masters in canonical load order. Always loaded, never listed in
+# plugins.txt (they still appear, in this order, at the top of loadorder.txt).
+# CC content (cc*.es[lmp]) loads after these but before mods and is also excluded
+# from plugins.txt -- see :func:`is_vanilla_master`.
+SKYRIMSE_VANILLA_ORDER = [
+    "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm",
+]
+SKYRIMSE_VANILLA = {n.lower() for n in SKYRIMSE_VANILLA_ORDER}
+PLUGIN_EXTS = (".esp", ".esm", ".esl")
 
 _MASTER_FLAG = 0x00000001   # ESM flag in the TES4 record header
 _LIGHT_FLAG = 0x00000200    # ESL / light-master flag
@@ -208,3 +213,96 @@ def render_plugins_txt(ordered_active: Sequence[str],
         mark = "*" if enabled.get(p.lower(), True) else ""
         lines.append(f"{mark}{p.lower()}")
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Compose a full load order from deployed plugins + collection rules
+# --------------------------------------------------------------------------- #
+def scan_plugins(data_dir: str) -> List[str]:
+    """List plugin files (.esp/.esm/.esl) directly in the game's Data folder."""
+    try:
+        names = os.listdir(data_dir)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.lower().endswith(PLUGIN_EXTS)
+                  and os.path.isfile(os.path.join(data_dir, n)))
+
+
+def after_map(collection: dict) -> Dict[str, List[str]]:
+    """Extract ``{plugin: [after...]}`` from ``collection.pluginRules.plugins``."""
+    rules = ((collection.get("pluginRules") or {}).get("plugins")) or []
+    return {r["name"]: list(r.get("after") or []) for r in rules if r.get("name")}
+
+
+def enabled_map(collection: dict) -> Dict[str, bool]:
+    """Extract ``{plugin_lower: enabled}`` from ``collection.plugins`` (deduped)."""
+    out: Dict[str, bool] = {}
+    for p in collection.get("plugins") or []:
+        if p.get("name"):
+            out[p["name"].lower()] = bool(p.get("enabled", True))
+    return out
+
+
+def compose_load_order(scanned: Sequence[str], data_dir: str,
+                       plugin_after: Optional[Dict[str, List[str]]] = None
+                       ) -> Tuple[List[str], List[str]]:
+    """Build ``(full_order, active_order)`` from scanned Data-folder plugins.
+
+    ``full_order`` (-> loadorder.txt) is: canonical vanilla masters, then CC
+    content, then everything else ordered masters-first + collection rules.
+    ``active_order`` (-> plugins.txt) is just the non-vanilla/non-CC plugins, in
+    the same relative order.
+    """
+    present = {n.lower(): n for n in scanned}
+    vanilla = [present[v] for v in SKYRIMSE_VANILLA if v in present]
+    vanilla += [n for n in scanned if is_vanilla_master(n) and n.lower() not in SKYRIMSE_VANILLA]
+    vanilla_set = {n.lower() for n in vanilla}
+
+    others = [n for n in scanned if n.lower() not in vanilla_set]
+
+    def master_here(name: str) -> bool:
+        return is_master_block(name, os.path.join(data_dir, name))
+
+    active = order_plugins(others, master_here, plugin_after)
+    # canonical vanilla first (core in fixed order, CC sorted), then ordered rest
+    core = [present[v.lower()] for v in SKYRIMSE_VANILLA_ORDER if v.lower() in present]
+    cc = sorted((n for n in vanilla if n.lower() not in SKYRIMSE_VANILLA),
+                key=str.lower)
+    full = core + cc + active
+    return full, active
+
+
+def write_load_order(localappdata_dir: str, full_order: Sequence[str],
+                     active_order: Sequence[str], enabled: Dict[str, bool], *,
+                     backup: bool = True) -> Tuple[str, str]:
+    """Write ``loadorder.txt`` + ``plugins.txt`` (backing up any existing pair).
+
+    Returns the two written paths. ``localappdata_dir`` is the game's
+    ``%LOCALAPPDATA%/<Game>`` folder (e.g. ``.../Skyrim Special Edition``).
+    """
+    lo_path = os.path.join(localappdata_dir, "loadorder.txt")
+    pl_path = os.path.join(localappdata_dir, "plugins.txt")
+    if backup:
+        for path in (lo_path, pl_path):
+            if os.path.isfile(path):
+                shutil.copy2(path, path + ".nxd-bak")
+    os.makedirs(localappdata_dir, exist_ok=True)
+    with open(lo_path, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write(render_loadorder(full_order))
+    with open(pl_path, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write(render_plugins_txt(active_order, enabled))
+    return lo_path, pl_path
+
+
+def sort_plugins(collection: dict, game_data_dir: str, localappdata_dir: str, *,
+                 backup: bool = True) -> Tuple[str, str, int]:
+    """End-to-end collection-rules plugin sort: scan -> order -> write the files.
+
+    Returns ``(loadorder_path, plugins_path, active_count)``.
+    """
+    scanned = scan_plugins(game_data_dir)
+    full, active = compose_load_order(scanned, game_data_dir, after_map(collection))
+    lo_path, pl_path = write_load_order(localappdata_dir, full, active,
+                                        enabled_map(collection), backup=backup)
+    return lo_path, pl_path, len(active)

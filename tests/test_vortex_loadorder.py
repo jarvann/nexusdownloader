@@ -86,3 +86,59 @@ def test_render_plugins_txt_format():
     assert lines[0].startswith("# This file is used by Skyrim")
     assert "*mymod.esp" in lines      # enabled -> * and lowercased
     assert "off.esp" in lines         # disabled -> no *
+
+
+# --- compose + write the load order ---------------------------------------
+def _make_data(tmp_path, names):
+    data = tmp_path / "Data"
+    data.mkdir()
+    for n in names:
+        # minimal TES4 header; .esp with no master flag stays in the regular block
+        (data / n).write_bytes(b"TES4" + b"\x00" * 4 + b"\x00\x00\x00\x00")
+    return str(data)
+
+
+def test_compose_load_order_vanilla_first_then_mods(tmp_path):
+    data = _make_data(tmp_path, ["Skyrim.esm", "Update.esm", "ccBGSSSE002-x.esl",
+                                 "MyMaster.esm", "MyMod.esp"])
+    full, active = lo.compose_load_order(lo.scan_plugins(data), data)
+    # canonical vanilla core first, in order
+    assert full[:2] == ["Skyrim.esm", "Update.esm"]
+    # CC after core, before mod masters
+    assert full.index("ccBGSSSE002-x.esl") < full.index("MyMaster.esm")
+    # mod master before mod esp
+    assert full.index("MyMaster.esm") < full.index("MyMod.esp")
+    # plugins.txt excludes vanilla + CC, keeps mod plugins
+    assert "Skyrim.esm" not in active and "ccBGSSSE002-x.esl" not in active
+    assert "MyMaster.esm" in active and "MyMod.esp" in active
+
+
+def test_after_and_enabled_maps():
+    coll = {
+        "plugins": [{"name": "A.esp", "enabled": True}, {"name": "B.esp", "enabled": False}],
+        "pluginRules": {"plugins": [{"name": "A.esp", "after": ["B.esp"]}]},
+    }
+    assert lo.after_map(coll) == {"A.esp": ["B.esp"]}
+    assert lo.enabled_map(coll) == {"a.esp": True, "b.esp": False}
+
+
+def test_sort_plugins_writes_files_and_backs_up(tmp_path):
+    data = _make_data(tmp_path, ["Skyrim.esm", "Zeta.esp", "Alpha.esp"])
+    lad = tmp_path / "LocalAppData"
+    lad.mkdir()
+    (lad / "plugins.txt").write_text("OLD")          # existing -> should be backed up
+    coll = {
+        "plugins": [{"name": "Alpha.esp", "enabled": True},
+                    {"name": "Zeta.esp", "enabled": False}],
+        "pluginRules": {"plugins": [{"name": "Alpha.esp", "after": ["Zeta.esp"]}]},
+    }
+    lo_path, pl_path, active = lo.sort_plugins(coll, data, str(lad))
+    assert active == 2
+    assert (lad / "plugins.txt.nxd-bak").read_text() == "OLD"   # backup made
+
+    plugins_txt = open(pl_path, encoding="utf-8").read().splitlines()
+    # Zeta before Alpha (after-rule), Zeta disabled (no *), Alpha enabled (*)
+    body = [l for l in plugins_txt if not l.startswith("#")]
+    assert body == ["zeta.esp", "*alpha.esp"]
+    # loadorder.txt has vanilla master first
+    assert open(lo_path, encoding="utf-8").read().splitlines()[1] == "Skyrim.esm"

@@ -255,3 +255,32 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                     deployment_time_ms=deployment_time_ms)
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
     return result, db_write
+
+
+@dataclass
+class FinalizeResult:
+    deploy: DeployResult
+    loadorder_path: str
+    plugins_path: str
+    active_plugins: int
+
+
+def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: str,
+                        game_data_dir: str, localappdata_dir: str,
+                        game_id: str = GAME_ID, *, node: str = "node",
+                        deployment_time_ms: int = 0, backup: bool = True) -> FinalizeResult:
+    """Full post-install pipeline: order mods -> deploy -> sort plugins.
+
+    Resolves deploy order from ``collection.modRules``, hard-links + writes the
+    deployment manifest, marks the DB deployed, then writes loadorder.txt /
+    plugins.txt from ``collection.pluginRules`` (masters-first; existing files
+    backed up). ``localappdata_dir`` is the game's ``%LOCALAPPDATA%/<Game>`` dir.
+    """
+    from utils import vortex_loadorder as lo
+
+    result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
+                                  collection=collection, node=node,
+                                  deployment_time_ms=deployment_time_ms)
+    lo_path, pl_path, active = lo.sort_plugins(collection, game_data_dir,
+                                               localappdata_dir, backup=backup)
+    return FinalizeResult(result, lo_path, pl_path, active)
