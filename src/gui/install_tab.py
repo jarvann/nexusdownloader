@@ -68,8 +68,8 @@ class InstallWorkerThread(QThread):
     log_message = Signal(str, str)  # level, message
     installation_finished = Signal(list)  # List of InstallationResult
     
-    def __init__(self, collection_path: str, downloads_path: str, staging_path: str, 
-                 use_parallel: bool = True, max_workers: int = 4):
+    def __init__(self, collection_path: str, downloads_path: str, staging_path: str,
+                 use_parallel: bool = True, max_workers: int = 4, temp_root: str = ""):
         super().__init__()
         self.collection_path = collection_path
         self.downloads_path = downloads_path
@@ -77,6 +77,7 @@ class InstallWorkerThread(QThread):
         self.is_cancelled = False
         self.use_parallel = use_parallel
         self.max_workers = max_workers
+        self.temp_root = temp_root
     
     def cancel(self):
         """Cancel the installation process."""
@@ -120,7 +121,7 @@ class InstallWorkerThread(QThread):
                 }
                 self.log_message.emit("DEBUG", "Creating parallel installer")
                 # Pass None as logger so installer creates its own file logger
-                with create_parallel_fomod_installer(self.staging_path, None, self.max_workers, config) as installer:
+                with create_parallel_fomod_installer(self.staging_path, None, self.max_workers, config, self.temp_root or None) as installer:
                     # Set up callbacks for real-time progress updates
                     self.log_message.emit("DEBUG", "Setting up callbacks")
                     installer.set_progress_callback(self._on_progress_update)
@@ -151,7 +152,7 @@ class InstallWorkerThread(QThread):
                 self.log_message.emit("DEBUG", "Creating sequential installer")
                 self.log_message.emit("INFO", f"Scanning staging folder for existing installations...")
                 # Pass None as logger so installer creates its own file logger
-                with create_fomod_installer(self.staging_path, None) as installer:
+                with create_fomod_installer(self.staging_path, None, self.temp_root or None) as installer:
                     # Run sequential installation (includes pre-scan)
                     results = installer.install_collection(collection_data, self.downloads_path)
                     
@@ -537,12 +538,25 @@ class InstallTab(QWidget):
         self.log_message("DEBUG", f"Paths - downloads: {self.downloads_path}")
         self.log_message("DEBUG", f"Paths - staging: {self.game_path}")
         
+        # Pull the optional install-temp override from config (blank = system %TEMP%)
+        temp_root = ""
+        try:
+            from config import get_config_manager
+            cfg = get_config_manager()
+            if cfg:
+                temp_root = cfg.get_config().downloads.install_temp_dir or ""
+        except Exception as e:
+            self.log_message("DEBUG", f"Could not read install_temp_dir from config: {e}")
+        if temp_root:
+            self.log_message("INFO", f"Using override install temp dir: {temp_root}")
+
         self.install_thread = InstallWorkerThread(
             self.collection_path,
             self.downloads_path,
             self.game_path,
             use_parallel,
-            max_workers
+            max_workers,
+            temp_root
         )
         
         # Connect signals

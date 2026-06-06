@@ -56,6 +56,9 @@ class DownloadConfig:
     verify_checksums: bool = True
     resume_partial_downloads: bool = True
     cleanup_failed_downloads: bool = True
+    # Override scratch/temp dir for extraction. Blank = system %TEMP%. Point this
+    # at a drive with lots of free space if %TEMP% is a small RAM disk.
+    install_temp_dir: str = ""
 
 
 @dataclass

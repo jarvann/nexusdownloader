@@ -78,8 +78,14 @@ class InstallationResult:
 class FomodInstaller:
     """Handles FOMOD-based mod installation."""
     
-    def __init__(self, staging_path: Union[str, Path], logger: Optional[logging.Logger] = None):
-        """Initialize FOMOD installer."""
+    def __init__(self, staging_path: Union[str, Path], logger: Optional[logging.Logger] = None,
+                 temp_root: Optional[str] = None):
+        """Initialize FOMOD installer.
+
+        ``temp_root`` overrides where extraction scratch dirs are created. Blank/None
+        uses the system ``%TEMP%``; point it at a roomy drive when ``%TEMP%`` is a
+        small RAM disk (avoids "No space left on device" during extraction).
+        """
         self.staging_path = Path(staging_path)
         # Use the provided logger or get the unified install logger
         if logger is None:
@@ -87,9 +93,12 @@ class FomodInstaller:
         else:
             self.logger = logger
         self.archive_handler = get_archive_handler(self.logger)
-        
+
+        # Resolve the scratch/temp root override (None -> system default).
+        self._temp_root = self._resolve_temp_root(temp_root)
+
         # Create temporary directory for extractions
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="nexusdownloader_install_"))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="nexusdownloader_install_", dir=self._temp_root))
         self.logger.debug(f"Created temp directory: {self.temp_dir}")
 
         # Space-aware extraction throttle. The temp volume is often small (e.g. a
@@ -100,6 +109,32 @@ class FomodInstaller:
         self._space_cond = threading.Condition()
         self._temp_min_headroom = 1 * 1024 ** 3   # always keep >= 1 GiB free
         self._temp_safety_factor = 3              # extracted size ~= 3x compressed
+
+    def _resolve_temp_root(self, temp_root: Optional[str]) -> Optional[str]:
+        """Validate/create the temp override; also point child extractors at it.
+
+        Returns the directory to pass as ``dir=`` to ``mkdtemp`` (None for system
+        default). When set, ``TEMP``/``TMP`` are exported so the external 7z/WinRAR
+        processes use it for their own scratch too. Falls back to the system temp
+        (with a warning) if the override can't be created/written.
+        """
+        if not temp_root or not str(temp_root).strip():
+            return None
+        path = str(temp_root).strip()
+        try:
+            os.makedirs(path, exist_ok=True)
+            if not os.access(path, os.W_OK):
+                raise OSError("not writable")
+        except OSError as e:
+            self.logger.warning(
+                f"Configured install temp dir '{path}' is unusable ({e}); "
+                f"falling back to system temp.")
+            return None
+        # Make external extractor subprocesses inherit the override for their scratch.
+        os.environ["TEMP"] = path
+        os.environ["TMP"] = path
+        self.logger.info(f"Using override install temp dir: {path}")
+        return path
 
     def __enter__(self):
         """Context manager entry."""
@@ -1222,9 +1257,10 @@ class ParallelFomodInstaller(FomodInstaller):
     """Thread-safe parallel FOMOD installer with concurrent execution support."""
     
     def __init__(self, staging_path: Union[str, Path], logger: Optional[logging.Logger] = None,
-                 max_workers: int = 4, config: Optional[Dict[str, Any]] = None):
+                 max_workers: int = 4, config: Optional[Dict[str, Any]] = None,
+                 temp_root: Optional[str] = None):
         """Initialize parallel FOMOD installer."""
-        super().__init__(staging_path, logger)
+        super().__init__(staging_path, logger, temp_root)
         
         # Threading configuration
         self.max_workers = max_workers
@@ -1260,7 +1296,7 @@ class ParallelFomodInstaller(FomodInstaller):
             if thread_id not in self._thread_temp_dirs:
                 # Use shorter directory names to avoid Windows path length issues
                 short_id = str(thread_id)[-8:]  # Last 8 digits of thread ID
-                thread_temp = Path(tempfile.mkdtemp(prefix=f"nxd_{short_id}_"))
+                thread_temp = Path(tempfile.mkdtemp(prefix=f"nxd_{short_id}_", dir=self._temp_root))
                 self._thread_temp_dirs[thread_id] = thread_temp
                 self.logger.debug(f"Created thread temp directory: {thread_temp}")
                 
@@ -1491,15 +1527,17 @@ class ParallelFomodInstaller(FomodInstaller):
         return results
 
 
-def create_fomod_installer(staging_path: Union[str, Path], 
-                          logger: Optional[logging.Logger] = None) -> FomodInstaller:
+def create_fomod_installer(staging_path: Union[str, Path],
+                          logger: Optional[logging.Logger] = None,
+                          temp_root: Optional[str] = None) -> FomodInstaller:
     """Create a FOMOD installer instance."""
-    return FomodInstaller(staging_path, logger)
+    return FomodInstaller(staging_path, logger, temp_root)
 
 
-def create_parallel_fomod_installer(staging_path: Union[str, Path], 
+def create_parallel_fomod_installer(staging_path: Union[str, Path],
                                    logger: Optional[logging.Logger] = None,
                                    max_workers: int = 4,
-                                   config: Optional[Dict[str, Any]] = None) -> ParallelFomodInstaller:
+                                   config: Optional[Dict[str, Any]] = None,
+                                   temp_root: Optional[str] = None) -> ParallelFomodInstaller:
     """Create a parallel FOMOD installer instance."""
-    return ParallelFomodInstaller(staging_path, logger, max_workers, config)
+    return ParallelFomodInstaller(staging_path, logger, max_workers, config, temp_root)
