@@ -538,13 +538,12 @@ class InstallTab(QWidget):
         self.log_message("DEBUG", f"Paths - downloads: {self.downloads_path}")
         self.log_message("DEBUG", f"Paths - staging: {self.game_path}")
         
-        # Pull the optional install-temp override from config (blank = system %TEMP%)
+        # Pull the optional install-temp override (blank = system %TEMP%). Read it
+        # fresh from src/config.json -- the same file the Settings dialog writes to --
+        # so a value just saved this session is picked up without a restart.
         temp_root = ""
         try:
-            from config import get_config_manager
-            cfg = get_config_manager()
-            if cfg:
-                temp_root = cfg.get_config().downloads.install_temp_dir or ""
+            temp_root = (self._load_config().get("downloads") or {}).get("install_temp_dir") or ""
         except Exception as e:
             self.log_message("DEBUG", f"Could not read install_temp_dir from config: {e}")
         if temp_root:
