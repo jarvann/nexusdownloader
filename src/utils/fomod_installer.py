@@ -281,36 +281,40 @@ class FomodInstaller:
         Returns:
             Path to the archive file if found, None otherwise
         """
-        # Try to find by logical filename or mod ID
         source = mod_data.get("source", {})
-        logical_filename = source.get("logicalFilename", "")
+        logical_filename = (source.get("logicalFilename") or "").lower()
         mod_id = source.get("modId")
-        file_id = source.get("fileId")
-        
-        # Common archive extensions
+        mod_name = (mod_data.get("name") or "").lower()
         extensions = ['.zip', '.7z', '.rar', '.tar.gz', '.tar.bz2']
-        
-        # Search patterns (now just string matching, much faster)
-        search_patterns = []
-        if logical_filename:
-            search_patterns.extend([f"{logical_filename}{ext}".lower() for ext in extensions])
-        if mod_id and file_id:
-            search_patterns.extend([f"{mod_id}_{file_id}".lower() for ext in extensions])
-            search_patterns.extend([f"{mod_id}".lower() for ext in extensions])
-        
-        # Exact filename matches first
-        for pattern in search_patterns:
-            if pattern in available_archives:
-                return available_archives[pattern]
-        
-        # Fallback: partial matching for mod name
-        mod_name = mod_data.get("name", "").lower()
+
+        # 1) PRECISE: Nexus archive/folder names carry the mod id as a "-<modId>-"
+        # token (e.g. "Mod Name-69415-1-0-1655653694.7z"). Match on that token --
+        # this is the reliable key. When several files share a modId, disambiguate
+        # by name overlap with the logical/display name.
+        if mod_id:
+            token = f"-{mod_id}-"
+            candidates = [(name, path) for name, path in available_archives.items()
+                          if token in name]
+            if len(candidates) == 1:
+                return candidates[0][1]
+            if candidates:
+                target = (logical_filename or mod_name).split()
+                def overlap(archive_name: str) -> int:
+                    return sum(1 for w in target if len(w) > 3 and w in archive_name)
+                candidates.sort(key=lambda c: overlap(c[0]), reverse=True)
+                return candidates[0][1]
+
+        # 2) Exact logical-filename match (some archives are named exactly that)
+        for ext in extensions:
+            if logical_filename and f"{logical_filename}{ext}" in available_archives:
+                return available_archives[f"{logical_filename}{ext}"]
+
+        # 3) Last resort: loose name-word match (kept for odd/non-nexus names)
         if mod_name:
             for archive_name, archive_path in available_archives.items():
-                # Simple name matching
                 if any(word in archive_name for word in mod_name.split() if len(word) > 3):
                     return archive_path
-        
+
         return None
     
     def _get_vortex_folder_name(self, mod_name: str, archive_path: Path, mod_data: Dict[str, Any] = None) -> str:
@@ -927,13 +931,32 @@ class FomodInstaller:
         
         return validation_result
     
-    def scan_existing_installations(self, collection_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _build_archive_cache(self, downloads_path: Union[str, Path]) -> Dict[str, Path]:
+        """Map lowercase archive filename -> Path for a downloads folder (one glob pass)."""
+        cache: Dict[str, Path] = {}
+        downloads_path = Path(downloads_path)
+        if not downloads_path.exists():
+            return cache
+        for ext in ('.zip', '.7z', '.rar', '.tar.gz', '.tar.bz2'):
+            for archive_file in downloads_path.glob(f"*{ext}"):
+                cache[archive_file.name.lower()] = archive_file
+        return cache
+
+    def scan_existing_installations(self, collection_data: Dict[str, Any],
+                                    downloads_path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
         """
         Scan the mod staging folder to identify already installed mods.
-        
+
+        The expected staging-folder name is the mod's archive filename stem (this is
+        how Vortex and our installer both name folders), so we resolve each mod to
+        its real archive in ``downloads_path`` to predict the folder. Without
+        ``downloads_path`` the folder can't be predicted and every mod is treated as
+        missing (safe -- the install step then re-checks per mod).
+
         Args:
             collection_data: Full collection.json data
-            
+            downloads_path: Folder holding the downloaded archives
+
         Returns:
             Dictionary with scan results
         """
@@ -944,32 +967,42 @@ class FomodInstaller:
             "installed_count": 0,
             "missing_count": 0
         }
-        
+
         mods = collection_data.get("mods", [])
         scan_result["total_mods"] = len(mods)
-        
+
         self.logger.info(f"Scanning staging folder for existing installations: {self.staging_path}")
-        
+
         # Get all existing mod folders in staging directory
         existing_folders = set()
         if self.staging_path.exists():
             for item in self.staging_path.iterdir():
                 if item.is_dir():
                     existing_folders.add(item.name.lower())  # Case-insensitive matching
-        
+
         self.logger.debug(f" Found {len(existing_folders)} existing mod folders in staging directory")
-        
+
+        # Resolve folder names from real archives so the prediction matches disk.
+        available_archives = self._build_archive_cache(downloads_path) if downloads_path else {}
+        if not available_archives:
+            self.logger.warning(
+                "No downloads path for the existing-install scan; cannot predict "
+                "folder names, so all mods will be treated as needing install.")
+
         for i, mod_data in enumerate(mods):
             if i % 500 == 0:  # Progress update every 500 mods
                 self.logger.debug(f" Scan progress: {i}/{len(mods)} mods checked")
-            
+
             mod_name = mod_data.get("name", f"Mod {i+1}")
-            
-            # Generate the expected Vortex folder name for this mod
-            expected_folder_name = self._get_vortex_folder_name(mod_name, Path("dummy"), mod_data)
-            
+
+            # Predict the staging folder name from the mod's real archive stem.
+            archive_path = (self._find_mod_archive_optimized(mod_data, available_archives)
+                            if available_archives else None)
+            expected_folder_name = (self._get_vortex_folder_name(mod_name, archive_path, mod_data)
+                                    if archive_path else "")
+
             # Check if this mod appears to be installed
-            if expected_folder_name.lower() in existing_folders:
+            if expected_folder_name and expected_folder_name.lower() in existing_folders:
                 scan_result["installed_mods"].append({
                     "mod_name": mod_name,
                     "folder_name": expected_folder_name,
@@ -1021,20 +1054,27 @@ class FomodInstaller:
         
         return filtered_collection
     
-    def check_mod_already_installed(self, mod_name: str, mod_data: Dict[str, Any]) -> bool:
+    def check_mod_already_installed(self, mod_name: str, mod_data: Dict[str, Any],
+                                    available_archives: Optional[Dict[str, Path]] = None) -> bool:
         """
         Check if a mod is already installed correctly in the staging folder.
-        
+
         Args:
             mod_name: Name of the mod
             mod_data: Mod data from collection.json
-            
+            available_archives: Optional cache (lowercase archive name -> Path) used to
+                predict the staging-folder name from the mod's real archive stem.
+
         Returns:
             True if mod is already installed correctly
         """
         try:
-            # Generate the expected folder name
-            folder_name = self._get_vortex_folder_name(mod_name, Path("dummy"), mod_data)
+            # Predict the folder name from the mod's real archive (None -> can't tell).
+            archive_path = (self._find_mod_archive_optimized(mod_data, available_archives)
+                            if available_archives else None)
+            if archive_path is None:
+                return False
+            folder_name = self._get_vortex_folder_name(mod_name, archive_path, mod_data)
             mod_install_path = self.staging_path / folder_name
             
             if not mod_install_path.exists():
@@ -1171,10 +1211,11 @@ class FomodInstaller:
         collection_data, manual_results = self._partition_manual_mods(collection_data)
         results.extend(manual_results)
 
-        # First, scan for existing installations
+        # First, scan for existing installations (needs downloads to predict folders)
         self.logger.info("Scanning for existing installations...")
-        scan_result = self.scan_existing_installations(collection_data)
-        
+        self._archive_cache = self._build_archive_cache(downloads_path)
+        scan_result = self.scan_existing_installations(collection_data, downloads_path)
+
         # Create filtered collection with only missing mods
         if scan_result["installed_count"] > 0:
             self.logger.info(f"Found {scan_result['installed_count']} already installed mods, filtering collection")
@@ -1225,7 +1266,7 @@ class FomodInstaller:
             self.logger.info(f"Processing mod {i}/{len(mods)}: {mod_name}")
             
             # Check if mod is already installed
-            if self.check_mod_already_installed(mod_name, mod_data):
+            if self.check_mod_already_installed(mod_name, mod_data, self._archive_cache):
                 self.logger.info(f"✓ Mod already installed, skipping: {mod_name}")
                 results.append(InstallationResult(
                     mod_name=mod_name,
@@ -1330,7 +1371,7 @@ class ParallelFomodInstaller(FomodInstaller):
             self.temp_dir = self._get_thread_temp_dir()
             
             # Check if mod is already installed (thread-safe)
-            if self.check_mod_already_installed(mod_name, mod_data):
+            if self.check_mod_already_installed(mod_name, mod_data, getattr(self, "_archive_cache", None)):
                 with self._progress_lock:
                     self._completed_count += 1
                     if self._progress_callback:
@@ -1420,10 +1461,11 @@ class ParallelFomodInstaller(FomodInstaller):
         collection_data, manual_results = self._partition_manual_mods(collection_data)
         results.extend(manual_results)
 
-        # First, scan for existing installations
+        # First, scan for existing installations (needs downloads to predict folders)
         self.logger.debug(f" Scanning for existing installations...")
-        scan_result = self.scan_existing_installations(collection_data)
-        
+        self._archive_cache = self._build_archive_cache(downloads_path)
+        scan_result = self.scan_existing_installations(collection_data, downloads_path)
+
         # Create filtered collection with only missing mods
         if scan_result["installed_count"] > 0:
             self.logger.debug(f" Found {scan_result['installed_count']} already installed mods, filtering collection")
