@@ -134,23 +134,40 @@ def _hardlink(src: str, dst: str) -> None:
         shutil.copy2(src, dst)
 
 
-def _walk_staged(staging_dir: str, folders: Iterable[str]) -> List[Tuple[str, str, int]]:
-    """Collect ``(folder, rel_path, mtime_ms)`` for every file under each folder."""
-    staged: List[Tuple[str, str, int]] = []
-    for folder in folders:
-        root = os.path.join(staging_dir, folder)
-        if not os.path.isdir(root):
-            continue
-        for dirpath, _dirs, files in os.walk(root):
-            for fn in files:
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root)
-                try:
-                    mtime_ms = int(os.path.getmtime(full) * 1000)
-                except OSError:
-                    mtime_ms = 0
-                staged.append((folder, rel, mtime_ms))
-    return staged
+def _walk_one(staging_dir: str, folder: str) -> List[Tuple[str, str, int]]:
+    """Collect ``(folder, rel_path, mtime_ms)`` for every file under one folder."""
+    out: List[Tuple[str, str, int]] = []
+    root = os.path.join(staging_dir, folder)
+    if not os.path.isdir(root):
+        return out
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root)
+            try:
+                mtime_ms = int(os.path.getmtime(full) * 1000)
+            except OSError:
+                mtime_ms = 0
+            out.append((folder, rel, mtime_ms))
+    return out
+
+
+def _walk_staged(staging_dir: str, folders: Iterable[str],
+                 workers: int = 1) -> List[Tuple[str, str, int]]:
+    """Collect ``(folder, rel_path, mtime_ms)`` for every file under each folder.
+
+    The per-folder walk is latency-bound over network/9p mounts, so ``workers > 1``
+    fans the folders out across a thread pool (the os calls release the GIL). Order
+    is preserved -- results come back in the input ``folders`` order, which
+    :func:`resolve_deployment` relies on for conflict-winner priority.
+    """
+    folders = list(folders)
+    if workers and workers > 1 and len(folders) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            per_folder = list(ex.map(lambda f: _walk_one(staging_dir, f), folders))
+        return [t for sub in per_folder for t in sub]
+    return [t for folder in folders for t in _walk_one(staging_dir, folder)]
 
 
 @dataclass
@@ -163,12 +180,17 @@ class DeployResult:
 
 def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str],
            game_id: str = GAME_ID, *, instance_id: Optional[str] = None,
-           link: bool = True, deployment_time_ms: int = 0) -> DeployResult:
+           link: bool = True, deployment_time_ms: int = 0,
+           workers: int = 1) -> DeployResult:
     """Hard-link staged files into the game folder and write the deployment manifest.
 
     ``enabled_folders`` must be in **load order** (ascending priority) so that, on
     a file conflict, the higher-priority mod wins -- the manifest always matches
     whatever ends up on disk, so Vortex stays consistent either way.
+
+    ``workers > 1`` parallelizes the (latency-bound) file walk and hard-linking
+    across a thread pool. Conflict resolution still happens centrally on the
+    ordered walk, so each link target is unique -- the links can run in any order.
     """
     instance_id = instance_id or read_instance_id(staging_dir, target_data_dir)
     if not instance_id:
@@ -177,16 +199,24 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             f"or {STAGING_MARKER} marker found). Open Vortex for this game once.")
 
     folders = list(enabled_folders)
-    staged = _walk_staged(staging_dir, folders)
+    staged = _walk_staged(staging_dir, folders, workers=workers)
     entries, links = resolve_deployment(staged)
 
     linked = 0
     if link:
-        for folder, nrel in links:
+        def _link_one(fl):
+            folder, nrel = fl
             sub = nrel.replace("\\", os.sep)
             _hardlink(os.path.join(staging_dir, folder, sub),
                       os.path.join(target_data_dir, sub))
-            linked += 1
+        if workers and workers > 1 and len(links) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_link_one, links))
+        else:
+            for fl in links:
+                _link_one(fl)
+        linked = len(links)
 
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
                               entries, deployment_time_ms=deployment_time_ms)
@@ -241,7 +271,8 @@ def order_folders_for_deploy(staging_dir: str, collection: Optional[Dict[str, An
 def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                       enabled_folders: Optional[Iterable[str]] = None,
                       game_id: str = GAME_ID, *, collection: Optional[Dict[str, Any]] = None,
-                      node: str = "node", deployment_time_ms: int = 0
+                      node: str = "node", deployment_time_ms: int = 0,
+                      workers: int = 1
                       ) -> Tuple[DeployResult, Any]:
     """High-level: hard-link + write manifest, then mark the deployment in the DB.
 
@@ -252,7 +283,7 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     if enabled_folders is None:
         enabled_folders = order_folders_for_deploy(staging_dir, collection)
     result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
-                    deployment_time_ms=deployment_time_ms)
+                    deployment_time_ms=deployment_time_ms, workers=workers)
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
     return result, db_write
 
@@ -268,19 +299,22 @@ class FinalizeResult:
 def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: str,
                         game_data_dir: str, localappdata_dir: str,
                         game_id: str = GAME_ID, *, node: str = "node",
-                        deployment_time_ms: int = 0, backup: bool = True) -> FinalizeResult:
+                        deployment_time_ms: int = 0, backup: bool = True,
+                        workers: int = 1) -> FinalizeResult:
     """Full post-install pipeline: order mods -> deploy -> sort plugins.
 
     Resolves deploy order from ``collection.modRules``, hard-links + writes the
     deployment manifest, marks the DB deployed, then writes loadorder.txt /
     plugins.txt from ``collection.pluginRules`` (masters-first; existing files
     backed up). ``localappdata_dir`` is the game's ``%LOCALAPPDATA%/<Game>`` dir.
+
+    ``workers > 1`` parallelizes the deploy's file walk + hard-linking.
     """
     from utils import vortex_loadorder as lo
 
     result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
                                   collection=collection, node=node,
-                                  deployment_time_ms=deployment_time_ms)
+                                  deployment_time_ms=deployment_time_ms, workers=workers)
     lo_path, pl_path, active = lo.sort_plugins(collection, game_data_dir,
                                                localappdata_dir, backup=backup)
     return FinalizeResult(result, lo_path, pl_path, active)
