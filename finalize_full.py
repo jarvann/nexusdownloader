@@ -185,10 +185,13 @@ def main(argv=None):
 
     # full apply
     from utils import vortex_deploy as dep
+    from utils import vortex_db
     from utils.vortex_db import VortexBusyError
-    db = args.db or None
-    if db and not os.path.exists(db):
-        print(f"!! state.v2 not found at {db}; pass --db.")
+    # Locate the DB: explicit --db, else OS default, else Windows auto-discovery.
+    db = args.db or vortex_db.find_state_db()
+    if not db or not os.path.exists(db):
+        print(f"!! Vortex state.v2 not found (looked at: {db or '<auto-discovery>'}). "
+              "Pass --db with the path to your state.v2 folder.")
         return 1
     try:
         res = dep.finalize_collection(
