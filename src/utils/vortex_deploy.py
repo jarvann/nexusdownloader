@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -77,17 +78,42 @@ def resolve_deployment(
     return entries, links
 
 
+_WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])(/.*)?$")
+
+
+def to_windows_path(p: str) -> str:
+    """Translate a WSL mount path (``/mnt/<d>/...``) to Windows form (``<D>:\\...``).
+
+    Vortex is a Windows app and compares its configured staging/target folders
+    against the manifest's ``stagingPath``/``targetPath`` as plain strings, so the
+    manifest MUST hold Windows paths even when the deploy is run from WSL (where
+    these are ``/mnt/...`` mounts). Already-Windows or relative paths pass through
+    unchanged, so this is a no-op when run natively on Windows.
+    """
+    m = _WSL_MOUNT_RE.match(p)
+    if not m:
+        return p
+    drive = m.group(1).upper()
+    rest = (m.group(2) or "").replace("/", "\\")
+    return f"{drive}:{rest}"
+
+
 def build_manifest(instance_id: str, game_id: str, staging_path: str, target_path: str,
                    entries: List[Dict[str, Any]], *, deployment_time_ms: int = 0) -> Dict[str, Any]:
-    """Wrap manifest entries in the exact shape Vortex 2.0.x writes."""
+    """Wrap manifest entries in the exact shape Vortex 2.0.x writes.
+
+    ``stagingPath``/``targetPath`` are always normalized to Windows form (see
+    :func:`to_windows_path`) so a WSL-run deploy doesn't leave ``/mnt/...`` paths
+    that Vortex can't match against its config.
+    """
     return {
         "instance": instance_id,
         "version": MANIFEST_VERSION,
         "deploymentMethod": DEPLOY_METHOD,
         "gameId": game_id,
         "deploymentTime": deployment_time_ms,
-        "stagingPath": staging_path,
-        "targetPath": target_path,
+        "stagingPath": to_windows_path(staging_path),
+        "targetPath": to_windows_path(target_path),
         "files": entries,
     }
 

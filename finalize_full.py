@@ -33,7 +33,9 @@ if os.name == "nt":
     DEFAULT_LOCALAPPDATA = os.path.expandvars(r"%LOCALAPPDATA%\Skyrim Special Edition")
     DEFAULT_DB = ""
 else:
-    DEFAULT_STAGING = "/mnt/l/vortexmods/skyrimse"
+    # Real on-disk case (VortexMods) so the Windows-translated manifest path
+    # matches Vortex's config exactly (9p access is case-insensitive anyway).
+    DEFAULT_STAGING = "/mnt/l/VortexMods/skyrimse"
     DEFAULT_DATA = "/mnt/l/SteamLibrary/steamapps/common/Skyrim Special Edition/Data"
     DEFAULT_LOCALAPPDATA = "/mnt/c/Users/cory/AppData/Local/Skyrim Special Edition"
     DEFAULT_DB = "/mnt/x/Nexus_Vortex/Appdata/Vortex/state.v2"
