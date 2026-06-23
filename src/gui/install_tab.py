@@ -79,11 +79,18 @@ class InstallWorkerThread(QThread):
         self.use_parallel = use_parallel
         self.max_workers = max_workers
         self.temp_root = temp_root
+        self._installer = None   # live ref so concurrency can be changed mid-run
     
     def cancel(self):
         """Cancel the installation process."""
         self.is_cancelled = True
-    
+
+    def set_concurrency(self, n: int):
+        """Change install concurrency live (no restart) if an installer is active."""
+        inst = self._installer
+        if inst is not None and hasattr(inst, "set_concurrency"):
+            inst.set_concurrency(n)
+
     def run(self):
         """Run the installation process."""
         try:
@@ -123,6 +130,7 @@ class InstallWorkerThread(QThread):
                 self.log_message.emit("DEBUG", "Creating parallel installer")
                 # Pass None as logger so installer creates its own file logger
                 with create_parallel_fomod_installer(self.staging_path, None, self.max_workers, config, self.temp_root or None) as installer:
+                    self._installer = installer   # expose for live concurrency changes
                     # Set up callbacks for real-time progress updates
                     self.log_message.emit("DEBUG", "Setting up callbacks")
                     installer.set_progress_callback(self._on_progress_update)
@@ -442,6 +450,14 @@ class InstallTab(QWidget):
         self.cancel_install_btn.clicked.connect(self.cancel_installation)
         self.clear_log_btn.clicked.connect(self.clear_log)
         self.link_vortex_btn.clicked.connect(self.link_to_vortex)
+        # Live concurrency: moving the spinbox retargets a running install (no restart).
+        self.max_workers_spinbox.valueChanged.connect(self._on_workers_changed)
+
+    def _on_workers_changed(self, value: int):
+        """Apply a new concurrency to the running install immediately, if any."""
+        if self.install_thread and self.install_thread.isRunning():
+            self.install_thread.set_concurrency(value)
+            self.log_message("INFO", f"Install concurrency changed to {value} (live)")
 
     def browse_collection_file(self):
         """Browse for collection JSON file."""

@@ -1294,18 +1294,56 @@ class FomodInstaller:
         return results
 
 
+class _ConcurrencyLimiter:
+    """A live-adjustable concurrency gate -- like a semaphore you can resize while
+    in use. Workers run ``with limiter:`` around the heavy work; ``set_max(n)``
+    changes how many may run at once on the fly (raising it wakes waiters;
+    lowering it just makes the next finishers block until active drops to n)."""
+
+    def __init__(self, value: int):
+        self._cond = threading.Condition()
+        self._max = max(1, int(value))
+        self._active = 0
+
+    def __enter__(self):
+        with self._cond:
+            while self._active >= self._max:
+                self._cond.wait()
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._active -= 1
+            self._cond.notify_all()
+        return False
+
+    def set_max(self, n: int):
+        with self._cond:
+            self._max = max(1, int(n))
+            self._cond.notify_all()
+
+
+# Upper bound on the OS threads the pool spins up; actual concurrency is gated
+# live by the limiter, so the spinbox can move anywhere in [1, this] without a
+# restart.
+MAX_INSTALL_CONCURRENCY = 16
+
+
 class ParallelFomodInstaller(FomodInstaller):
     """Thread-safe parallel FOMOD installer with concurrent execution support."""
-    
+
     def __init__(self, staging_path: Union[str, Path], logger: Optional[logging.Logger] = None,
                  max_workers: int = 4, config: Optional[Dict[str, Any]] = None,
                  temp_root: Optional[str] = None):
         """Initialize parallel FOMOD installer."""
         super().__init__(staging_path, logger, temp_root)
-        
+
         # Threading configuration
         self.max_workers = max_workers
         self.config = config or {}
+        # Live-adjustable concurrency gate (see set_concurrency).
+        self._limiter = _ConcurrencyLimiter(max_workers)
         
         # Thread safety locks
         self._temp_dir_lock = threading.Lock()
@@ -1320,7 +1358,16 @@ class ParallelFomodInstaller(FomodInstaller):
         
         # Individual temp directories per thread to avoid conflicts
         self._thread_temp_dirs: Dict[int, Path] = {}
-        
+
+    def set_concurrency(self, n: int):
+        """Change how many mods install at once -- takes effect immediately, no
+        restart. Raising it lets queued workers start; lowering it lets in-flight
+        installs finish, then holds at the new ceiling."""
+        n = max(1, min(int(n), MAX_INSTALL_CONCURRENCY))
+        self.max_workers = n
+        self._limiter.set_max(n)
+        self.logger.info(f"Install concurrency set to {n} (live)")
+
     def set_progress_callback(self, callback: Callable[[int, int, str], None]):
         """Set callback for progress updates."""
         self._progress_callback = callback
@@ -1386,23 +1433,27 @@ class ParallelFomodInstaller(FomodInstaller):
                     warnings=["Mod already installed correctly"]
                 )
             
-            # Find the downloaded archive
-            archive_path = self._find_mod_archive(mod_data, downloads_path)
-            if not archive_path:
-                result = InstallationResult(
-                    mod_name=mod_name,
-                    status=InstallResult.FAILED,
-                    error_message="Downloaded archive not found"
-                )
-            else:
-                # Check if mod has installation choices
-                choices = mod_data.get("choices", {})
-                if not choices or choices.get("type") != "fomod":
-                    # Simple extraction without FOMOD
-                    result = self._install_simple(mod_name, archive_path, mod_data)
+            # Gate the heavy work (extract + copy) behind the live concurrency
+            # limiter so the running thread count can be changed mid-install. The
+            # already-installed skip above is fast and intentionally ungated.
+            with self._limiter:
+                # Find the downloaded archive
+                archive_path = self._find_mod_archive(mod_data, downloads_path)
+                if not archive_path:
+                    result = InstallationResult(
+                        mod_name=mod_name,
+                        status=InstallResult.FAILED,
+                        error_message="Downloaded archive not found"
+                    )
                 else:
-                    # FOMOD installation with choices
-                    result = self._install_fomod(mod_name, archive_path, choices, mod_data)
+                    # Check if mod has installation choices
+                    choices = mod_data.get("choices", {})
+                    if not choices or choices.get("type") != "fomod":
+                        # Simple extraction without FOMOD
+                        result = self._install_simple(mod_name, archive_path, mod_data)
+                    else:
+                        # FOMOD installation with choices
+                        result = self._install_fomod(mod_name, archive_path, choices, mod_data)
             
             # Update progress and notify
             with self._progress_lock:
@@ -1518,9 +1569,11 @@ class ParallelFomodInstaller(FomodInstaller):
             self._total_count = len(mods)
         
         self.logger.info(f"Installing collection with {len(mods)} mods using {self.max_workers} threads")
-        
-        # Use ThreadPoolExecutor for parallel installation
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+
+        # Size the pool to the upper bound; the limiter gates actual concurrency
+        # to self.max_workers and can be changed live via set_concurrency().
+        pool_size = max(self.max_workers, MAX_INSTALL_CONCURRENCY)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
             # Submit all installation tasks
             future_to_mod = {
                 executor.submit(self._install_mod_thread_safe, mod_data, downloads_path): mod_data
