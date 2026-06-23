@@ -20,7 +20,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils import vortex_records as vr
 from utils.vortex_schema import (
@@ -68,6 +68,7 @@ class SyncPlan:
     skipped_manual: int = 0
     skipped_no_disk: int = 0
     rule_count: int = 0
+    orphan_count: int = 0       # staging folders not in the collection, given bare records
     violations: List[str] = field(default_factory=list)     # schema problems
 
     @property
@@ -79,15 +80,20 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
                folders_by_modid: Dict[str, List[str]], existing_dl_by_path: Dict[str, str],
                profile_id: str, collection_folder: str, collection_id: int, slug: str,
                revision_id: int, revision_number: int,
-               install_time_iso: str = "", install_ms: int = 0) -> SyncPlan:
+               install_time_iso: str = "", install_ms: int = 0,
+               all_folders: Optional[List[str]] = None) -> SyncPlan:
     """Build + validate every record for the sync (pure, no I/O).
 
     ``install_time_iso``/``install_ms`` (passed in by :func:`run` so this stays
     deterministic) stamp the install-time / install-completed fields Vortex writes.
+    ``all_folders`` (every staging subfolder) lets us write a bare record for any
+    folder that isn't a collection member, so Vortex's "Mods changed on disk" scan
+    finds full folder<->record parity and never re-stubs our records.
     """
     plan = SyncPlan()
     info = collection.get("info", {})
     coll_name = info.get("name", collection_folder)   # the mods' "variant"
+    recorded: set = set()   # staging folders we've written a mod record for
 
     def add(record_type: str, base: str, leaves: Dict[str, Any]):
         plan.violations.extend(
@@ -120,6 +126,7 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         add("mod", base, leaves)
         base, leaves = vr.build_profile_modstate(profile_id, folder)
         add("profile_modstate", base, leaves)
+        recorded.add(folder)
         plan.mod_count += 1
         plan.profile_enables += 1
 
@@ -136,6 +143,13 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
     coll_archive = collection_folder + ".7z"
     coll_dl_id = existing_dl_by_path.get(coll_archive) or _gen_id(f"coll-{revision_id}")
     if coll_archive not in existing_dl_by_path:
+        # Register the collection's own download so Vortex can read the collection
+        # identity from downloads.files[archiveId].modInfo.nexus.ids (the linkup).
+        base, leaves = vr.build_collection_download(
+            info, coll_archive, coll_dl_id, collection_id=collection_id, slug=slug,
+            revision_id=revision_id, revision_number=revision_number,
+            folder=collection_folder)
+        plan.records.update(vr.to_absolute(base, leaves))   # download record (no member schema)
         plan.new_downloads += 1
 
     base, leaves = vr.build_collection_mod(info, collection_folder, coll_dl_id, rules,
@@ -145,9 +159,25 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
     add("collection", base, leaves)
     base, leaves = vr.build_profile_modstate(profile_id, collection_folder)
     add("profile_modstate", base, leaves)
+    recorded.add(collection_folder)
     base, leaves = vr.build_collection_revision(info, collection.get("mods", []),
                                                 revision_id, revision_number, collection_id, slug)
     plan.records.update(vr.to_absolute(base, leaves))   # manifest has no record schema
+
+    # Phase 3: bare records for staging folders that aren't collection members
+    # (old versions, manually-added mods, duplicates) so refreshMods sees parity.
+    for folder in (all_folders or []):
+        if folder in recorded or folder.startswith("__vortex"):
+            continue
+        # Orphans are intentionally bare (no modId/source) -- identical to the stub
+        # Vortex itself writes -- so they're schema-exempt; don't validate as "mod".
+        base, leaves = vr.build_orphan_mod(folder, install_time=install_time_iso)
+        plan.records.update(vr.to_absolute(base, leaves))
+        base, leaves = vr.build_profile_modstate(profile_id, folder)
+        add("profile_modstate", base, leaves)
+        recorded.add(folder)
+        plan.orphan_count += 1
+        plan.profile_enables += 1
 
     return plan
 
@@ -234,8 +264,9 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
         collection = json.load(fh)
 
     downloads = index_by_modid(os.listdir(downloads_dir), archives_only=True)
-    folders = index_by_modid([d for d in os.listdir(staging_dir)
-                              if os.path.isdir(os.path.join(staging_dir, d))])
+    all_folders = [d for d in os.listdir(staging_dir)
+                   if os.path.isdir(os.path.join(staging_dir, d))]
+    folders = index_by_modid(all_folders)
     collection_folder = os.path.basename(os.path.dirname(collection_path))
     revision_id, revision_number = parse_revision_from_folder(collection_folder)
 
@@ -254,7 +285,8 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
                       existing_dl_by_path=existing_dl_by_path, profile_id=profile_id,
                       collection_folder=collection_folder, collection_id=collection_id,
                       slug=slug, revision_id=revision_id, revision_number=revision_number,
-                      install_time_iso=install_time_iso, install_ms=install_ms)
+                      install_time_iso=install_time_iso, install_ms=install_ms,
+                      all_folders=all_folders)
 
     if not apply:
         return SyncResult(False, plan, risk, message="dry-run")

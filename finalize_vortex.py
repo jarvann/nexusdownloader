@@ -132,6 +132,7 @@ def main(argv=None):
     print(f"mods linked      : {p.mod_count}")
     print(f"new downloads    : {p.new_downloads}")
     print(f"collection rules : {p.rule_count}")
+    print(f"orphan records   : {p.orphan_count}  (non-collection staging folders, given bare records)")
     print(f"profile enables  : {p.profile_enables}")
     print(f"skipped          : manual={p.skipped_manual}, not-on-disk={p.skipped_no_disk}")
     print(f"total db keys     : {p.total_keys}")

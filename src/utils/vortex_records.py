@@ -142,6 +142,62 @@ def build_profile_modstate(profile_id: str, folder: str) -> Tuple[str, Dict[str,
     return base, _flatten({"enabled": True, "enabledTime": 0})
 
 
+def build_orphan_mod(folder: str, install_time: str = "") -> Tuple[str, Dict[str, Any]]:
+    """Build a minimal installed-mod record for a staging folder that isn't a
+    collection member (an old version, a manually-added mod, a duplicate).
+
+    Shaped identically to the bare record Vortex's own ``refreshMods`` creates on
+    "Apply Changes" (``{id, type:"", installationPath, state:"installed",
+    attributes:{name, installTime}}``). Writing one for EVERY staging folder is
+    what stops the "Mods changed on disk" prompt -- Vortex only flags folders that
+    have no mod record, so full folder<->record parity means it never fires (and
+    so never strips our real records to stubs).
+    """
+    attributes: Dict[str, Any] = {"name": folder, "installedAsDependency": False}
+    if install_time:
+        attributes["installTime"] = install_time
+    tree = {
+        "id": folder, "installationPath": folder, "state": "installed", "type": "",
+        "fileOverrides": [], "attributes": attributes,
+    }
+    base = f"persistent{P}mods{P}{GAME_ID}{P}{folder}"
+    return base, _flatten(tree)
+
+
+def build_collection_download(info: Dict[str, Any], archive_name: str, dl_id: str, *,
+                             collection_id: Any, slug: str, revision_id: int,
+                             revision_number: int, size: int = 0,
+                             folder: str = "") -> Tuple[str, Dict[str, Any]]:
+    """Build the ``persistent.downloads.files.<id>`` record for the collection
+    archive itself (the ``.7z``).
+
+    This is the load-bearing registration linkup: Vortex reads a collection's
+    identity from ``downloads.files[archiveId].modInfo.nexus.ids`` (collectionId,
+    collectionSlug, revisionId, revisionNumber) -- NOT from the mod attributes.
+    The collection mod's ``archiveId`` must point at this id.
+    """
+    tree = {
+        "id": dl_id, "chunks": [], "pausable": False,
+        "state": "finished", "source": "nexus",
+        "game": [GAME_ID, NEXUS_DOMAIN], "localPath": archive_name,
+        "size": size, "received": size,
+        "modInfo": {
+            "source": "nexus", "game": GAME_ID, "name": info.get("name", archive_name),
+            "nexus": {
+                "ids": {
+                    "gameId": NEXUS_DOMAIN, "collectionId": str(collection_id),
+                    "collectionSlug": slug, "revisionId": revision_id,
+                    "revisionNumber": revision_number,
+                },
+            },
+        },
+    }
+    if folder:
+        tree["installed"] = {"gameId": GAME_ID, "modId": folder}
+    base = f"persistent{P}downloads{P}files{P}{dl_id}"
+    return base, _flatten(tree)
+
+
 def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[str, Any]:
     """Build one rule for the collection mod's ``rules`` array.
 
