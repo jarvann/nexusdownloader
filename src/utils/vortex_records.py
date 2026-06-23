@@ -120,6 +120,14 @@ def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
         attributes["variant"] = variant
     if install_time:
         attributes["installTime"] = install_time
+    # Vortex's InstallDriver stamps installerChoices onto the installed mod
+    # (mirrors the collection entry's `choices`). Its keys ("options"/"type") are
+    # dot-free so they flatten cleanly. `patches`/`fileList` are intentionally NOT
+    # set here: their keys are filenames containing dots, which would corrupt the
+    # ###-flattening -- they live faithfully in the rule's JSON blob instead, and
+    # association doesn't need them on the mod (reference.tag is the match key).
+    if mod.get("choices"):
+        attributes["installerChoices"] = mod["choices"]
     tree = {
         "id": folder, "installationPath": folder, "state": "installed", "type": "",
         "archiveId": archive_id, "fileOverrides": [], "attributes": attributes,
@@ -135,15 +143,25 @@ def build_profile_modstate(profile_id: str, folder: str) -> Tuple[str, Dict[str,
 
 
 def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[str, Any]:
-    """Build one ``requires`` rule for the collection mod's ``rules`` array.
+    """Build one rule for the collection mod's ``rules`` array.
 
-    ``reference.tag`` matches the member mod's ``attributes.referenceTag`` (both
-    are the collection.json ``source.tag``), which is how Vortex links an
-    installed mod to its collection slot.
+    Matches Vortex's own ``collectionModToRule`` shape so the rules array is
+    indistinguishable from a native install:
+    * ``type`` is ``recommends`` for optional mods, ``requires`` otherwise --
+      only ``requires`` rules count toward collection completeness, so optionals
+      neither block completion nor get treated as mandatory.
+    * ``reference.tag`` matches the member mod's ``attributes.referenceTag`` --
+      this alone is how Vortex links an installed mod to its collection slot
+      (``installerChoices``/``fileList`` live at the rule top level, NOT in
+      ``reference``, so they don't affect matching).
+    * ``installerChoices``/``fileList``/``extra.patches``/``extra.fileOverrides``
+      mirror the collection entry so update/patch behavior matches native. These
+      ride inside the JSON-serialized rules array, so dotted filename keys (e.g.
+      patch keys like ``foo.esp``) are preserved verbatim.
     """
     s = mod.get("source", {})
-    return {
-        "type": "requires",
+    rule: Dict[str, Any] = {
+        "type": "recommends" if mod.get("optional") else "requires",
         "reference": {
             "description": mod.get("name", ""), "fileMD5": s.get("md5", ""),
             "gameId": GAME_ID, "fileSize": s.get("fileSize", 0),
@@ -164,6 +182,19 @@ def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[s
             "phase": mod.get("phase", 0), "fileName": archive_name,
         },
     }
+    # Only emit when present -- JSON.stringify drops undefined, so a native rule
+    # omits these keys when the mod has no choices/hashes/patches; match that.
+    if mod.get("choices"):
+        rule["installerChoices"] = mod["choices"]
+    if mod.get("hashes"):
+        rule["fileList"] = mod["hashes"]
+    if mod.get("patches"):
+        rule["extra"]["patches"] = mod["patches"]
+    if mod.get("fileOverrides"):
+        rule["extra"]["fileOverrides"] = mod["fileOverrides"]
+    if mod.get("instructions"):
+        rule["extra"]["instructions"] = mod["instructions"]
+    return rule
 
 
 def build_collection_mod(info: Dict[str, Any], coll_folder: str, archive_id: str,
