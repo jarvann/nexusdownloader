@@ -235,7 +235,13 @@ class FomodInstaller:
     def _find_mod_archive(self, mod_data: Dict[str, Any], downloads_path: Union[str, Path]) -> Optional[Path]:
         """Find the downloaded archive for a mod."""
         downloads_path = Path(downloads_path)
-        
+
+        # Off-site mods have no modId -- match them by filename/size instead.
+        if self._is_manual_mod(mod_data):
+            manual = self._find_manual_archive(mod_data, downloads_path)
+            if manual:
+                return manual
+
         # Try to find by logical filename or mod ID
         source = mod_data.get("source", {})
         logical_filename = source.get("logicalFilename", "")
@@ -1181,21 +1187,70 @@ class FomodInstaller:
             return True
         return False
 
-    def _partition_manual_mods(self, collection_data: Dict[str, Any]):
-        """Split out mods needing manual install.
+    def _find_manual_archive(self, mod_data: Dict[str, Any],
+                             downloads_path: Union[str, Path]) -> Optional[Path]:
+        """Find a hand-downloaded archive for an off-site mod.
 
-        Returns (filtered_collection_data, manual_results) where manual_results
-        are SKIPPED entries carrying the source URL / instructions so the user
-        knows exactly what to install by hand. Filtering them out up front keeps
-        them from being reported as download/install failures.
+        Off-site/bundled mods have no Nexus modId, but the collection lists each by
+        its archive filename (the mod ``name``) plus an ``md5``/``fileSize``. So if
+        the user dropped the file in the downloads folder, match it by exact name,
+        then by exact byte size (handles a renamed file)."""
+        downloads_path = Path(downloads_path)
+        exts = (".7z", ".zip", ".rar")
+        name = (mod_data.get("name") or "").strip()
+        src = mod_data.get("source", {})
+        # 1) exact filename -- off-site mods are named by their archive
+        if name and name.lower().endswith(exts):
+            cand = downloads_path / name
+            if cand.exists():
+                return cand
+        # 2) exact byte-size match, via a one-time cached {size: path} index so we
+        #    don't rescan the (large) downloads folder once per off-site mod.
+        size = src.get("fileSize")
+        if size:
+            return self._download_size_index(downloads_path).get(size)
+        return None
+
+    def _download_size_index(self, downloads_path: Path) -> Dict[int, Path]:
+        """Cached ``{file_size: archive_path}`` for the downloads folder (built once)."""
+        idx = getattr(self, "_dl_size_index", None)
+        if idx is None:
+            idx = {}
+            try:
+                for f in Path(downloads_path).iterdir():
+                    if f.suffix.lower() in (".7z", ".zip", ".rar") and f.is_file():
+                        try:
+                            idx.setdefault(f.stat().st_size, f)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            self._dl_size_index = idx
+        return idx
+
+    def _partition_manual_mods(self, collection_data: Dict[str, Any],
+                               downloads_path: Union[str, Path] = None):
+        """Split out off-site/bundled mods that still need a HAND download.
+
+        An off-site mod whose archive is ALREADY in the downloads folder installs
+        like any other mod (it's kept in the install list); only the ones we can't
+        find on disk are set aside as SKIPPED, carrying the source URL/instructions.
         """
         mods = collection_data.get("mods", [])
         manual = [m for m in mods if self._is_manual_mod(m)]
         if not manual:
             return collection_data, []
 
+        present = set()
+        if downloads_path:
+            for m in manual:
+                if self._find_manual_archive(m, downloads_path):
+                    present.add(id(m))
+
         manual_results = []
         for m in manual:
+            if id(m) in present:
+                continue   # archive is here -> install it normally
             source = m.get("source", {})
             url = source.get("url", "")
             instructions = (source.get("instructions") or m.get("instructions") or "").strip()
@@ -1211,11 +1266,13 @@ class FomodInstaller:
                 warnings=[note],
             ))
 
+        # Keep nexus mods + any off-site mods whose archive is present on disk.
         filtered = dict(collection_data)
-        filtered["mods"] = [m for m in mods if not self._is_manual_mod(m)]
+        filtered["mods"] = [m for m in mods
+                            if (not self._is_manual_mod(m)) or (id(m) in present)]
         self.logger.info(
-            f"{len(manual)} mod(s) require manual installation (external/bundled) "
-            f"and were marked as skipped")
+            f"{len(present)} off-site mod(s) present on disk -> installing; "
+            f"{len(manual) - len(present)} still need a manual download.")
         return filtered, manual_results
 
     def install_collection(self, collection_data: Dict[str, Any],
@@ -1233,7 +1290,7 @@ class FomodInstaller:
         results = []
 
         # Set aside mods that can't be auto-installed (external/bundled sources)
-        collection_data, manual_results = self._partition_manual_mods(collection_data)
+        collection_data, manual_results = self._partition_manual_mods(collection_data, downloads_path)
         results.extend(manual_results)
 
         # First, scan for existing installations (needs downloads to predict folders)
@@ -1534,7 +1591,7 @@ class ParallelFomodInstaller(FomodInstaller):
         results = []
 
         # Set aside mods that can't be auto-installed (external/bundled sources)
-        collection_data, manual_results = self._partition_manual_mods(collection_data)
+        collection_data, manual_results = self._partition_manual_mods(collection_data, downloads_path)
         results.extend(manual_results)
 
         # First, scan for existing installations (needs downloads to predict folders)
