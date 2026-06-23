@@ -92,6 +92,10 @@ class UIPreferencesConfig:
     """User interface preferences and settings"""
     last_collection_directory: str = ""
     remember_collection_location: bool = True
+    # Remembered Install-tab path pickers (persist across sessions).
+    last_collection_file: str = ""
+    last_downloads_folder: str = ""
+    last_staging_folder: str = ""
 
 
 @dataclass
@@ -211,24 +215,32 @@ class ConfigManager:
             raise ConfigurationError(f"Failed to load config: {e}")
     
     def _dict_to_config(self, config_dict: Dict[str, Any]) -> AppConfig:
-        """Convert dictionary to AppConfig object"""
+        """Convert dictionary to AppConfig object.
+
+        Unknown keys within a section are dropped (with a warning) rather than
+        raising -- a stray field written by an older/newer build must never brick
+        startup. Only genuinely malformed structures still raise.
+        """
+        from dataclasses import fields as _dc_fields
+
+        def _filtered(cls, data: Dict[str, Any]):
+            known = {f.name for f in _dc_fields(cls)}
+            extra = set(data) - known
+            if extra:
+                self.logger.warning("Ignoring unknown %s keys in config: %s",
+                                    cls.__name__, ", ".join(sorted(extra)))
+            return cls(**{k: v for k, v in data.items() if k in known})
+
         try:
-            # Extract nested configurations
-            nexus_api_data = config_dict.get('nexus_api', {})
-            vortex_data = config_dict.get('vortex', {})
-            downloads_data = config_dict.get('downloads', {})
-            logging_data = config_dict.get('logging', {})
-            security_data = config_dict.get('security', {})
-            ui_preferences_data = config_dict.get('ui_preferences', {})
-            
             return AppConfig(
                 version=config_dict.get('version', ConfigVersion.CURRENT.value),
-                nexus_api=NexusApiConfig(**nexus_api_data),
-                vortex=VortexConfig(**vortex_data),
-                downloads=DownloadConfig(**downloads_data),
-                logging=LoggingConfig(**logging_data),
-                security=SecurityConfig(**security_data),
-                ui_preferences=UIPreferencesConfig(**ui_preferences_data)
+                nexus_api=_filtered(NexusApiConfig, config_dict.get('nexus_api', {})),
+                vortex=_filtered(VortexConfig, config_dict.get('vortex', {})),
+                downloads=_filtered(DownloadConfig, config_dict.get('downloads', {})),
+                logging=_filtered(LoggingConfig, config_dict.get('logging', {})),
+                security=_filtered(SecurityConfig, config_dict.get('security', {})),
+                ui_preferences=_filtered(UIPreferencesConfig,
+                                         config_dict.get('ui_preferences', {})),
             )
         except TypeError as e:
             raise ConfigurationError(f"Invalid configuration structure: {e}")
