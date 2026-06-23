@@ -23,9 +23,19 @@ priority for overwrite ordering). The caller performs the actual copy.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+def _norm(s: Optional[str]) -> str:
+    """Normalize a FOMOD step/group/option name for lenient matching: lowercase,
+    strip everything but letters/digits. Makes 'Version', '[ESL] Foo - Bar', and
+    'Foo Bar' comparable so a collection's recorded choice still maps onto the
+    real ModuleConfig when prefixes/punctuation/spacing differ (the native Vortex
+    FOMOD engine is similarly lenient and skips what truly can't match)."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 # ModuleConfig.xml comes from third-party mod archives, so parse it with the
 # hardened defusedxml parser (protects against XXE / billion-laughs). Fall back
@@ -249,24 +259,54 @@ def selections_from_collection(choices_data: Dict) -> List[Tuple[Optional[str], 
 def _match_group(config: FomodConfig, step_name: Optional[str], group_name: str) -> Optional[Group]:
     """Find the parsed group matching a collection selection.
 
-    Match on group name, disambiguating by step name when provided. Group names
-    are compared case-insensitively.
+    Match on group name (disambiguated by step name), leniently: exact, then
+    normalized, then treating the recorded ``group_name`` as a STEP name, then
+    a normalized substring. Vortex matches step/group by name too; we add the
+    normalization so prefixes/punctuation/spacing differences don't break it.
     """
+    all_groups = [(step, group) for step in config.install_steps for group in step.groups]
     gname = group_name.strip().lower()
-    candidates = []
-    for step in config.install_steps:
-        for group in step.groups:
-            if group.name.strip().lower() == gname:
-                candidates.append((step, group))
+    gnorm = _norm(group_name)
+
+    candidates = [(s, g) for s, g in all_groups if g.name.strip().lower() == gname]
+    if not candidates and gnorm:
+        candidates = [(s, g) for s, g in all_groups if _norm(g.name) == gnorm]
+    if not candidates and gnorm:        # recorded "group" may actually be the step
+        candidates = [(s, g) for s, g in all_groups if _norm(s.name) == gnorm]
+    if not candidates and gnorm:        # last resort: normalized substring either way
+        candidates = [(s, g) for s, g in all_groups if _norm(g.name)
+                      and (gnorm in _norm(g.name) or _norm(g.name) in gnorm)]
     if not candidates:
         return None
     if len(candidates) == 1 or not step_name:
         return candidates[0][1]
-    sname = step_name.strip().lower()
-    for step, group in candidates:
-        if step.name.strip().lower() == sname:
-            return group
+    snorm = _norm(step_name)
+    for s, g in candidates:
+        if _norm(s.name) == snorm:
+            return g
     return candidates[0][1]
+
+
+def _plugin_by_name(plugins, name: str):
+    """Lenient option-name match within a plugin list: exact -> normalized ->
+    normalized substring (handles '[ESL] ' prefixes and the like)."""
+    if not name:
+        return None
+    target = name.strip().lower()
+    for p in plugins:
+        if p.name.strip().lower() == target:
+            return p
+    tnorm = _norm(name)
+    if not tnorm:
+        return None
+    for p in plugins:
+        if _norm(p.name) == tnorm:
+            return p
+    contains = [p for p in plugins if _norm(p.name)
+                and (_norm(p.name) in tnorm or tnorm in _norm(p.name))]
+    if contains:
+        return max(contains, key=lambda p: len(_norm(p.name)))
+    return None
 
 
 @dataclass
@@ -344,23 +384,23 @@ def resolve_install(config: FomodConfig,
     # 1. Always-installed required files
     selected_items.extend(config.required_files)
 
-    # 2. Chosen plugins (by idx, validated by name where possible)
+    # 2. Chosen plugins. Vortex matches the chosen option by NAME
+    #    (preChoice.name == option.Name) within name-matched steps/groups -- NOT by
+    #    index. So match by name first (prefer the matched group, then anywhere),
+    #    and only fall back to the recorded positional idx.
     for step_name, group_name, idx, choice_name in selections_from_collection(choices_data):
         group = _match_group(config, step_name, group_name)
-        if group is None or idx < 0 or idx >= len(group.plugins):
-            # Fall back to matching by plugin name within any group
-            plugin = _find_plugin_by_name(config, choice_name)
+        plugin = None
+        if choice_name:
+            if group is not None:
+                plugin = _plugin_by_name(group.plugins, choice_name)
             if plugin is None:
-                report.unmatched_selections.append(f"{group_name}[{idx}] {choice_name}")
-                continue
-        else:
+                plugin = _find_plugin_by_name(config, choice_name)
+        if plugin is None and group is not None and 0 <= idx < len(group.plugins):
             plugin = group.plugins[idx]
-            # Validate idx against recorded name; prefer a name match if they diverge
-            if choice_name and plugin.name.strip().lower() != choice_name.strip().lower():
-                by_name = next((p for p in group.plugins
-                                if p.name.strip().lower() == choice_name.strip().lower()), None)
-                if by_name is not None:
-                    plugin = by_name
+        if plugin is None:
+            report.unmatched_selections.append(f"{group_name}[{idx}] {choice_name}")
+            continue
         report.chosen_plugins.append(plugin.name)
         selected_items.extend(plugin.files)
         flags.update(plugin.set_flags)
@@ -382,15 +422,10 @@ def resolve_install(config: FomodConfig,
 
 
 def _find_plugin_by_name(config: FomodConfig, name: str) -> Optional[Plugin]:
-    if not name:
-        return None
-    target = name.strip().lower()
-    for step in config.install_steps:
-        for group in step.groups:
-            for plugin in group.plugins:
-                if plugin.name.strip().lower() == target:
-                    return plugin
-    return None
+    """Lenient option-name match across every group in the config."""
+    all_plugins = [p for step in config.install_steps for group in step.groups
+                   for p in group.plugins]
+    return _plugin_by_name(all_plugins, name)
 
 
 def find_moduleconfig(extract_path) -> Optional[Path]:
