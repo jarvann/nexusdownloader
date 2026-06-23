@@ -1311,89 +1311,37 @@ class MainWindow(QMainWindow):
                 self.install_tab.set_downloads_path(folder_path)
     
     def _auto_detect_vortex_paths(self):
-        """Auto-detect game paths from Vortex installation."""
+        """Auto-detect game paths from Vortex's live state.v2 DB (shared helper)."""
         try:
-            # Create Vortex config reader
-            vortex_reader = get_vortex_config_reader(self.logger)
-            
-            # First check if we can determine game domain from collection
-            game_domain = self._extract_game_domain_from_collection()
-            
-            if not game_domain:
-                # Show dialog to let user select game
-                game_domain = self._show_game_selection_dialog(vortex_reader)
-                
-            if not game_domain:
-                QMessageBox.information(
-                    self,
-                    "Auto-Detection",
-                    "Could not determine game domain. Please select a collection file first or choose a game manually."
-                )
-                return
-            
-            # Auto-detect paths
-            paths = vortex_reader.auto_detect_paths(game_domain)
-            
-            if not paths['vortex_found']:
-                QMessageBox.warning(
-                    self,
-                    "Vortex Not Found",
-                    "Could not find Vortex Mod Manager installation.\n\n"
-                    "Please ensure Vortex is installed and has been run at least once.\n\n"
-                    "If Vortex is currently running, please close it and try again."
-                )
-                return
-            
-            # Update paths if found
+            from gui.vortex_detect import pick_game
+            domain = self._extract_game_domain_from_collection()
+            g = pick_game(self, prefer_domain=domain,
+                          prompt="Pick the game to set up (fills Downloads + Mod Staging):")
+            if not g:
+                return   # helper already explained why (not found / locked / cancel)
+
             updates = []
-            if paths['downloads_folder']:
-                self.game_folder_edit.setText(paths['downloads_folder'])
-                updates.append(f"Downloads: {paths['downloads_folder']}")
-                
-                # Update install tab with downloads path
+            if g.get('downloads'):
+                self.game_folder_edit.setText(g['downloads'])
+                updates.append(f"Downloads: {g['downloads']}")
                 if hasattr(self, 'install_tab'):
-                    self.install_tab.set_downloads_path(paths['downloads_folder'])
-            
-            if paths['mods_folder'] and hasattr(self, 'install_tab'):
-                self.install_tab.set_game_path(paths['mods_folder'])
-                updates.append(f"Mods: {paths['mods_folder']}")
-            
+                    self.install_tab.set_downloads_path(g['downloads'])
+            if g.get('staging') and hasattr(self, 'install_tab'):
+                self.install_tab.set_game_path(g['staging'])
+                updates.append(f"Mod Staging: {g['staging']}")
+
             if updates:
-                QMessageBox.information(
-                    self,
-                    "Auto-Detection Successful",
-                    f"Successfully detected paths from Vortex:\n\n" + "\n".join(updates)
-                )
+                QMessageBox.information(self, "Auto-Detection Successful",
+                    f"Detected paths for {g['game']}:\n\n" + "\n".join(updates))
             else:
-                QMessageBox.warning(
-                    self,
-                    "Auto-Detection Failed",
-                    f"Found Vortex installation but could not detect paths for game '{game_domain}'.\n\n"
-                    "The game may not be managed by Vortex or may use custom paths."
-                )
-        
+                QMessageBox.warning(self, "Auto-Detection Failed",
+                    f"{g['game']} is discovered in Vortex but has no configured "
+                    "staging/downloads paths.")
         except Exception as e:
-            error_msg = str(e)
             if hasattr(self.logger, 'error'):
                 self.logger.error(f"Failed to auto-detect Vortex paths: {e}")
-            else:
-                print(f"ERROR: Failed to auto-detect Vortex paths: {e}")
-            
-            if "Permission denied" in error_msg or "Errno 13" in error_msg:
-                QMessageBox.warning(
-                    self,
-                    "Vortex Access Error",
-                    "Cannot access Vortex configuration files.\n\n"
-                    "This usually happens when Vortex is currently running.\n"
-                    "Please close Vortex and try auto-detection again.\n\n"
-                    f"Technical details: {error_msg}"
-                )
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Auto-Detection Error",
-                    f"An error occurred while trying to detect Vortex paths:\n\n{error_msg}"
-                )
+            QMessageBox.critical(self, "Auto-Detection Error",
+                f"An error occurred while trying to detect Vortex paths:\n\n{e}")
     
     def _extract_game_domain_from_collection(self) -> Optional[str]:
         """Extract game domain from the selected collection file."""

@@ -49,9 +49,8 @@ class CollectionSelector(QWidget):
 
     def _autodetect_staging(self):
         try:
-            from utils.vortex_config import get_vortex_config_reader
-            paths = get_vortex_config_reader().get_game_paths("skyrimse") or {}
-            staging = paths.get("mods") or ""
+            from gui.vortex_detect import find_staging_for
+            staging = find_staging_for("skyrimse")
             if staging and os.path.isdir(staging):
                 self.staging_path = staging
         except Exception:

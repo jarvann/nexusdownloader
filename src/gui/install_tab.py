@@ -858,47 +858,12 @@ class InstallTab(QWidget):
         one, and fill the Downloads + Mod Staging pickers from that game's configured
         paths (and the newest collection.json found in staging, if none is chosen)."""
         try:
-            from utils import vortex_db
-            db = vortex_db.find_state_db()
-            if not db:
-                QMessageBox.warning(self, "Vortex Not Found",
-                    "Could not find Vortex's database (state.v2). Make sure Vortex is "
-                    "installed and has been run at least once.")
-                return
-            try:
-                games = vortex_db.read_vortex_games(db)
-            except Exception as e:
-                QMessageBox.warning(self, "Close Vortex",
-                    "Couldn't read Vortex's configuration -- its database is locked.\n\n"
-                    "Close Vortex completely, then try Auto-Detect again.\n\n"
-                    f"Details: {e}")
-                return
-            if not games:
-                QMessageBox.information(self, "No Games Found",
-                    "Vortex has no mod-managed games configured.")
-                return
-
-            # Pre-select the game matching the loaded collection. Collections use
-            # the Nexus DOMAIN (e.g. 'skyrimspecialedition') while Vortex's game id
-            # is shorter (e.g. 'skyrimse'), so map the common ones.
-            _DOMAIN_TO_GAME = {
-                "skyrimspecialedition": "skyrimse", "skyrim": "skyrim",
-                "skyrimvr": "skyrimvr", "oblivion": "oblivion",
-                "fallout4": "fallout4", "fallout4vr": "fallout4vr",
-                "falloutnv": "falloutnv", "starfield": "starfield",
-            }
+            from gui.vortex_detect import pick_game
             domain = self._extract_game_domain_from_collection()
-            game_id = _DOMAIN_TO_GAME.get((domain or "").lower(), domain)
-            labels = [f"{g['game']}" + (f"  [{g['store']}]" if g.get('store') else "")
-                      for g in games]
-            default_idx = next((i for i, g in enumerate(games) if g['game'] == game_id), 0)
-            choice, ok = QInputDialog.getItem(
-                self, "Select Game",
-                "Pick the game to set up (fills Downloads + Mod Staging):",
-                labels, default_idx, False)
-            if not ok:
-                return
-            g = games[labels.index(choice)]
+            g = pick_game(self, prefer_domain=domain,
+                          prompt="Pick the game to set up (fills Downloads + Mod Staging):")
+            if not g:
+                return   # helper already explained why (not found / locked / cancel)
 
             updates = []
             if g.get('downloads'):
