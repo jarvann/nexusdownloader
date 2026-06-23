@@ -1465,6 +1465,9 @@ class ParallelFomodInstaller(FomodInstaller):
         self.config = config or {}
         # Live-adjustable concurrency gate (see set_concurrency).
         self._limiter = _ConcurrencyLimiter(max_workers)
+        # Cooperative cancel: set by cancel(); checked at the top of each mod's
+        # install so queued mods bail instantly (running ones finish cleanly).
+        self._cancelled = False
         
         # Thread safety locks
         self._temp_dir_lock = threading.Lock()
@@ -1488,6 +1491,14 @@ class ParallelFomodInstaller(FomodInstaller):
         self.max_workers = n
         self._limiter.set_max(n)
         self.logger.info(f"Install concurrency set to {n} (live)")
+
+    def cancel(self):
+        """Request cancellation: queued mods bail immediately; mods already
+        extracting finish cleanly (we don't kill threads mid-write). Also bumps
+        the limiter so any worker blocked on it wakes up to see the flag."""
+        self._cancelled = True
+        self._limiter.set_max(MAX_INSTALL_CONCURRENCY)
+        self.logger.warning("Installation cancel requested -- draining queued mods.")
 
     def set_progress_callback(self, callback: Callable[[int, int, str], None]):
         """Set callback for progress updates."""
@@ -1532,7 +1543,16 @@ class ParallelFomodInstaller(FomodInstaller):
         """Thread-safe version of install_mod that uses per-thread temp directories."""
         mod_name = mod_data.get("name", "Unknown Mod")
         thread_id = threading.get_ident()
-        
+
+        # Cancelled while this mod was still queued -> skip it instantly. (Mods
+        # already past this point finish their current extract so we never leave a
+        # half-written staging folder.)
+        if self._cancelled:
+            with self._progress_lock:
+                self._completed_count += 1
+            return InstallationResult(mod_name=mod_name, status=InstallResult.SKIPPED,
+                                      installed_files=[], warnings=["Cancelled"])
+
         try:
             # Use thread-specific temp directory
             original_temp_dir = self.temp_dir

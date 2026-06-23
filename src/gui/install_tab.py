@@ -84,6 +84,10 @@ class InstallWorkerThread(QThread):
     def cancel(self):
         """Cancel the installation process."""
         self.is_cancelled = True
+        # Propagate to the running installer so queued mods stop being started.
+        inst = self._installer
+        if inst is not None and hasattr(inst, "cancel"):
+            inst.cancel()
 
     def set_concurrency(self, n: int):
         """Change install concurrency live (no restart) if an installer is active."""
