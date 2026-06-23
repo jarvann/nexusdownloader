@@ -167,7 +167,7 @@ def build_orphan_mod(folder: str, install_time: str = "") -> Tuple[str, Dict[str
 def build_collection_download(info: Dict[str, Any], archive_name: str, dl_id: str, *,
                              collection_id: Any, slug: str, revision_id: int,
                              revision_number: int, size: int = 0,
-                             folder: str = "") -> Tuple[str, Dict[str, Any]]:
+                             folder: str = "", file_md5: str = "") -> Tuple[str, Dict[str, Any]]:
     """Build the ``persistent.downloads.files.<id>`` record for the collection
     archive itself (the ``.7z``).
 
@@ -175,10 +175,15 @@ def build_collection_download(info: Dict[str, Any], archive_name: str, dl_id: st
     identity from ``downloads.files[archiveId].modInfo.nexus.ids`` (collectionId,
     collectionSlug, revisionId, revisionNumber) -- NOT from the mod attributes.
     The collection mod's ``archiveId`` must point at this id.
+
+    ``fileMD5`` MUST be present (even if empty): Vortex flags any ``state:finished``
+    download whose ``fileMD5`` is ``undefined`` as "not finalized" and offers a
+    repair. Including the key -- ideally the real md5 -- keeps the download
+    finalized in Vortex's eyes.
     """
     tree = {
         "id": dl_id, "chunks": [], "pausable": False,
-        "state": "finished", "source": "nexus",
+        "state": "finished", "source": "nexus", "fileMD5": file_md5,
         "game": [GAME_ID, NEXUS_DOMAIN], "localPath": archive_name,
         "size": size, "received": size,
         "modInfo": {
