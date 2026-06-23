@@ -357,29 +357,9 @@ class InstallTab(QWidget):
         """Setup the user interface."""
         layout = QVBoxLayout(self)
 
-        # Quick Setup: pick the game + collection from dropdowns and let Vortex
-        # supply the paths -- no manual browsing needed in the common case. The
-        # detailed pickers below act as an override for anything off the beaten path.
-        from gui.collection_selector import CollectionSelector
-        quick_group = QGroupBox("Quick Setup — pick from Vortex")
-        quick_layout = QGridLayout(quick_group)
-        quick_layout.addWidget(QLabel("Game:"), 0, 0)
-        self.game_combo = QComboBox()
-        self.game_combo.setMinimumWidth(260)
-        self.game_combo.setToolTip("Games Vortex manages (read from its database). "
-                                   "Picking one fills the Downloads + Staging paths.")
-        quick_layout.addWidget(self.game_combo, 0, 1)
-        self.refresh_games_btn = QPushButton("↻")
-        self.refresh_games_btn.setToolTip("Re-read games from Vortex (close Vortex first)")
-        self.refresh_games_btn.setFixedWidth(32)
-        self.refresh_games_btn.clicked.connect(self._populate_game_dropdown)
-        quick_layout.addWidget(self.refresh_games_btn, 0, 2)
-        self.collection_combo = CollectionSelector()   # has its own "Collection:" label
-        quick_layout.addWidget(self.collection_combo, 1, 0, 1, 3)
-        layout.addWidget(quick_group)
-
-        # Configuration section (advanced / override paths)
-        config_group = QGroupBox("Paths (auto-filled — override here if needed)")
+        # Paths come from the global Game + Collection header (shared store); these
+        # fields show what's wired up and let you override any of them.
+        config_group = QGroupBox("Paths (from the Game/Collection header — override if needed)")
         config_layout = QGridLayout(config_group)
         
         # Collection file selection
@@ -525,50 +505,30 @@ class InstallTab(QWidget):
         self.link_vortex_btn.clicked.connect(self.link_to_vortex)
         # Live concurrency: moving the spinbox retargets a running install (no restart).
         self.max_workers_spinbox.valueChanged.connect(self._on_workers_changed)
-        # Quick Setup dropdowns drive the path fields.
-        self.game_combo.currentIndexChanged.connect(self._on_quick_game_changed)
-        self.collection_combo.collection_selected.connect(self._on_quick_collection_changed)
-        self._populate_game_dropdown()
+        # Subscribe to the shared store: the global Game/Collection header fills
+        # these path fields automatically.
+        from gui.session_paths import session_paths
+        self._session = session_paths()
+        self._session.changed.connect(self._sync_from_session)
+        self._sync_from_session()
 
-    def _populate_game_dropdown(self):
-        """Fill the Game dropdown from Vortex's DB (silent if locked/not found)."""
-        from gui.vortex_detect import read_games, domain_to_game_id
-        self._games = read_games(self, warn=False)
-        self.game_combo.blockSignals(True)
-        self.game_combo.clear()
-        for g in self._games:
-            self.game_combo.addItem(
-                g["game"] + (f"  [{g['store']}]" if g.get("store") else ""), g["game"])
-        self.game_combo.blockSignals(False)
-        if not self._games:
-            return
-        domain = self._extract_game_domain_from_collection()
-        gid = domain_to_game_id(domain)
-        idx = next((i for i, g in enumerate(self._games) if g["game"] == gid), 0)
-        self.game_combo.setCurrentIndex(idx)
-        self._on_quick_game_changed(idx)
+    def _sync_from_session(self):
+        """Pull collection/downloads/staging from the shared store into the fields.
 
-    def _on_quick_game_changed(self, idx: int):
-        """Game picked -> fill Downloads + Staging and point the collection dropdown
-        at that game's staging folder."""
-        games = getattr(self, "_games", None)
-        if not games or idx < 0 or idx >= len(games):
-            return
-        g = games[idx]
-        if g.get("downloads"):
-            self.downloads_path = g["downloads"]
-            self.downloads_path_edit.setText(g["downloads"])
-        if g.get("staging"):
-            self.game_path = g["staging"]
-            self.game_path_edit.setText(g["staging"])
-            self.collection_combo.set_staging(g["staging"])
+        update_start_button_state re-publishes, but session.update() is a no-op
+        when values are unchanged, so there's no feedback loop.
+        """
+        s = self._session
+        if s.collection and self.collection_path != s.collection:
+            self.collection_path = s.collection
+            self.collection_path_edit.setText(s.collection)
+        if s.downloads and self.downloads_path != s.downloads:
+            self.downloads_path = s.downloads
+            self.downloads_path_edit.setText(s.downloads)
+        if s.staging and self.game_path != s.staging:
+            self.game_path = s.staging
+            self.game_path_edit.setText(s.staging)
         self.update_start_button_state()
-
-    def _on_quick_collection_changed(self, path: str):
-        if path:
-            self.collection_path = path
-            self.collection_path_edit.setText(path)
-            self.update_start_button_state()
 
     def _on_workers_changed(self, value: int):
         """Apply a new concurrency to the running install immediately, if any."""
@@ -632,6 +592,12 @@ class InstallTab(QWidget):
         self.link_vortex_btn.setEnabled(can_start)
         # Share the picked paths with the Deploy & Play tab.
         self.paths_changed.emit(self.collection_path or "", self.game_path or "", "")
+        # Publish to the shared store (single source of truth for all tabs).
+        if getattr(self, "_paths_loaded", False):
+            from gui.session_paths import session_paths
+            session_paths().update(collection=self.collection_path,
+                                   downloads=self.downloads_path,
+                                   staging=self.game_path)
         # Persist the picks so they come back next session.
         self._save_paths()
 

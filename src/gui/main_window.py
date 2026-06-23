@@ -931,9 +931,11 @@ class MainWindow(QMainWindow):
         # Main layout with tab widget
         main_layout = QVBoxLayout(central_widget)
         
-        # Shared collection selector (drives every tab) above the tabs.
-        self.collection_selector = CollectionSelector()
-        main_layout.addWidget(self.collection_selector)
+        # Shared Game + Collection header (drives every tab via session_paths).
+        from gui.setup_header import SetupHeader
+        self.setup_header = SetupHeader()
+        self.collection_selector = self.setup_header.collection_selector  # back-compat
+        main_layout.addWidget(self.setup_header)
 
         # Create tabbed interface
         self.tab_widget = QTabWidget()

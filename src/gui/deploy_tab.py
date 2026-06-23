@@ -107,7 +107,28 @@ class DeployTab(QWidget):
         self.skse_path = ""
         self._thread = None
         self._setup_ui()
-        self.auto_detect()
+        # Subscribe to the shared path store so picking a game/collection in the
+        # Install tab wires up Deploy automatically (Data folder, SKSE included).
+        from gui.session_paths import session_paths
+        self._session = session_paths()
+        self._session.changed.connect(self._sync_from_session)
+        self._sync_from_session()
+        if not (self.collection_path and self.staging_path and self.game_data_dir):
+            self.auto_detect()
+
+    def _sync_from_session(self):
+        """Pull any paths the shared store now has (set by the Install tab)."""
+        s = self._session
+        changed = False
+        for src, dst in (("collection", "collection_path"), ("staging", "staging_path"),
+                         ("game_data", "game_data_dir"), ("localappdata", "localappdata_dir"),
+                         ("skse", "skse_path")):
+            val = getattr(s, src, "")
+            if val and getattr(self, dst, "") != val:
+                setattr(self, dst, val)
+                changed = True
+        if changed:
+            self._refresh_paths_label()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -231,6 +252,13 @@ class DeployTab(QWidget):
             lbl.setText(vals.get(k) or "— not set —")
         ready = all([self.collection_path, self.staging_path, self.game_data_dir])
         self.deploy_btn.setEnabled(ready)
+        # Publish back to the shared store (no-op if unchanged -> no feedback loop).
+        if getattr(self, "_session", None) is not None:
+            self._session.update(collection=self.collection_path,
+                                 staging=self.staging_path,
+                                 game_data=self.game_data_dir,
+                                 localappdata=self.localappdata_dir,
+                                 skse=self.skse_path)
 
     # --- deploy ----------------------------------------------------------- #
     def start_deploy(self):
