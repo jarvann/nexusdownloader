@@ -4,7 +4,7 @@ import concurrent.futures
 import logging
 import sys
 import download, endorse  # Import modules
-from download import download_file, set_download_logger  # Importing functions from download.py
+from download import download_file, set_download_logger, CONFIG  # Importing functions from download.py
 from endorse import endorse_mod, set_endorse_logger  # Importing functions from endorse.py
 import threading
 import time
@@ -91,11 +91,36 @@ def main(mods, gamefolder, max_threads=10, logger=None):
     if logger:
         logger.verbose(f"Starting downloads for {len(mods)} mods with {max_threads} threads.")
 
+    # Pre-index what's already on disk so we can skip the Nexus API entirely for
+    # mods that are already fully downloaded. A resume otherwise fires one API
+    # 'get download url' call per existing file (just to learn the filename, then
+    # skip it) -> thousands at once -> Nexus rate-limits / resets connections.
+    # Filenames embed the modId (-<modId>-) but not the fileId, so we skip a mod
+    # only when the count of files on disk for that modId already meets what the
+    # collection wants -- safe for resumes; a fresh revision is a fresh download.
+    from collections import Counter
+    import re as _re
+    download_dir = os.path.join(CONFIG.VortexSettings.DownloadsFolderRoot, gamefolder)
+    expected = Counter(str(mid) for mid, _fid in mods)
+    existing = Counter()
+    _modid_re = _re.compile(r"-(\d{2,7})-")
+    if os.path.isdir(download_dir):
+        for fn in os.listdir(download_dir):
+            m = _modid_re.search(fn)
+            if m:
+                existing[m.group(1)] += 1
+    complete = {mid for mid in expected if existing.get(mid, 0) >= expected[mid]}
+    if logger and complete:
+        logger.verbose(f"{len(complete)} mod(s) already on disk -- skipping the Nexus "
+                       f"API for those (fast, rate-limit-safe resume).")
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_threads)) as executor:
         futures = []
         for mod_id, file_id in mods:
             current_counter = incrementCOUNTER_ThreadSafe()
-            futures.append(executor.submit(download_file, GAME_DOMAIN, gamefolder, mod_id, file_id, current_counter))
+            futures.append(executor.submit(
+                download_file, GAME_DOMAIN, gamefolder, mod_id, file_id, current_counter,
+                already_have=(str(mod_id) in complete)))
 
         for future in concurrent.futures.as_completed(futures):
             try:

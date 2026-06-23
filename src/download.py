@@ -127,11 +127,23 @@ def get_download_url(game_domain, mod_id, file_id):
     if last_error:
         raise last_error
 
-def download_file(game_domain, gamefolder, mod_id, file_id, current_counter):
-    """Download a specific mod file."""
+def download_file(game_domain, gamefolder, mod_id, file_id, current_counter,
+                  already_have=False):
+    """Download a specific mod file.
+
+    ``already_have`` lets the caller short-circuit BEFORE the Nexus API call when
+    it has already confirmed the file is on disk. The filename only comes from the
+    signed download URL, so without this flag a resume fires one 'get download
+    url' API request per already-downloaded file -- thousands at once -> Nexus
+    rate-limits and forcibly closes connections. Skipping the API here avoids that.
+    """
     logger = get_download_logger()
+    if already_have:
+        logger.verbose(f"mod {mod_id} file {file_id} already downloaded; "
+                       f"skipped (no API call). (#{current_counter})")
+        return
+
     download_start = time.time()
-    
     logger.info(f"Starting download for mod {mod_id}, file {file_id} (#{current_counter})")
 
     download_dir = os.path.join(CONFIG.VortexSettings.DownloadsFolderRoot, gamefolder)
