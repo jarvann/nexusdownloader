@@ -96,6 +96,7 @@ class SyncPlan:
     skipped_no_disk: int = 0
     rule_count: int = 0
     orphan_count: int = 0       # staging folders not in the collection, given bare records
+    modrule_count: int = 0      # per-mod before/after conflict rules written
     violations: List[str] = field(default_factory=list)     # schema problems
 
     @property
@@ -121,6 +122,12 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
     info = collection.get("info", {})
     coll_name = info.get("name", collection_folder)   # the mods' "variant"
     recorded: set = set()   # staging folders we've written a mod record for
+    # Maps for translating collection.modRules into per-mod conflict rules:
+    # resolve a rule endpoint (by md5 / logical name) to the folder we actually
+    # installed it into, plus that folder's download (archive) id.
+    folder_by_md5: Dict[str, str] = {}
+    folder_by_logical: Dict[str, str] = {}
+    archive_id_by_folder: Dict[str, str] = {}
 
     def add(record_type: str, base: str, leaves: Dict[str, Any]):
         plan.violations.extend(
@@ -157,8 +164,52 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         base, leaves = vr.build_profile_modstate(profile_id, folder)
         add("profile_modstate", base, leaves)
         recorded.add(folder)
+        # Index this mod for modRule resolution (md5 + logical name -> its folder).
+        archive_id_by_folder[folder] = dl_id
+        if s.get("md5"):
+            folder_by_md5[s["md5"].lower()] = folder
+        lf = (s.get("logicalFilename") or mod.get("name") or "").lower()
+        if lf:
+            folder_by_logical[lf] = folder
         plan.mod_count += 1
         plan.profile_enables += 1
+
+    # Phase 1b: translate the collection's modRules into per-mod conflict rules.
+    # Vortex resolves file conflicts from each mod's own `rules` array; without
+    # them every overlap shows as an unresolved conflict even though our deploy
+    # already ordered them. Mirrors collections/postprocessCollection.ts: add a
+    # {type, reference:{id,idHint,archiveId}} entry to the SOURCE mod for each
+    # before/after rule, with the reference resolved to the DEST mod's folder.
+    def _resolve_ref(ref: Dict[str, Any]) -> Optional[str]:
+        md5 = (ref.get("fileMD5") or "").lower()
+        if md5 and md5 in folder_by_md5:
+            return folder_by_md5[md5]
+        lf = (ref.get("logicalFileName") or "").lower()
+        if lf and lf in folder_by_logical:
+            return folder_by_logical[lf]
+        idh = ref.get("idHint") or ref.get("id")
+        return idh if idh in recorded else None
+
+    rules_by_folder: Dict[str, list] = {}
+    for rule in collection.get("modRules", []):
+        if rule.get("type") not in ("before", "after"):
+            continue   # only load-order rules resolve file conflicts
+        src_folder = _resolve_ref(rule.get("source") or {})
+        if not src_folder:
+            continue
+        dst_folder = _resolve_ref(rule.get("reference") or {})
+        if dst_folder:
+            reference = {"id": dst_folder, "idHint": dst_folder,
+                         "archiveId": archive_id_by_folder.get(dst_folder, "")}
+        else:
+            reference = rule.get("reference") or {}
+        rules_by_folder.setdefault(src_folder, []).append(
+            {"type": rule["type"], "reference": reference})
+
+    for folder, frules in rules_by_folder.items():
+        base = f"persistent###mods###{GAME_ID}###{folder}"
+        plan.records.update(vr.to_absolute(base, {"rules": frules}))
+    plan.modrule_count = sum(len(v) for v in rules_by_folder.values())
 
     # Phase 2: collection mod @ revision + rules + manifest
     rules = []
