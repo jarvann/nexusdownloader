@@ -1504,7 +1504,7 @@ class ParallelFomodInstaller(FomodInstaller):
         """Set callback for progress updates."""
         self._progress_callback = callback
         
-    def set_installation_callback(self, callback: Callable[[str, bool, str], None]):
+    def set_installation_callback(self, callback: Callable[[str, bool, str, int], None]):
         """Set callback for individual installation completion."""
         self._installation_callback = callback
         
@@ -1565,8 +1565,8 @@ class ParallelFomodInstaller(FomodInstaller):
                     if self._progress_callback:
                         self._progress_callback(self._completed_count, self._total_count, mod_name)
                     if self._installation_callback:
-                        self._installation_callback(mod_name, True, "Already installed, skipped")
-                
+                        self._installation_callback(mod_name, True, "Already installed, skipped", 0)
+
                 return InstallationResult(
                     mod_name=mod_name,
                     status=InstallResult.SKIPPED,
@@ -1603,10 +1603,11 @@ class ParallelFomodInstaller(FomodInstaller):
                     self._progress_callback(self._completed_count, self._total_count, mod_name)
                 if self._installation_callback:
                     success = result.status in [InstallResult.SUCCESS, InstallResult.SKIPPED]
-                    message = result.error_message or f"Installed {len(result.installed_files)} files"
+                    file_count = len(result.installed_files)
+                    message = result.error_message or f"Installed {file_count} files"
                     if result.status == InstallResult.SKIPPED:
                         message = "Already installed, skipped"
-                    self._installation_callback(mod_name, success, message)
+                    self._installation_callback(mod_name, success, message, file_count)
             
             # Note: Individual extraction cleanup is handled by _install_simple/_install_fomod
             # No need for aggressive cleanup here as each method cleans up its own extraction

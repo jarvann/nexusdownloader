@@ -65,7 +65,7 @@ class InstallWorkerThread(QThread):
     """Worker thread for mod installation operations."""
 
     progress_updated = Signal(int, int, str)  # current, total, mod_name
-    installation_complete = Signal(str, bool, str)  # mod_name, success, message
+    installation_complete = Signal(str, bool, str, int)  # mod_name, success, message, file_count
     log_message = Signal(str, str)  # level, message
     installation_finished = Signal(list)  # List of InstallationResult
     
@@ -197,10 +197,11 @@ class InstallWorkerThread(QThread):
         if not self.is_cancelled:
             self.progress_updated.emit(current, total, mod_name)
     
-    def _on_installation_complete(self, mod_name: str, success: bool, message: str):
+    def _on_installation_complete(self, mod_name: str, success: bool, message: str,
+                                  file_count: int = 0):
         """Callback for individual mod installation completion."""
         if not self.is_cancelled:
-            self.installation_complete.emit(mod_name, success, message)
+            self.installation_complete.emit(mod_name, success, message, file_count)
 
 
 class OptionalSelectionDialog(QDialog):
@@ -490,8 +491,10 @@ class InstallTab(QWidget):
         splitter.addWidget(log_group)
         splitter.setSizes([300, 500])  # Set initial sizes
         
-        progress_layout.addWidget(splitter)
-        layout.addWidget(progress_group)
+        progress_layout.addWidget(splitter, 1)   # splitter fills the progress group
+        # Stretch factor 1: the progress group absorbs all extra vertical space
+        # when the window grows, while Paths/Options stay at their natural height.
+        layout.addWidget(progress_group, 1)
     
     def setup_connections(self):
         """Setup signal connections."""
@@ -688,8 +691,9 @@ class InstallTab(QWidget):
             self.log_message("WARNING", "Installation already running, returning")
             return
         
-        # Clear previous results
+        # Clear previous results + reset the running mod/file counters.
         self.mod_status_list.clear()
+        self._mods_done = self._mods_total = self._files_done = 0
         self.overall_progress.setValue(0)
         self.overall_progress.setVisible(True)
 
@@ -787,26 +791,32 @@ class InstallTab(QWidget):
             self.progress_label.setText("Cancelling...")
     
     def update_progress(self, current: int, total: int, mod_name: str):
-        """Update installation progress."""
+        """Update installation progress (bar tracks mods; label adds file totals)."""
+        self._mods_done, self._mods_total = current, total
         if total > 0:
-            progress_percent = int((current / total) * 100)
-            self.overall_progress.setValue(progress_percent)
-            
-        if current < total:
-            self.progress_label.setText(f"Installing {current+1}/{total}: {mod_name}")
-        else:
-            self.progress_label.setText(f"Installation complete: {current}/{total}")
-    
-    def on_mod_installed(self, mod_name: str, success: bool, message: str):
-        """Handle individual mod installation completion."""
+            self.overall_progress.setValue(int((current / total) * 100))
+        self._refresh_overall_label(mod_name if current < total else "")
+
+    def _refresh_overall_label(self, mod_name: str = ""):
+        """Overall status: mods completed + total files installed so far."""
+        done, total = getattr(self, "_mods_done", 0), getattr(self, "_mods_total", 0)
+        files = getattr(self, "_files_done", 0)
+        if total and done < total:
+            self.progress_label.setText(
+                f"Installing {done}/{total} mods — {files:,} files installed"
+                + (f"  ({mod_name})" if mod_name else ""))
+        elif total:
+            self.progress_label.setText(
+                f"Installed {done}/{total} mods — {files:,} files total")
+
+    def on_mod_installed(self, mod_name: str, success: bool, message: str, file_count: int = 0):
+        """Handle individual mod completion: one MOD-level row + running file total."""
+        self._files_done = getattr(self, "_files_done", 0) + max(0, file_count)
         item = QListWidgetItem(f"{mod_name}: {message}")
-        if success:
-            item.setBackground(Qt.green)
-        else:
-            item.setBackground(Qt.red)
-        
+        item.setBackground(Qt.green if success else Qt.red)
         self.mod_status_list.addItem(item)
         self.mod_status_list.scrollToBottom()
+        self._refresh_overall_label()
     
     def on_installation_finished(self, results: List[InstallationResult]):
         """Handle completion of entire installation process."""
@@ -819,8 +829,11 @@ class InstallTab(QWidget):
         successful = sum(1 for r in results if r.status == InstallResult.SUCCESS)
         failed = sum(1 for r in results if r.status == InstallResult.FAILED)
         skipped = sum(1 for r in results if r.status == InstallResult.SKIPPED)
-        
-        self.progress_label.setText(f"Installation finished: {successful} successful, {failed} failed, {skipped} skipped")
+        total_files = sum(len(getattr(r, "installed_files", []) or []) for r in results)
+
+        self.progress_label.setText(
+            f"Installation finished: {successful} successful, {failed} failed, "
+            f"{skipped} skipped — {total_files:,} files installed")
         
         # Show completion dialog
         if failed == 0:

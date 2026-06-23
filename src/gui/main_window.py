@@ -969,6 +969,26 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # The Download tab's own fields aren't a subscribing widget, so wire them
+        # to the shared store here: header pick -> collection JSON + downloads folder.
+        try:
+            from gui.session_paths import session_paths
+            self._session = session_paths()
+            self._session.changed.connect(self._sync_download_tab)
+            self._sync_download_tab()
+        except Exception:
+            pass
+
+    def _sync_download_tab(self):
+        """Reflect the shared Game/Collection pick into the Download tab fields."""
+        s = getattr(self, "_session", None)
+        if s is None:
+            return
+        if s.collection and self.json_file_edit.text() != s.collection:
+            self.json_file_edit.setText(s.collection)
+        if s.downloads and self.game_folder_edit.text() != s.downloads:
+            self.game_folder_edit.setText(s.downloads)
+
     def _on_collection_selected(self, collection_path: str):
         """Apply the shared collection pick to the Install + Deploy tabs."""
         if not collection_path:
@@ -1262,7 +1282,12 @@ class MainWindow(QMainWindow):
         
         if file_path:
             self.json_file_edit.setText(file_path)
-            
+            # Publish to the shared store so Install/Deploy reflect it too.
+            try:
+                from gui.session_paths import session_paths
+                session_paths().update(collection=file_path)
+            except Exception:
+                pass
             # Save the directory for next time
             self._save_last_collection_directory(file_path)
 
@@ -1308,6 +1333,12 @@ class MainWindow(QMainWindow):
         )
         if folder_path:
             self.game_folder_edit.setText(folder_path)
+            # Publish to the shared store so Install/Deploy reflect it too.
+            try:
+                from gui.session_paths import session_paths
+                session_paths().update(downloads=folder_path)
+            except Exception:
+                pass
             # Update install tab with downloads path
             if hasattr(self, 'install_tab'):
                 self.install_tab.set_downloads_path(folder_path)
@@ -1322,14 +1353,19 @@ class MainWindow(QMainWindow):
             if not g:
                 return   # helper already explained why (not found / locked / cancel)
 
+            # Publish the whole game to the shared store (downloads/staging/Data/SKSE)
+            # so every tab updates from one place.
+            try:
+                from gui.session_paths import session_paths
+                session_paths().apply_game(g)
+            except Exception:
+                pass
+
             updates = []
             if g.get('downloads'):
                 self.game_folder_edit.setText(g['downloads'])
                 updates.append(f"Downloads: {g['downloads']}")
-                if hasattr(self, 'install_tab'):
-                    self.install_tab.set_downloads_path(g['downloads'])
-            if g.get('staging') and hasattr(self, 'install_tab'):
-                self.install_tab.set_game_path(g['staging'])
+            if g.get('staging'):
                 updates.append(f"Mod Staging: {g['staging']}")
 
             if updates:
