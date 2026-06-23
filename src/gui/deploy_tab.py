@@ -16,6 +16,7 @@ from typing import Optional
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QMessageBox,
+    QGridLayout, QFileDialog, QGroupBox,
 )
 
 import sys
@@ -118,10 +119,31 @@ class DeployTab(QWidget):
         info.setWordWrap(True)
         layout.addWidget(info)
 
-        self.paths_label = QLabel("Detecting paths...")
-        self.paths_label.setWordWrap(True)
-        self.paths_label.setStyleSheet("QLabel { color: gray; }")
-        layout.addWidget(self.paths_label)
+        # Editable path rows (auto-detected, but always overridable via Browse).
+        box = QGroupBox("Paths")
+        grid = QGridLayout(box)
+        self._path_lbls = {}
+
+        def add_row(row, key, caption, is_file):
+            grid.addWidget(QLabel(caption), row, 0)
+            val = QLabel("— not set —")
+            val.setStyleSheet("QLabel { border: 1px solid gray; padding: 3px; }")
+            val.setWordWrap(True)
+            grid.addWidget(val, row, 1)
+            btn = QPushButton("Browse…")
+            btn.clicked.connect(lambda _=False, k=key, f=is_file: self._browse_path(k, f))
+            grid.addWidget(btn, row, 2)
+            self._path_lbls[key] = val
+
+        add_row(0, "collection", "Collection file:", True)
+        add_row(1, "staging", "Mod staging:", False)
+        add_row(2, "game_data", "Game Data folder:", False)
+        add_row(3, "localappdata", "Plugins (LOCALAPPDATA):", False)
+
+        self.redetect_btn = QPushButton("Re-detect from Vortex")
+        self.redetect_btn.clicked.connect(self.auto_detect)
+        grid.addWidget(self.redetect_btn, 4, 1, 1, 2)
+        layout.addWidget(box)
 
         btns = QHBoxLayout()
         self.deploy_btn = QPushButton("Deploy + Sort")
@@ -141,29 +163,51 @@ class DeployTab(QWidget):
 
     # --- path discovery --------------------------------------------------- #
     def auto_detect(self):
+        """Fill paths from Vortex's state.v2 (game install -> Data folder, staging,
+        newest collection.json). Requires Vortex closed; fails silently if locked --
+        the user can always set paths via Browse."""
         try:
-            from utils.vortex_config import get_vortex_config_reader
-            reader = get_vortex_config_reader()
-            paths = reader.get_game_paths("skyrimse") or {}
-            staging = paths.get("mods") or ""
-            install = paths.get("install") or ""
-            if staging and os.path.isdir(staging):
-                self.staging_path = staging
-            if install:
-                data = os.path.join(install, "Data")
-                if os.path.isdir(data):
-                    self.game_data_dir = data
-            if self.staging_path:
+            from utils import vortex_db
+            games = []
+            db = vortex_db.find_state_db()
+            if db:
+                try:
+                    games = vortex_db.read_vortex_games(db)
+                except Exception:
+                    games = []
+            g = next((x for x in games if x["game"] == "skyrimse"), None) \
+                or (games[0] if games else None)
+            if g:
+                if g.get("staging") and os.path.isdir(g["staging"]):
+                    self.staging_path = g["staging"]
+                install = g.get("install") or ""
+                if install:
+                    data = os.path.join(install, "Data")
+                    if os.path.isdir(data):
+                        self.game_data_dir = data
+                    cand = os.path.join(install, "skse64_loader.exe")
+                    if os.path.exists(cand):
+                        self.skse_path = cand
+            if self.staging_path and not self.collection_path:
                 cj = _find_collection_json(self.staging_path)
                 if cj:
                     self.collection_path = cj
-            # locate SKSE for launch
-            if install:
-                cand = os.path.join(install, "skse64_loader.exe")
-                if os.path.exists(cand):
-                    self.skse_path = cand
         except Exception:
             pass
+        self._refresh_paths_label()
+
+    def _browse_path(self, key, is_file):
+        if is_file:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select collection.json", self.staging_path or "",
+                "Collection (collection.json);;JSON (*.json);;All files (*.*)")
+        else:
+            start = (self.game_data_dir or self.staging_path or "")
+            path = QFileDialog.getExistingDirectory(self, "Select folder", start)
+        if not path:
+            return
+        setattr(self, {"collection": "collection_path", "staging": "staging_path",
+                       "game_data": "game_data_dir", "localappdata": "localappdata_dir"}[key], path)
         self._refresh_paths_label()
 
     def set_paths(self, collection="", staging="", game_data=""):
@@ -177,11 +221,14 @@ class DeployTab(QWidget):
         self._refresh_paths_label()
 
     def _refresh_paths_label(self):
-        self.paths_label.setText(
-            f"collection: {self.collection_path or '— not found —'}\n"
-            f"staging:    {self.staging_path or '— not found —'}\n"
-            f"game data:  {self.game_data_dir or '— not found —'}\n"
-            f"plugins:    {self.localappdata_dir}")
+        vals = {
+            "collection": self.collection_path,
+            "staging": self.staging_path,
+            "game_data": self.game_data_dir,
+            "localappdata": self.localappdata_dir,
+        }
+        for k, lbl in self._path_lbls.items():
+            lbl.setText(vals.get(k) or "— not set —")
         ready = all([self.collection_path, self.staging_path, self.game_data_dir])
         self.deploy_btn.setEnabled(ready)
 

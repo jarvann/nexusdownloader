@@ -828,11 +828,20 @@ class InstallTab(QWidget):
                     "Vortex has no mod-managed games configured.")
                 return
 
-            # Pre-select the game that matches the loaded collection, if any.
+            # Pre-select the game matching the loaded collection. Collections use
+            # the Nexus DOMAIN (e.g. 'skyrimspecialedition') while Vortex's game id
+            # is shorter (e.g. 'skyrimse'), so map the common ones.
+            _DOMAIN_TO_GAME = {
+                "skyrimspecialedition": "skyrimse", "skyrim": "skyrim",
+                "skyrimvr": "skyrimvr", "oblivion": "oblivion",
+                "fallout4": "fallout4", "fallout4vr": "fallout4vr",
+                "falloutnv": "falloutnv", "starfield": "starfield",
+            }
             domain = self._extract_game_domain_from_collection()
+            game_id = _DOMAIN_TO_GAME.get((domain or "").lower(), domain)
             labels = [f"{g['game']}" + (f"  [{g['store']}]" if g.get('store') else "")
                       for g in games]
-            default_idx = next((i for i, g in enumerate(games) if g['game'] == domain), 0)
+            default_idx = next((i for i, g in enumerate(games) if g['game'] == game_id), 0)
             choice, ok = QInputDialog.getItem(
                 self, "Select Game",
                 "Pick the game to set up (fills Downloads + Mod Staging):",
