@@ -33,6 +33,7 @@ from gui.settings_dialog import SettingsDialog
 from gui.progress_monitor import ProgressMonitorWidget
 from gui.install_tab import InstallTab
 from gui.deploy_tab import DeployTab
+from gui.collection_selector import CollectionSelector
 from utils.vortex_config import get_vortex_config_reader
 
 # Import Phase 1 modules
@@ -926,6 +927,10 @@ class MainWindow(QMainWindow):
         # Main layout with tab widget
         main_layout = QVBoxLayout(central_widget)
         
+        # Shared collection selector (drives every tab) above the tabs.
+        self.collection_selector = CollectionSelector()
+        main_layout.addWidget(self.collection_selector)
+
         # Create tabbed interface
         self.tab_widget = QTabWidget()
         main_layout.addWidget(self.tab_widget)
@@ -948,6 +953,34 @@ class MainWindow(QMainWindow):
         # When the Install tab's paths change, push them to the Deploy tab too.
         try:
             self.install_tab.paths_changed.connect(self.deploy_tab.set_paths)
+        except Exception:
+            pass
+
+        # Shared collection selector drives Install + Deploy tabs.
+        try:
+            self.collection_selector.collection_selected.connect(self._on_collection_selected)
+            self.collection_selector.refresh()   # emit the initial selection
+        except Exception:
+            pass
+
+    def _on_collection_selected(self, collection_path: str):
+        """Apply the shared collection pick to the Install + Deploy tabs."""
+        if not collection_path:
+            return
+        staging = os.path.dirname(os.path.dirname(collection_path))
+        # Install tab
+        try:
+            self.install_tab.collection_path = collection_path
+            self.install_tab.collection_path_edit.setText(collection_path)
+            if os.path.isdir(staging):
+                self.install_tab.game_path = staging
+                self.install_tab.game_path_edit.setText(staging)
+            self.install_tab.update_start_button_state()
+        except Exception:
+            pass
+        # Deploy tab
+        try:
+            self.deploy_tab.set_paths(collection=collection_path, staging=staging)
         except Exception:
             pass
     
