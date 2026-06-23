@@ -275,10 +275,58 @@ class InstallTab(QWidget):
         
         # Load configuration
         self.config = self._load_config()
-        
+
+        self._paths_loaded = False   # guard so we don't save empty paths during build
         self.setup_ui()
         self.setup_connections()
-    
+        self._restore_paths()        # bring back last session's collection/downloads/staging
+
+    def _config_file(self):
+        from pathlib import Path as _P
+        return _P(__file__).parent.parent / "config.json"
+
+    def _save_paths(self):
+        """Persist the chosen collection/downloads/staging to ui_preferences so they
+        survive a restart (the path pickers were previously session-only)."""
+        if not getattr(self, "_paths_loaded", False):
+            return
+        try:
+            p = self._config_file()
+            cfg = {}
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            ui = cfg.setdefault("ui_preferences", {})
+            ui["last_collection_file"] = self.collection_path or ""
+            ui["last_downloads_folder"] = self.downloads_path or ""
+            ui["last_staging_folder"] = self.game_path or ""
+            tmp = str(p) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, str(p))
+        except Exception as e:
+            self.log_message("DEBUG", f"Could not save paths: {e}")
+
+    def _restore_paths(self):
+        try:
+            ui = (self._load_config().get("ui_preferences") or {})
+            c, d, s = (ui.get("last_collection_file") or "",
+                       ui.get("last_downloads_folder") or "",
+                       ui.get("last_staging_folder") or "")
+            if c and os.path.exists(c):
+                self.collection_path = c
+                self.collection_path_edit.setText(c)
+            if d and os.path.isdir(d):
+                self.downloads_path = d
+                self.downloads_path_edit.setText(d)
+            if s and os.path.isdir(s):
+                self.game_path = s
+                self.game_path_edit.setText(s)
+        except Exception as e:
+            self.log_message("DEBUG", f"Could not restore paths: {e}")
+        self._paths_loaded = True
+        self.update_start_button_state()
+
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from config.json."""
         default_config = {
@@ -519,6 +567,8 @@ class InstallTab(QWidget):
         self.link_vortex_btn.setEnabled(can_start)
         # Share the picked paths with the Deploy & Play tab.
         self.paths_changed.emit(self.collection_path or "", self.game_path or "", "")
+        # Persist the picks so they come back next session.
+        self._save_paths()
 
     def link_to_vortex(self):
         """Register installed mods + the collection into Vortex's DB (two-phase:
