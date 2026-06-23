@@ -319,45 +319,40 @@ class ArchiveHandler:
                     szf.extractall(extract_to)
         except Exception as e:
             error_msg = str(e)
-            
-            # Check if this is a BCJ2 compression error that we can handle with external tools
-            if "BCJ2 filter is not supported" in error_msg:
-                self.logger.warning(f"py7zr cannot handle BCJ2 compression in {archive_path.name}, trying external tools")
-                
-                # Try external 7-Zip first
-                if '7z' in _external_tools:
-                    try:
-                        self.logger.info(f"Using external 7-Zip for BCJ2 archive: {archive_path.name}")
-                        self._extract_7z_external(archive_path, extract_to, selected_files)
-                        return
-                    except Exception as ext_error:
-                        self.logger.warning(f"External 7-Zip failed: {ext_error}")
-                
-                # Try external WinRAR as second fallback
-                if 'winrar' in _external_tools:
-                    try:
-                        self.logger.info(f"Using external WinRAR for BCJ2 archive: {archive_path.name}")
-                        self._extract_winrar_external(archive_path, extract_to, selected_files)
-                        return
-                    except Exception as ext_error:
-                        self.logger.warning(f"External WinRAR failed: {ext_error}")
-                
-                # If all external tools failed, provide helpful error message
-                available_tools = [tool for tool in ['7z', 'winrar'] if tool in _external_tools]
-                if available_tools:
-                    raise ValueError(
-                        f"Archive {archive_path.name} uses BCJ2 compression which py7zr doesn't support. "
-                        f"External tools {available_tools} were found but failed to extract. "
-                        f"Original py7zr error: {error_msg}"
-                    )
-                else:
-                    raise ValueError(
-                        f"Archive {archive_path.name} uses BCJ2 compression which py7zr doesn't support. "
-                        f"Please install 7-Zip or WinRAR for BCJ2 support. Original error: {error_msg}"
-                    )
-            else:
-                # Re-raise other errors
-                raise
+
+            # py7zr chokes on several things the external binaries handle fine --
+            # BCJ2, newer/unsupported compression methods ("That compression method
+            # is not supported"), some solid archives, etc. Rather than only
+            # special-casing BCJ2, fall back to external 7-Zip/WinRAR on ANY py7zr
+            # failure; they cover effectively every real-world archive.
+            self.logger.warning(
+                f"py7zr failed to extract {archive_path.name} ({error_msg}); "
+                f"trying external 7-Zip/WinRAR.")
+
+            if '7z' in _external_tools:
+                try:
+                    self.logger.info(f"Using external 7-Zip for {archive_path.name}")
+                    self._extract_7z_external(archive_path, extract_to, selected_files)
+                    return
+                except Exception as ext_error:
+                    self.logger.warning(f"External 7-Zip failed: {ext_error}")
+
+            if 'winrar' in _external_tools:
+                try:
+                    self.logger.info(f"Using external WinRAR for {archive_path.name}")
+                    self._extract_winrar_external(archive_path, extract_to, selected_files)
+                    return
+                except Exception as ext_error:
+                    self.logger.warning(f"External WinRAR failed: {ext_error}")
+
+            available_tools = [tool for tool in ['7z', 'winrar'] if tool in _external_tools]
+            if available_tools:
+                raise ValueError(
+                    f"Archive {archive_path.name} could not be extracted by py7zr or "
+                    f"external tools {available_tools}. py7zr error: {error_msg}")
+            raise ValueError(
+                f"Archive {archive_path.name} could not be extracted by py7zr "
+                f"({error_msg}). Install 7-Zip or WinRAR for broader format support.")
     
     def _extract_rar(self, archive_path: Path, extract_to: Path, selected_files: Optional[List[str]]):
         """Extract RAR archive."""
