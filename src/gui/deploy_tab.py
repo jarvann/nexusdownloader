@@ -261,9 +261,14 @@ class DeployTab(QWidget):
     def _on_done(self, res):
         self.deploy_btn.setEnabled(True)
         self.launch_btn.setEnabled(bool(self.skse_path) or True)
+        esl = getattr(res, "esl_flagged", 0)
         self.panel.finish(
-            f"Deployed {res.deploy.files:,} files, {res.active_plugins:,} plugins sorted. "
-            "Ready to play.", ok=True)
+            f"Deployed {res.deploy.files:,} files, {res.active_plugins:,} plugins active"
+            + (f", {esl:,} auto-flagged light (ESL)" if esl else "")
+            + ". Ready to play.", ok=True)
+        if esl:
+            self.panel.log("INFO", f"ESL: marked {esl:,} eligible plugins as light "
+                                   "(keeps the full-plugin count under Skyrim's 254 cap)")
         self.panel.log("INFO", f"manifest: {res.deploy.manifest_path}")
         self.panel.log("INFO", f"plugins.txt: {res.plugins_path}")
 

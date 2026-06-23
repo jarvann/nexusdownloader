@@ -149,6 +149,14 @@ def _hardlink(src: str, dst: str) -> None:
     game folders live on different volumes).
     """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
+    # If dst is already the SAME physical file (a hard link laid down by a prior
+    # deploy), there's nothing to do -- and trying to copy a file onto itself
+    # raises shutil.SameFileError. This is the common case on a re-deploy.
+    try:
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            return
+    except OSError:
+        pass
     if os.path.lexists(dst):
         try:
             os.remove(dst)
@@ -157,7 +165,10 @@ def _hardlink(src: str, dst: str) -> None:
     try:
         os.link(src, dst)
     except OSError:
-        shutil.copy2(src, dst)
+        try:
+            shutil.copy2(src, dst)
+        except shutil.SameFileError:
+            pass        # already the same content/inode; leave it
 
 
 def _walk_one(staging_dir: str, folder: str) -> List[Tuple[str, str, int]]:
@@ -336,13 +347,14 @@ class FinalizeResult:
     loadorder_path: str
     plugins_path: str
     active_plugins: int
+    esl_flagged: int = 0          # plugins auto-flagged light (ESL) this run
 
 
 def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: str,
                         game_data_dir: str, localappdata_dir: str,
                         game_id: str = GAME_ID, *, node: str = "node",
                         deployment_time_ms: int = 0, backup: bool = True,
-                        workers: int = 1,
+                        workers: int = 1, eslify: bool = True,
                         progress: Optional[Callable[[int, int, str], None]] = None) -> FinalizeResult:
     """Full post-install pipeline: order mods -> deploy -> sort plugins.
 
@@ -354,11 +366,26 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
     ``workers > 1`` parallelizes the deploy's file walk + hard-linking.
     """
     from utils import vortex_loadorder as lo
+    from utils import esl_flagging as esl
 
     result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
                                   collection=collection, node=node,
                                   deployment_time_ms=deployment_time_ms, workers=workers,
                                   progress=progress)
+
+    # Auto-flag eligible plugins as light (ESL) -- our equivalent of Vortex's
+    # "mark could-be-light as light". Without it the full-plugin count blows past
+    # Skyrim's 254 cap and the game won't launch. Runs before the sort so the
+    # load order reflects the newly-light masters.
+    esl_flagged = 0
+    if eslify:
+        enabled = lo.enabled_map(collection)
+        active_names = [n for n in lo.scan_plugins(game_data_dir)
+                        if n.lower() in enabled] if enabled else lo.scan_plugins(game_data_dir)
+        eres = esl.mark_eligible_as_light(game_data_dir, active_names,
+                                          workers=max(8, workers))
+        esl_flagged = eres.flagged
+
     lo_path, pl_path, active = lo.sort_plugins(collection, game_data_dir,
                                                localappdata_dir, backup=backup)
-    return FinalizeResult(result, lo_path, pl_path, active)
+    return FinalizeResult(result, lo_path, pl_path, active, esl_flagged=esl_flagged)
