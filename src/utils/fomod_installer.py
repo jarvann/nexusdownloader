@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Union, Any, Tuple, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .archive_handler import ArchiveHandler, get_archive_handler
+from .archive_handler import ArchiveHandler, get_archive_handler, _external_tools
 from .unified_logging import get_logger, create_operation_logger
 
 
@@ -577,6 +577,31 @@ class FomodInstaller:
             from utils.fomod_engine import find_moduleconfig, parse_moduleconfig, resolve_install
 
             module_config = find_moduleconfig(temp_extract)
+            if module_config is None:
+                # A complex multi-folder FOMOD can come out of a py7zr extraction
+                # INCOMPLETE on Windows (long paths), silently dropping
+                # ModuleConfig.xml -- which would then lose the whole mod via the
+                # simple-install fallback (everything lives in option subfolders).
+                # If the archive actually CONTAINS a ModuleConfig.xml, re-extract
+                # with the external 7z tool (robust + long-path safe) and retry.
+                archive_has_fomod = False
+                try:
+                    archive_has_fomod = any(
+                        n.lower().replace("\\", "/").endswith("fomod/moduleconfig.xml")
+                        for n in self.archive_handler.list_archive_contents(archive_path))
+                except Exception:
+                    pass
+                if archive_has_fomod and _external_tools.get("7z"):
+                    self.logger.warning(
+                        f"{mod_name}: ModuleConfig.xml missing after extraction but present "
+                        f"in the archive -- re-extracting with external 7z.")
+                    try:
+                        self.archive_handler._extract_7z_external(archive_path, temp_extract)
+                        module_config = find_moduleconfig(temp_extract)
+                    except Exception as reextract_error:
+                        self.logger.error(
+                            f"{mod_name}: external 7z re-extract failed: {reextract_error}")
+
             if module_config is None:
                 self.logger.warning(
                     f"{mod_name}: choices present but no fomod/ModuleConfig.xml found; "
