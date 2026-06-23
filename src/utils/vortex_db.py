@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import psutil
@@ -207,6 +207,46 @@ def read_active_profile(db_path: str, node: str = "node") -> Optional[str]:
     data = read_prefix(db_path, "settings###profiles###activeProfileId", node=node)
     val = data.get("settings###profiles###activeProfileId")
     return val if isinstance(val, str) else None
+
+
+def read_vortex_games(db_path: str, node: str = "node") -> List[Dict[str, Any]]:
+    """Read the mod-managed games Vortex knows about, with their paths.
+
+    Modern Vortex keeps everything in the LevelDB (no JSON to parse), so we pull:
+    * ``settings.gameMode.discovered.<game>`` -- install path / store / hidden
+    * ``settings.mods.installPath.<game>``    -- staging path template
+    * ``settings.downloads.path``             -- downloads path template
+    The ``{game}`` token in the templates expands to the game id. Only games that
+    are discovered (have an install path) AND have a staging path are returned
+    (i.e. ones actually set up for mods). Requires Vortex CLOSED (LevelDB lock).
+    """
+    discovered = read_prefix(db_path, "settings###gameMode###discovered###", node=node)
+    install_paths = read_prefix(db_path, "settings###mods###installPath###", node=node)
+    dl_tmpl = read_prefix(db_path, "settings###downloads###path",
+                          node=node).get("settings###downloads###path", "")
+
+    by_game: Dict[str, Dict[str, Any]] = {}
+    for k, v in discovered.items():
+        parts = k.split("###")
+        if len(parts) >= 5:
+            by_game.setdefault(parts[3], {})[".".join(parts[4:])] = v
+
+    games: List[Dict[str, Any]] = []
+    for game, info in by_game.items():
+        if info.get("hidden") is True or not info.get("path"):
+            continue
+        staging_tmpl = install_paths.get(f"settings###mods###installPath###{game}", "")
+        staging = staging_tmpl.replace("{game}", game) if staging_tmpl else ""
+        if not staging:
+            continue   # discovered but not set up for mods
+        games.append({
+            "game": game,
+            "install": info.get("path", ""),
+            "staging": staging,
+            "downloads": dl_tmpl.replace("{game}", game) if dl_tmpl else "",
+            "store": info.get("store", ""),
+        })
+    return sorted(games, key=lambda g: g["game"])
 
 
 def read_collection_identity(db_path: str, game: str = "skyrimse",
