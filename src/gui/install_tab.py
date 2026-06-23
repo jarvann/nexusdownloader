@@ -15,7 +15,8 @@ from typing import Optional, Dict, Any, List
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog,
     QTextEdit, QProgressBar, QGroupBox, QGridLayout, QListWidget, QSplitter,
-    QListWidgetItem, QMessageBox, QComboBox, QSpinBox, QCheckBox, QInputDialog
+    QListWidgetItem, QMessageBox, QComboBox, QSpinBox, QCheckBox, QInputDialog,
+    QDialog, QScrollArea, QDialogButtonBox
 )
 from PySide6.QtCore import QThread, Signal, Qt, QTimer
 from PySide6.QtGui import QFont
@@ -190,9 +191,69 @@ class InstallWorkerThread(QThread):
             self.installation_complete.emit(mod_name, success, message)
 
 
+class OptionalSelectionDialog(QDialog):
+    """Let the user opt IN to optional collection mods, and shows off-site/manual
+    mods they must download themselves. Optionals are unchecked by default."""
+
+    def __init__(self, optional_mods, offsite_mods, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Choose optional mods")
+        self.resize(560, 520)
+        self._checks = []
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            f"<b>{len(optional_mods)} optional mod(s)</b> are not installed by "
+            "default. Check any you want to include:"))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        for m in optional_mods:
+            cb = QCheckBox(f"{m.get('name', '?')}  (v{m.get('version', '?')})")
+            cb.setChecked(False)
+            cb._mod = m
+            self._checks.append(cb)
+            inner_layout.addWidget(cb)
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+
+        if offsite_mods:
+            layout.addWidget(QLabel(
+                f"<b>{len(offsite_mods)} off-site / manual mod(s)</b> can't be "
+                "auto-downloaded. Get these from their pages and drop them in your "
+                "downloads folder, then re-run install:"))
+            off = QTextEdit()
+            off.setReadOnly(True)
+            off.setMaximumHeight(120)
+            off.setPlainText("\n".join(f"• {m.get('name', '?')}" for m in offsite_mods))
+            layout.addWidget(off)
+
+        row = QHBoxLayout()
+        self._select_all = QPushButton("Select all")
+        self._select_all.clicked.connect(lambda: [c.setChecked(True) for c in self._checks])
+        self._select_none = QPushButton("Select none")
+        self._select_none.clicked.connect(lambda: [c.setChecked(False) for c in self._checks])
+        row.addWidget(self._select_all)
+        row.addWidget(self._select_none)
+        row.addStretch()
+        layout.addLayout(row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def selected_mods(self):
+        return [c._mod for c in self._checks if c.isChecked()]
+
+
 class InstallTab(QWidget):
     """Installation tab widget."""
-    
+
+    paths_changed = Signal(str, str, str)   # collection, staging, game_data(blank)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.install_thread = None
@@ -436,6 +497,8 @@ class InstallTab(QWidget):
         self.start_install_btn.setEnabled(can_start)
         # Linking needs the same three paths; available whether or not an install ran.
         self.link_vortex_btn.setEnabled(can_start)
+        # Share the picked paths with the Deploy & Play tab.
+        self.paths_changed.emit(self.collection_path or "", self.game_path or "", "")
 
     def link_to_vortex(self):
         """Register installed mods + the collection into Vortex's DB (two-phase:
@@ -528,7 +591,44 @@ class InstallTab(QWidget):
         self.mod_status_list.clear()
         self.overall_progress.setValue(0)
         self.overall_progress.setVisible(True)
-        
+
+        # Optionals are opt-in: install required only, unless the user picks some
+        # (or "Skip optional mods" is checked, which skips all without asking).
+        install_collection_path = self.collection_path
+        try:
+            with open(self.collection_path, "r", encoding="utf-8") as fh:
+                cdata = json.load(fh)
+            mods = cdata.get("mods", [])
+
+            def _is_offsite(m):
+                s = m.get("source", {})
+                return (s.get("type") or "").lower() != "nexus" or not s.get("modId")
+
+            optional = [m for m in mods if m.get("optional") and not _is_offsite(m)]
+            offsite = [m for m in mods if _is_offsite(m)]
+            selected_optional = []
+            if not self.skip_optional.isChecked() and (optional or offsite):
+                dlg = OptionalSelectionDialog(optional, offsite, self)
+                if dlg.exec() != QDialog.Accepted:
+                    self.log_message("INFO", "Installation cancelled at optionals dialog.")
+                    self.overall_progress.setVisible(False)
+                    return
+                selected_optional = dlg.selected_mods()
+            sel_ids = {id(m) for m in selected_optional}
+            filtered = [m for m in mods if (not m.get("optional")) or (id(m) in sel_ids)]
+            if len(filtered) != len(mods):
+                cdata = dict(cdata)
+                cdata["mods"] = filtered
+                import tempfile
+                install_collection_path = os.path.join(
+                    tempfile.gettempdir(), "nxd_install_collection.json")
+                with open(install_collection_path, "w", encoding="utf-8") as fh:
+                    json.dump(cdata, fh)
+                self.log_message("INFO", f"Installing {len(filtered)}/{len(mods)} mods "
+                                         f"({len(mods) - len(filtered)} optional skipped).")
+        except Exception as e:
+            self.log_message("WARNING", f"Optionals filtering skipped: {e}")
+
         # Create and start installation thread
         use_parallel = self.parallel_install.isChecked()
         max_workers = self.max_workers_spinbox.value()
@@ -550,7 +650,7 @@ class InstallTab(QWidget):
             self.log_message("INFO", f"Using override install temp dir: {temp_root}")
 
         self.install_thread = InstallWorkerThread(
-            self.collection_path,
+            install_collection_path,
             self.downloads_path,
             self.game_path,
             use_parallel,

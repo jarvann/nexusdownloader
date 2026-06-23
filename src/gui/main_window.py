@@ -32,6 +32,7 @@ from progress_tracking import ProgressTracker, DownloadProgress
 from gui.settings_dialog import SettingsDialog
 from gui.progress_monitor import ProgressMonitorWidget
 from gui.install_tab import InstallTab
+from gui.deploy_tab import DeployTab
 from utils.vortex_config import get_vortex_config_reader
 
 # Import Phase 1 modules
@@ -936,9 +937,19 @@ class MainWindow(QMainWindow):
         # Install tab (new FOMOD functionality)
         self.install_tab = InstallTab()
         self.tab_widget.addTab(self.install_tab, "Install")
-        
+
+        # Deploy & Play tab (hard-link into game, sort plugins, launch)
+        self.deploy_tab = DeployTab()
+        self.tab_widget.addTab(self.deploy_tab, "Deploy && Play")
+
         # Connect tabs for data sharing
         self._setup_tab_connections()
+
+        # When the Install tab's paths change, push them to the Deploy tab too.
+        try:
+            self.install_tab.paths_changed.connect(self.deploy_tab.set_paths)
+        except Exception:
+            pass
     
     def _create_download_tab(self):
         """Create the download tab with original functionality."""
