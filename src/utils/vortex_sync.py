@@ -31,6 +31,33 @@ ARCHIVE_RE = re.compile(r"\.(7z|zip|rar)$", re.IGNORECASE)
 _MODID_RE = re.compile(r"-(\d{2,7})-")
 
 
+def _best_match(candidates: List[str], mod: Dict[str, Any]) -> Optional[str]:
+    """Pick the staging folder / archive that belongs to *this* mod when several
+    share a modId (the DOMAIN patches, LODGen/TexGen, any multi-file mod).
+
+    Without this, ``candidates[0]`` is chosen for every mod sharing a modId, so
+    only one variant links and the rest show 'Not Installed' in Vortex. Match by
+    word overlap between the candidate's name and the mod's logicalFilename/name
+    -- the same signal the installer uses to lay the folders down.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    s = mod.get("source", {})
+    target = (s.get("logicalFilename") or mod.get("name") or "").lower()
+    words = [w for w in re.split(r"[^a-z0-9]+", target) if len(w) > 3]
+    if not words:
+        return candidates[0]
+
+    def score(cand: str) -> int:
+        n = os.path.basename(cand).lower()
+        return sum(1 for w in words if w in n)
+
+    best = max(candidates, key=score)
+    return best if score(best) > 0 else candidates[0]
+
+
 def _gen_id(seed: str) -> str:
     """Deterministic 12-char download id from a seed (stable across re-runs)."""
     h = hashlib.sha1(seed.encode()).hexdigest()
@@ -110,7 +137,10 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         if not folders or not archives:
             plan.skipped_no_disk += 1
             continue
-        folder, archive = folders[0], archives[0]
+        # Disambiguate shared-modId variants so each mod links its OWN folder,
+        # not folders[0] (else every variant but the first shows 'Not Installed').
+        folder = _best_match([f for f in folders if f not in recorded] or folders, mod)
+        archive = _best_match(archives, mod)
 
         dl_id = existing_dl_by_path.get(archive)
         if not dl_id:
@@ -136,7 +166,7 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         s = mod.get("source", {})
         if s.get("type") != "nexus" or not s.get("modId"):
             continue
-        archive = (downloads_by_modid.get(str(s["modId"])) or [""])[0]
+        archive = _best_match(downloads_by_modid.get(str(s["modId"]), []), mod) or ""
         rules.append(vr.build_collection_rule(mod, archive))
     plan.rule_count = len(rules)
 
