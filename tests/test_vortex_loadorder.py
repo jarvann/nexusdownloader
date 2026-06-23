@@ -133,7 +133,9 @@ def test_sort_plugins_writes_files_and_backs_up(tmp_path):
         "pluginRules": {"plugins": [{"name": "Alpha.esp", "after": ["Zeta.esp"]}]},
     }
     lo_path, pl_path, active = lo.sort_plugins(coll, data, str(lad))
-    assert active == 2
+    # active_count = plugins actually ENABLED (Zeta is disabled), which is the
+    # number that counts against Skyrim's plugin caps.
+    assert active == 1
     assert (lad / "plugins.txt.nxd-bak").read_text() == "OLD"   # backup made
 
     plugins_txt = open(pl_path, encoding="utf-8").read().splitlines()

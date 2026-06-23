@@ -203,14 +203,22 @@ def render_loadorder(ordered_all: Sequence[str]) -> str:
 
 
 def render_plugins_txt(ordered_active: Sequence[str],
-                       enabled: Dict[str, bool]) -> str:
-    """``plugins.txt``: non-vanilla plugins, lowercase, ``*`` prefix when enabled."""
+                       enabled: Dict[str, bool], *, strict: bool = False) -> str:
+    """``plugins.txt``: non-vanilla plugins, lowercase, ``*`` prefix when enabled.
+
+    ``strict`` (set when the collection ships an explicit plugin list): plugins
+    that are deployed but NOT in that list are written *un*-activated. Mods often
+    ship optional/alternate ESPs the collection deliberately leaves off; auto-
+    enabling every ESP on disk pushed the active count past Skyrim's hard caps
+    (254 full / 4096 light). Without a list we keep the old default-on behavior.
+    """
     lines = [
         "# This file is used by Skyrim to keep track of your downloaded content.",
         "# Please do not modify this file.",
     ]
     for p in ordered_active:
-        mark = "*" if enabled.get(p.lower(), True) else ""
+        default = not strict          # unlisted plugins: off in strict mode
+        mark = "*" if enabled.get(p.lower(), default) else ""
         lines.append(f"{mark}{p.lower()}")
     return "\n".join(lines) + "\n"
 
@@ -275,7 +283,7 @@ def compose_load_order(scanned: Sequence[str], data_dir: str,
 
 def write_load_order(localappdata_dir: str, full_order: Sequence[str],
                      active_order: Sequence[str], enabled: Dict[str, bool], *,
-                     backup: bool = True) -> Tuple[str, str]:
+                     backup: bool = True, strict: bool = False) -> Tuple[str, str]:
     """Write ``loadorder.txt`` + ``plugins.txt`` (backing up any existing pair).
 
     Returns the two written paths. ``localappdata_dir`` is the game's
@@ -291,7 +299,7 @@ def write_load_order(localappdata_dir: str, full_order: Sequence[str],
     with open(lo_path, "w", encoding="utf-8", newline="\r\n") as fh:
         fh.write(render_loadorder(full_order))
     with open(pl_path, "w", encoding="utf-8", newline="\r\n") as fh:
-        fh.write(render_plugins_txt(active_order, enabled))
+        fh.write(render_plugins_txt(active_order, enabled, strict=strict))
     return lo_path, pl_path
 
 
@@ -303,6 +311,13 @@ def sort_plugins(collection: dict, game_data_dir: str, localappdata_dir: str, *,
     """
     scanned = scan_plugins(game_data_dir)
     full, active = compose_load_order(scanned, game_data_dir, after_map(collection))
-    lo_path, pl_path = write_load_order(localappdata_dir, full, active,
-                                        enabled_map(collection), backup=backup)
-    return lo_path, pl_path, len(active)
+    enabled = enabled_map(collection)
+    # Strict activation only when the collection actually ships a plugin list,
+    # so we don't accidentally disable everything for list-less collections.
+    strict = bool(enabled)
+    lo_path, pl_path = write_load_order(localappdata_dir, full, active, enabled,
+                                        backup=backup, strict=strict)
+    # Count what's actually activated (strict drops unlisted plugins).
+    active_count = sum(1 for p in active
+                       if enabled.get(p.lower(), not strict))
+    return lo_path, pl_path, active_count
