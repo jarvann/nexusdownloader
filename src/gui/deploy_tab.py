@@ -16,7 +16,7 @@ from typing import Optional
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QMessageBox,
-    QGridLayout, QFileDialog, QGroupBox,
+    QGridLayout, QFileDialog, QGroupBox, QSpinBox,
 )
 
 import sys
@@ -176,11 +176,20 @@ class DeployTab(QWidget):
         self.launch_btn.clicked.connect(self.launch_game)
         btns.addWidget(self.launch_btn)
         btns.addStretch()
+        # Hard-link threads: deploy parallelizes the walk + linking. More threads
+        # help on native NTFS; over a WSL /mnt mount the 9p layer serializes, so
+        # extra threads do little there.
+        btns.addWidget(QLabel("Threads:"))
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(1, 64)
+        self.workers_spin.setValue(16)
+        self.workers_spin.setToolTip("Parallel hard-link threads (raise on a fast "
+                                     "local NTFS drive; little effect over WSL /mnt)")
+        btns.addWidget(self.workers_spin)
         layout.addLayout(btns)
 
         self.panel = PhasePanel("Deploy Progress")
-        layout.addWidget(self.panel)
-        layout.addStretch()
+        layout.addWidget(self.panel, 1)   # progress panel absorbs vertical stretch
 
     # --- path discovery --------------------------------------------------- #
     def auto_detect(self):
@@ -272,7 +281,7 @@ class DeployTab(QWidget):
         self.panel.start("Starting deploy...")
         self._thread = DeployWorkerThread(
             self.collection_path, self.staging_path, self.game_data_dir,
-            self.localappdata_dir)
+            self.localappdata_dir, workers=self.workers_spin.value())
         self._thread.progress.connect(self._on_progress)
         self._thread.status.connect(lambda m: self.panel.set_progress(
             self.panel.bar.value(), max(self.panel.bar.maximum(), 1), m))
