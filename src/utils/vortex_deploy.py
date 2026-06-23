@@ -30,7 +30,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from utils.vortex_schema import GAME_ID
 
@@ -207,7 +207,8 @@ class DeployResult:
 def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str],
            game_id: str = GAME_ID, *, instance_id: Optional[str] = None,
            link: bool = True, deployment_time_ms: int = 0,
-           workers: int = 1) -> DeployResult:
+           workers: int = 1,
+           progress: Optional[Callable[[int, int, str], None]] = None) -> DeployResult:
     """Hard-link staged files into the game folder and write the deployment manifest.
 
     ``enabled_folders`` must be in **load order** (ascending priority) so that, on
@@ -217,6 +218,9 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
     ``workers > 1`` parallelizes the (latency-bound) file walk and hard-linking
     across a thread pool. Conflict resolution still happens centrally on the
     ordered walk, so each link target is unique -- the links can run in any order.
+
+    ``progress(done, total, rel_path)`` is called (throttled, thread-safe) as files
+    are hard-linked, so a GUI can show live deploy progress.
     """
     instance_id = instance_id or read_instance_id(staging_dir, target_data_dir)
     if not instance_id:
@@ -230,11 +234,21 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
 
     linked = 0
     if link:
+        total = len(links)
+        from threading import Lock
+        lock, done = Lock(), [0]
+
         def _link_one(fl):
             folder, nrel = fl
             sub = nrel.replace("\\", os.sep)
             _hardlink(os.path.join(staging_dir, folder, sub),
                       os.path.join(target_data_dir, sub))
+            if progress is not None:
+                with lock:
+                    done[0] += 1
+                    if done[0] % 200 == 0 or done[0] == total:
+                        progress(done[0], total, nrel)
+
         if workers and workers > 1 and len(links) > 1:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -242,7 +256,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         else:
             for fl in links:
                 _link_one(fl)
-        linked = len(links)
+        linked = total
 
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
                               entries, deployment_time_ms=deployment_time_ms)
@@ -298,7 +312,8 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                       enabled_folders: Optional[Iterable[str]] = None,
                       game_id: str = GAME_ID, *, collection: Optional[Dict[str, Any]] = None,
                       node: str = "node", deployment_time_ms: int = 0,
-                      workers: int = 1
+                      workers: int = 1,
+                      progress: Optional[Callable[[int, int, str], None]] = None
                       ) -> Tuple[DeployResult, Any]:
     """High-level: hard-link + write manifest, then mark the deployment in the DB.
 
@@ -309,7 +324,8 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     if enabled_folders is None:
         enabled_folders = order_folders_for_deploy(staging_dir, collection)
     result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
-                    deployment_time_ms=deployment_time_ms, workers=workers)
+                    deployment_time_ms=deployment_time_ms, workers=workers,
+                    progress=progress)
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
     return result, db_write
 
@@ -326,7 +342,8 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
                         game_data_dir: str, localappdata_dir: str,
                         game_id: str = GAME_ID, *, node: str = "node",
                         deployment_time_ms: int = 0, backup: bool = True,
-                        workers: int = 1) -> FinalizeResult:
+                        workers: int = 1,
+                        progress: Optional[Callable[[int, int, str], None]] = None) -> FinalizeResult:
     """Full post-install pipeline: order mods -> deploy -> sort plugins.
 
     Resolves deploy order from ``collection.modRules``, hard-links + writes the
@@ -340,7 +357,8 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
 
     result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
                                   collection=collection, node=node,
-                                  deployment_time_ms=deployment_time_ms, workers=workers)
+                                  deployment_time_ms=deployment_time_ms, workers=workers,
+                                  progress=progress)
     lo_path, pl_path, active = lo.sort_plugins(collection, game_data_dir,
                                                localappdata_dir, backup=backup)
     return FinalizeResult(result, lo_path, pl_path, active)
