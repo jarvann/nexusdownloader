@@ -202,6 +202,21 @@ def find_state_db() -> Optional[str]:
     return existing[0]
 
 
+def read_app_instance_id(db_path: str, node: str = "node") -> Optional[str]:
+    """Return Vortex's ``app.instanceId`` -- the value the deployment manifest's
+    ``instance`` field MUST match.
+
+    On a deploy, ``loadActivation`` compares the manifest's ``instance`` to
+    ``state.app.instanceId``; if they differ it assumes another Vortex instance
+    modded the game, PURGES the deployed files, and re-links everything from
+    scratch. Writing this exact id into our manifest makes Vortex accept our
+    deployment as its own (no purge, no full re-deploy).
+    """
+    data = read_prefix(db_path, "app###instanceId", node=node)
+    val = data.get("app###instanceId")
+    return val if isinstance(val, str) else None
+
+
 def read_active_profile(db_path: str, node: str = "node") -> Optional[str]:
     """Return the id of the currently active Vortex profile."""
     data = read_prefix(db_path, "settings###profiles###activeProfileId", node=node)

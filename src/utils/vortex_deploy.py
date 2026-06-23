@@ -334,7 +334,16 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     """
     if enabled_folders is None:
         enabled_folders = order_folders_for_deploy(staging_dir, collection)
+    # Use Vortex's authoritative app.instanceId for the manifest so Vortex accepts
+    # our deployment as its own instead of purging + re-linking everything.
+    from utils import vortex_db
+    instance_id = None
+    try:
+        instance_id = vortex_db.read_app_instance_id(db_path, node=node)
+    except Exception:
+        instance_id = None
     result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
+                    instance_id=instance_id,
                     deployment_time_ms=deployment_time_ms, workers=workers,
                     progress=progress)
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
