@@ -56,6 +56,9 @@ class DownloadConfig:
     verify_checksums: bool = True
     resume_partial_downloads: bool = True
     cleanup_failed_downloads: bool = True
+    # When true, verify_downloads.py validates archives by full MD5 (thorough,
+    # slower) instead of the default fast byte-size check.
+    verify_md5: bool = False
     # Override scratch/temp dir for extraction. Blank = system %TEMP%. Point this
     # at a drive with lots of free space if %TEMP% is a small RAM disk.
     install_temp_dir: str = ""
