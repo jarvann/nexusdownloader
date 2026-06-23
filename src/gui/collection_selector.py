@@ -107,3 +107,8 @@ class CollectionSelector(QWidget):
 
     def current_path(self) -> str:
         return self.combo.currentData() or ""
+
+    def set_staging(self, staging_path: str):
+        """Point the dropdown at a different game's staging folder and rescan."""
+        self.staging_path = staging_path or ""
+        self.refresh()
