@@ -250,30 +250,55 @@ class FomodInstaller:
         
         # Common archive extensions
         extensions = ['.zip', '.7z', '.rar', '.tar.gz', '.tar.bz2']
-        
-        # Search patterns
-        search_patterns = []
+        expected_size = source.get("fileSize")
+        mod_name = mod_data.get("name", "")
+
+        def _pick(matches):
+            """Choose among candidate archives. When several share a modId -- e.g.
+            the DOMAIN 'file repository' hosts a dozen DIFFERENT files under modId
+            99737 -- returning the first match installs the SAME archive for all of
+            them. Disambiguate by EXACT file size (the only reliable key), then by
+            overlap with the logical/display name."""
+            matches = list(dict.fromkeys(matches))
+            if len(matches) <= 1:
+                return matches[0] if matches else None
+            if expected_size:
+                for m in matches:
+                    try:
+                        if m.stat().st_size == expected_size:
+                            return m
+                    except OSError:
+                        pass
+            target = (logical_filename or mod_name).lower().split()
+            return max(matches, key=lambda p: sum(
+                1 for w in target if len(w) > 3 and w in p.name.lower()))
+
+        # 1) logical filename as exact-or-prefix (Nexus names start with it)
         if logical_filename:
-            search_patterns.extend([f"{logical_filename}{ext}" for ext in extensions])
-        if mod_id and file_id:
-            search_patterns.extend([f"*{mod_id}*{file_id}*{ext}" for ext in extensions])
-            search_patterns.extend([f"*{mod_id}*{ext}" for ext in extensions])
-        
-        for pattern in search_patterns:
-            matches = list(downloads_path.glob(pattern))
-            if matches:
-                return matches[0]  # Return first match
-        
-        # Fallback: search all archives in downloads directory
-        for ext in extensions:
-            archives = list(downloads_path.glob(f"*{ext}"))
-            for archive in archives:
-                # Simple name matching
-                archive_name = archive.stem.lower()
-                mod_name = mod_data.get("name", "").lower()
-                if mod_name in archive_name or any(word in archive_name for word in mod_name.split() if len(word) > 3):
-                    return archive
-        
+            for ext in extensions:
+                m = _pick(list(downloads_path.glob(f"{logical_filename}*{ext}")))
+                if m:
+                    return m
+        # 2) modId (+fileId), size/name-disambiguated
+        if mod_id:
+            if file_id:
+                for ext in extensions:
+                    m = _pick(list(downloads_path.glob(f"*{mod_id}*{file_id}*{ext}")))
+                    if m:
+                        return m
+            for ext in extensions:
+                m = _pick(list(downloads_path.glob(f"*{mod_id}*{ext}")))
+                if m:
+                    return m
+        # 3) last-resort fuzzy name match, also size-disambiguated
+        if mod_name:
+            for ext in extensions:
+                cands = [a for a in downloads_path.glob(f"*{ext}")
+                         if any(w in a.stem.lower()
+                                for w in mod_name.lower().split() if len(w) > 3)]
+                m = _pick(cands)
+                if m:
+                    return m
         return None
     
     def _find_mod_archive_optimized(self, mod_data: Dict[str, Any], available_archives: Dict[str, Path]) -> Optional[Path]:
@@ -297,6 +322,7 @@ class FomodInstaller:
         # token (e.g. "Mod Name-69415-1-0-1655653694.7z"). Match on that token --
         # this is the reliable key. When several files share a modId, disambiguate
         # by name overlap with the logical/display name.
+        expected_size = source.get("fileSize")
         if mod_id:
             token = f"-{mod_id}-"
             candidates = [(name, path) for name, path in available_archives.items()
@@ -304,6 +330,19 @@ class FomodInstaller:
             if len(candidates) == 1:
                 return candidates[0][1]
             if candidates:
+                # Several files share this modId (e.g. the DOMAIN file repository,
+                # modId 99737, hosts a dozen DIFFERENT files). Disambiguate by EXACT
+                # file size first -- the reliable key, mirroring how Vortex tells
+                # variants apart by fileId/fileMD5/fileSize -- then by name overlap.
+                # MUST match _find_mod_archive so the skip-check predicts the same
+                # folder the installer creates (else variants re-install every run).
+                if expected_size:
+                    for _name, path in candidates:
+                        try:
+                            if path.stat().st_size == expected_size:
+                                return path
+                        except OSError:
+                            pass
                 target = (logical_filename or mod_name).split()
                 def overlap(archive_name: str) -> int:
                     return sum(1 for w in target if len(w) > 3 and w in archive_name)
