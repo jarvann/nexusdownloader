@@ -216,8 +216,12 @@ class DownloadWorkerThread(QThread):
                         # Register file for tracking
                         self.progress_tracker.register_file(mod_id, file_id, filename, 0)
                     
-                except KeyError as e:
-                    self.log_message_received.emit("WARNING", f"Skipping entry {i} due to missing key: {e}")
+                except KeyError:
+                    name = entry.get('name', f'Entry {i}') if isinstance(entry, dict) else f'Entry {i}'
+                    self.log_message_received.emit(
+                        "INFO",
+                        f"{name}: ModId is null, must be an off-site mod — "
+                        f"check the Collection page for download instructions.")
                     continue
             
             self.status_changed.emit(f"Registered {total_files} files for processing")

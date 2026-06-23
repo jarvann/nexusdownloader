@@ -72,9 +72,11 @@ def load_mods_from_json(file_path, logger=None):
                 mod_id = entry['source']['modId']
                 file_id = entry['source']['fileId']
                 mods.append((mod_id, file_id))
-            except KeyError as e:
+            except KeyError:
                 if logger:
-                    logger.error(f"Skipping entry due to missing key: {e}")
+                    name = entry.get('name', 'A mod') if isinstance(entry, dict) else 'A mod'
+                    logger.info(f"{name}: ModId is null, must be an off-site mod — "
+                                f"check the Collection page for download instructions.")
         if logger:
             logger.verbose(f"Loaded {len(mods)} mods from the JSON file.")
         return mods
