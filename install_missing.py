@@ -57,6 +57,8 @@ def main(argv=None):
     p.add_argument("--temp", default=DEFAULT_TEMP, help=f"scratch dir for extraction (default {DEFAULT_TEMP or '<system>'})")
     p.add_argument("--workers", type=int, default=4, help="parallel install workers (default 4)")
     p.add_argument("--sequential", action="store_true", help="install one mod at a time")
+    p.add_argument("--with-optional", action="store_true",
+                   help="also install collection mods marked optional (default: required only)")
     args = p.parse_args(argv)
 
     import json
@@ -67,6 +69,15 @@ def main(argv=None):
     collection = args.collection or find_collection_json(args.staging)
     with open(collection, "r", encoding="utf-8") as fh:
         collection_data = json.load(fh)
+
+    # Optionals are opt-in: by default install only the collection's required mods.
+    all_mods = collection_data.get("mods", [])
+    optional = [m for m in all_mods if m.get("optional")]
+    if not args.with_optional and optional:
+        collection_data = dict(collection_data)
+        collection_data["mods"] = [m for m in all_mods if not m.get("optional")]
+        print(f"optionals: skipping {len(optional)} optional mod(s) "
+              f"(re-run with --with-optional to include them)")
     total = len(collection_data.get("mods", []))
 
     if args.temp:
