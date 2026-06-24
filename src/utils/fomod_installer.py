@@ -1597,12 +1597,32 @@ class ParallelFomodInstaller(FomodInstaller):
                 else:
                     # Check if mod has installation choices
                     choices = mod_data.get("choices", {})
-                    if not choices or choices.get("type") != "fomod":
-                        # Simple extraction without FOMOD
-                        result = self._install_simple(mod_name, archive_path, mod_data)
-                    else:
-                        # FOMOD installation with choices
-                        result = self._install_fomod(mod_name, archive_path, choices, mod_data)
+                    fomod = bool(choices) and choices.get("type") == "fomod"
+
+                    # Retry the "empty result" race. Tiny mods (a single file, a
+                    # Pandora behavior cache) extract so fast that under high
+                    # concurrency the temp dir is cleaned / the file isn't yet
+                    # visible on the DrvFs mount when we scan it -> 0 files copied
+                    # -> "no files installed" / "appears to be empty". The same mod
+                    # installs fine on another run, so it's a timing race, not a
+                    # broken archive. Re-extract to a fresh temp dir a couple times
+                    # with a short settle before giving up. Deterministic failures
+                    # (archive not found, real extraction errors) carry a different
+                    # message and fall straight through.
+                    for attempt in range(3):
+                        if fomod:
+                            result = self._install_fomod(mod_name, archive_path, choices, mod_data)
+                        else:
+                            result = self._install_simple(mod_name, archive_path, mod_data)
+                        msg = (result.error_message or "").lower()
+                        race = result.status == InstallResult.FAILED and (
+                            "no files were installed" in msg or "appears to be empty" in msg)
+                        if not race or attempt == 2:
+                            break
+                        self.logger.warning(
+                            f"{mod_name}: empty install (attempt {attempt + 1}/3) -- "
+                            f"likely extract/copy race, retrying after settle")
+                        time.sleep(0.75 * (attempt + 1))
             
             # Update progress and notify
             with self._progress_lock:

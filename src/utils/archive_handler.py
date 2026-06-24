@@ -300,13 +300,29 @@ class ArchiveHandler:
         return extract_to
     
     def _extract_zip(self, archive_path: Path, extract_to: Path, selected_files: Optional[List[str]]):
-        """Extract ZIP archive."""
-        with zipfile.ZipFile(archive_path, 'r') as zf:
-            if selected_files:
-                for file_path in selected_files:
-                    zf.extract(file_path, extract_to)
-            else:
-                zf.extractall(extract_to)
+        """Extract ZIP archive, falling back to external 7-Zip for formats Python's
+        zipfile can't handle.
+
+        Python's zipfile only implements DEFLATE/STORE: a .zip compressed with PPMd
+        or LZMA raises NotImplementedError ("That compression method is not
+        supported"), and a mislabeled archive (a 7z/rar with a .zip extension)
+        raises BadZipFile ("File is not a zip file"). 7z.exe handles PPMd/LZMA zips
+        and auto-detects the real format regardless of extension, so route those
+        failures to it instead of letting the mod fail to install."""
+        try:
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                if selected_files:
+                    for file_path in selected_files:
+                        zf.extract(file_path, extract_to)
+                else:
+                    zf.extractall(extract_to)
+        except (NotImplementedError, zipfile.BadZipFile, RuntimeError) as e:
+            if '7z' not in _external_tools:
+                raise
+            self.logger.warning(
+                f"zipfile could not extract {archive_path.name} ({e}); "
+                f"falling back to external 7-Zip.")
+            self._extract_7z_external(archive_path, extract_to, selected_files)
     
     def _extract_7z(self, archive_path: Path, extract_to: Path, selected_files: Optional[List[str]]):
         """Extract 7Z archive with external fallback for unsupported formats."""
