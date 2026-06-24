@@ -446,6 +446,29 @@ class FomodInstaller:
         self.logger.warning(f"No clear mod root found, using extraction path: {extract_path}")
         return extract_path
     
+    def _copy_long(self, src: Path, dst: Path) -> bool:
+        """Copy ``src`` -> ``dst`` using the Windows extended-length (``\\\\?\\``)
+        prefix so files whose full path exceeds MAX_PATH (260 chars) still install
+        instead of being silently skipped. This is what was dropping every file in
+        mods with a long folder name + deep paths (e.g. OAR animations), leaving
+        "no files installed". No-op prefix on non-Windows. Returns True on success.
+        """
+        def ext(p):
+            s = os.fspath(p)
+            if os.name != "nt":
+                return s
+            ap = os.path.abspath(s)
+            if ap.startswith("\\\\?\\"):
+                return ap
+            return ("\\\\?\\UNC\\" + ap[2:]) if ap.startswith("\\\\") else ("\\\\?\\" + ap)
+        try:
+            os.makedirs(ext(dst.parent), exist_ok=True)
+            shutil.copy2(ext(src), ext(dst))
+            return True
+        except (OSError, FileNotFoundError) as e:
+            self.logger.warning(f"Failed to copy (even with long-path prefix) {dst}: {e}")
+            return False
+
     def _install_simple(self, mod_name: str, archive_path: Path, mod_data: Dict[str, Any] = None) -> InstallationResult:
         """Install mod without FOMOD (simple extraction)."""
         temp_extract = None
@@ -500,17 +523,8 @@ class FomodInstaller:
                     rel_path = item.relative_to(root_path)
                     if not self._should_skip_file(rel_path):
                         dest_path = mod_install_path / rel_path
-                        try:
-                            dest_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(item, dest_path)
+                        if self._copy_long(item, dest_path):
                             installed_files.append(dest_path)
-                        except (OSError, FileNotFoundError) as copy_error:
-                            # Handle long path issues during file copy
-                            if "path specified" in str(copy_error).lower() or len(str(dest_path)) > 250:
-                                self.logger.warning(f"Skipping file due to path length: {rel_path}")
-                                continue
-                            else:
-                                raise
             
             # Clean up temp extraction immediately after copying
             if temp_extract and temp_extract.exists():
@@ -689,17 +703,8 @@ class FomodInstaller:
                 if not source_path.is_file():
                     continue
                 dest_path = mod_install_path / op.destination
-                try:
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source_path, dest_path)
-                    if dest_path not in installed_files:
-                        installed_files.append(dest_path)
-                except (OSError, FileNotFoundError) as copy_error:
-                    if "path specified" in str(copy_error).lower() or len(str(dest_path)) > 250:
-                        self.logger.warning(f"Skipping file due to path length: {op.destination}")
-                        continue
-                    else:
-                        raise
+                if self._copy_long(source_path, dest_path) and dest_path not in installed_files:
+                    installed_files.append(dest_path)
             
             # Clean up temp extraction immediately after copying
             if temp_extract and temp_extract.exists():
