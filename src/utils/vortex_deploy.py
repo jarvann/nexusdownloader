@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -158,10 +159,7 @@ def _hardlink(src: str, dst: str) -> None:
     except OSError:
         pass
     if os.path.lexists(dst):
-        try:
-            os.remove(dst)
-        except OSError:
-            pass
+        _force_remove(dst)
     try:
         os.link(src, dst)
     except OSError:
@@ -169,6 +167,33 @@ def _hardlink(src: str, dst: str) -> None:
             shutil.copy2(src, dst)
         except shutil.SameFileError:
             pass        # already the same content/inode; leave it
+        except PermissionError:
+            # dst still there and read-only -> clear the attribute and overwrite.
+            _force_remove(dst)
+            shutil.copy2(src, dst)
+
+
+def _force_remove(path: str) -> None:
+    """Remove ``path``, clearing a read-only attribute first if needed.
+
+    Steam ships some Data files read-only and prior deploys can leave links
+    read-only; on Windows ``os.remove`` then raises ``PermissionError`` (Errno
+    13). Clearing the write bit and retrying lets a re-deploy replace them
+    instead of aborting the whole run on one file."""
+    try:
+        os.remove(path)
+        return
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        pass
+    except OSError:
+        return
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _walk_one(staging_dir: str, folder: str) -> List[Tuple[str, str, int]]:
@@ -249,11 +274,19 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         from threading import Lock
         lock, done = Lock(), [0]
 
+        failures: List[Tuple[str, str]] = []
+
         def _link_one(fl):
             folder, nrel = fl
             sub = nrel.replace("\\", os.sep)
-            _hardlink(os.path.join(staging_dir, folder, sub),
-                      os.path.join(target_data_dir, sub))
+            try:
+                _hardlink(os.path.join(staging_dir, folder, sub),
+                          os.path.join(target_data_dir, sub))
+            except OSError as ex:
+                # One unrecoverable file (locked by a running game, ACL-denied)
+                # must not abort the whole deploy. Record it and move on.
+                with lock:
+                    failures.append((nrel, str(ex)))
             if progress is not None:
                 with lock:
                     done[0] += 1
@@ -267,7 +300,11 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         else:
             for fl in links:
                 _link_one(fl)
-        linked = total
+        linked = total - len(failures)
+        if failures:
+            shown = "; ".join(f"{r} ({e})" for r, e in failures[:5])
+            print(f"WARNING: {len(failures)} of {total} files could not be linked "
+                  f"(first few: {shown})")
 
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
                               entries, deployment_time_ms=deployment_time_ms)
