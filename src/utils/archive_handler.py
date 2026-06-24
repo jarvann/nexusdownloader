@@ -310,8 +310,21 @@ class ArchiveHandler:
     
     def _extract_7z(self, archive_path: Path, extract_to: Path, selected_files: Optional[List[str]]):
         """Extract 7Z archive with external fallback for unsupported formats."""
+        # Prefer EXTERNAL 7-Zip: it runs as a subprocess (bounded memory, released
+        # between mods) and handles long paths natively. py7zr decompresses
+        # in-memory, so under high concurrency it bloats RAM and stalls the install
+        # (Threadripper at 7% CPU, 95GB RAM) -- which is why it's now the fallback.
+        # Order: external 7-Zip -> py7zr (+ long-path check) -> WinRAR.
+        if '7z' in _external_tools:
+            try:
+                self._extract_7z_external(archive_path, extract_to, selected_files)
+                return
+            except Exception as ext_error:
+                self.logger.warning(
+                    f"External 7-Zip failed for {archive_path.name} ({ext_error}); "
+                    f"trying py7zr.")
+
         try:
-            # Try py7zr first
             with py7zr.SevenZipFile(archive_path, 'r') as szf:
                 expected = None
                 if not selected_files:
@@ -324,10 +337,8 @@ class ArchiveHandler:
                 else:
                     szf.extractall(extract_to)
             # py7zr writes with plain Python file ops, so on Windows it SILENTLY
-            # drops any file whose extracted path exceeds MAX_PATH (260) -- no
-            # exception, so deep-path files just vanish and the mod installs as
-            # "no files". Verify the count and fall back to external 7-Zip (which
-            # handles long paths natively) when it comes up short.
+            # drops files whose path exceeds MAX_PATH (260) -- no exception. Verify
+            # the count so a short extraction is treated as a failure.
             if expected is not None:
                 got = sum(len(files) for _root, _dirs, files in os.walk(extract_to))
                 if got < expected:
@@ -336,40 +347,19 @@ class ArchiveHandler:
             return
         except Exception as e:
             error_msg = str(e)
-
-            # py7zr chokes on several things the external binaries handle fine --
-            # BCJ2, newer/unsupported compression methods ("That compression method
-            # is not supported"), some solid archives, etc. Rather than only
-            # special-casing BCJ2, fall back to external 7-Zip/WinRAR on ANY py7zr
-            # failure; they cover effectively every real-world archive.
             self.logger.warning(
-                f"py7zr failed to extract {archive_path.name} ({error_msg}); "
-                f"trying external 7-Zip/WinRAR.")
-
-            if '7z' in _external_tools:
-                try:
-                    self.logger.info(f"Using external 7-Zip for {archive_path.name}")
-                    self._extract_7z_external(archive_path, extract_to, selected_files)
-                    return
-                except Exception as ext_error:
-                    self.logger.warning(f"External 7-Zip failed: {ext_error}")
+                f"py7zr failed to extract {archive_path.name} ({error_msg}); trying WinRAR.")
 
             if 'winrar' in _external_tools:
                 try:
-                    self.logger.info(f"Using external WinRAR for {archive_path.name}")
                     self._extract_winrar_external(archive_path, extract_to, selected_files)
                     return
                 except Exception as ext_error:
                     self.logger.warning(f"External WinRAR failed: {ext_error}")
 
-            available_tools = [tool for tool in ['7z', 'winrar'] if tool in _external_tools]
-            if available_tools:
-                raise ValueError(
-                    f"Archive {archive_path.name} could not be extracted by py7zr or "
-                    f"external tools {available_tools}. py7zr error: {error_msg}")
             raise ValueError(
-                f"Archive {archive_path.name} could not be extracted by py7zr "
-                f"({error_msg}). Install 7-Zip or WinRAR for broader format support.")
+                f"Archive {archive_path.name} could not be extracted "
+                f"(py7zr: {error_msg}). Install 7-Zip or WinRAR for broader format support.")
     
     def _extract_rar(self, archive_path: Path, extract_to: Path, selected_files: Optional[List[str]]):
         """Extract RAR archive."""
@@ -404,8 +394,11 @@ class ArchiveHandler:
         
         sevenz_exe = _external_tools['7z']
         
-        # Build command
-        cmd = [sevenz_exe, 'x', str(archive_path), f'-o{extract_to}', '-y']  # -y = assume Yes on all queries
+        # Build command. -mmt2 caps each process to 2 CPU threads so many parallel
+        # installs (up to MAX_INSTALL_CONCURRENCY) don't oversubscribe the cores --
+        # 7z decompression is largely serial anyway, so total throughput comes from
+        # running many mods at once, not many threads per mod.
+        cmd = [sevenz_exe, 'x', str(archive_path), f'-o{extract_to}', '-y', '-mmt2']
         
         if selected_files:
             # Add specific files to extract

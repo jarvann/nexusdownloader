@@ -1453,7 +1453,10 @@ class _ConcurrencyLimiter:
 # Upper bound on the OS threads the pool spins up; actual concurrency is gated
 # live by the limiter, so the spinbox can move anywhere in [1, this] without a
 # restart.
-MAX_INSTALL_CONCURRENCY = 16
+MAX_INSTALL_CONCURRENCY = 48   # external-7z extraction is subprocess-bounded in
+                               # memory, so high concurrency is safe on many-core
+                               # machines (the temp-space throttle still gates by
+                               # free scratch space for large archives)
 
 
 class ParallelFomodInstaller(FomodInstaller):

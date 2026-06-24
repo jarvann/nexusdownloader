@@ -420,9 +420,11 @@ class InstallTab(QWidget):
         options_layout.addWidget(QLabel("Max concurrent installs:"), 1, 1)
         self.max_workers_spinbox = QSpinBox()
         self.max_workers_spinbox.setMinimum(1)
-        self.max_workers_spinbox.setMaximum(16)
+        self.max_workers_spinbox.setMaximum(48)
         self.max_workers_spinbox.setValue(install_config.get("max_concurrent_installs", 4))
-        self.max_workers_spinbox.setToolTip("Number of mods to install simultaneously (1-16)")
+        self.max_workers_spinbox.setToolTip("Number of mods to install simultaneously (1-48). "
+                                            "External 7-Zip keeps memory bounded, so high values "
+                                            "are safe on many-core machines.")
         options_layout.addWidget(self.max_workers_spinbox, 1, 2)
         
         layout.addWidget(options_group)
