@@ -268,8 +268,11 @@ def read_collection_identity(db_path: str, game: str = "skyrimse",
                              node: str = "node") -> Optional[Tuple[int, str]]:
     """Find an installed collection's ``(collectionId, slug)`` from existing state.
 
-    Works when a prior revision of the collection is already known to Vortex
-    (the common "update" case). Returns None if no collection is present.
+    Looks first in the installed mod records (the common "update" case), then
+    falls back to the collection's DOWNLOAD record -- which survives a Vortex
+    "remove collection" as long as the archives were kept -- so a clean re-Link
+    after removing the collection still resolves the identity. Returns None only
+    when neither source has it.
     """
     base = f"persistent###mods###{game}###"
     # Two small, filtered reads instead of pulling the whole mods section (which
@@ -279,6 +282,17 @@ def read_collection_identity(db_path: str, game: str = "skyrimse",
     slug_data = read_prefix(db_path, base, node=node, suffix="###attributes###collectionSlug")
     cid = next((v for v in cid_data.values() if isinstance(v, int)), None)
     slug = next((v for v in slug_data.values() if isinstance(v, str)), None)
+    if cid is not None and slug:
+        return (cid, slug)
+
+    # Fallback: the collection .7z download record carries the same identity under
+    # modInfo.nexus.ids -- present even after the collection mod is removed.
+    dl = "persistent###downloads###files###"
+    cid_dl = read_prefix(db_path, dl, node=node, suffix="###modInfo###nexus###ids###collectionId")
+    slug_dl = read_prefix(db_path, dl, node=node, suffix="###modInfo###nexus###ids###collectionSlug")
+    cid = cid if cid is not None else next(
+        (int(v) for v in cid_dl.values() if isinstance(v, (int, str)) and str(v).isdigit()), None)
+    slug = slug or next((v for v in slug_dl.values() if isinstance(v, str)), None)
     return (cid, slug) if (cid is not None and slug) else None
 
 
