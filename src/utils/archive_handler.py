@@ -313,10 +313,27 @@ class ArchiveHandler:
         try:
             # Try py7zr first
             with py7zr.SevenZipFile(archive_path, 'r') as szf:
+                expected = None
+                if not selected_files:
+                    try:
+                        expected = sum(1 for fi in szf.list() if not fi.is_directory)
+                    except Exception:
+                        expected = None
                 if selected_files:
                     szf.extract(extract_to, targets=selected_files)
                 else:
                     szf.extractall(extract_to)
+            # py7zr writes with plain Python file ops, so on Windows it SILENTLY
+            # drops any file whose extracted path exceeds MAX_PATH (260) -- no
+            # exception, so deep-path files just vanish and the mod installs as
+            # "no files". Verify the count and fall back to external 7-Zip (which
+            # handles long paths natively) when it comes up short.
+            if expected is not None:
+                got = sum(len(files) for _root, _dirs, files in os.walk(extract_to))
+                if got < expected:
+                    raise RuntimeError(
+                        f"py7zr extracted only {got}/{expected} files (likely long-path drops)")
+            return
         except Exception as e:
             error_msg = str(e)
 
