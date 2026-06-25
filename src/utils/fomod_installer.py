@@ -273,21 +273,27 @@ class FomodInstaller:
             return max(matches, key=lambda p: sum(
                 1 for w in target if len(w) > 3 and w in p.name.lower()))
 
-        # 1) logical filename as exact-or-prefix (Nexus names start with it)
+        # 1) modId TOKEN ("-<modId>-") + exact-size, the reliable key. This MUST
+        # precede logical-filename matching: a prefix like "Open Animation Replacer"
+        # greedily matches addon archives ("... - Dialogue Plugin-107186-...") and
+        # the base mod (a .7z tried after .zip) loses, so the WRONG file installs.
+        # Vortex avoids this entirely by tracking each download's stored fileId/md5;
+        # we have no such records (we re-match pre-downloaded files on disk), so the
+        # "-<modId>-" token + fileSize is the closest reliable identity. The dashes
+        # make it a real token -- "*-92109-*" won't match a timestamp like
+        # "...1660892109". _pick disambiguates shared-modId variants by exact size.
+        if mod_id:
+            cands = []
+            for ext in extensions:
+                cands += downloads_path.glob(f"*-{mod_id}-*{ext}")
+            m = _pick(cands)
+            if m:
+                return m
+        # 2) logical filename as exact-or-prefix (Nexus names start with it),
+        #    size-confirmed by _pick when several share the prefix.
         if logical_filename:
             for ext in extensions:
                 m = _pick(list(downloads_path.glob(f"{logical_filename}*{ext}")))
-                if m:
-                    return m
-        # 2) modId (+fileId), size/name-disambiguated
-        if mod_id:
-            if file_id:
-                for ext in extensions:
-                    m = _pick(list(downloads_path.glob(f"*{mod_id}*{file_id}*{ext}")))
-                    if m:
-                        return m
-            for ext in extensions:
-                m = _pick(list(downloads_path.glob(f"*{mod_id}*{ext}")))
                 if m:
                     return m
         # 3) last-resort fuzzy name match, also size-disambiguated
