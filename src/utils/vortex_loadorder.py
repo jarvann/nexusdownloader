@@ -90,14 +90,20 @@ def build_mod_resolver(mods: List[dict], folder_by_modid: Dict[str, List[str]]
     Matches by ``fileMD5`` first (most reliable), then ``logicalFileName``, then
     falls back to a literal ``fileExpression``/``idHint`` (which is a folder name).
     """
+    from utils.vortex_sync import _best_match   # deferred: avoid import-time cost
     by_md5: Dict[str, str] = {}
     by_logical: Dict[str, str] = {}
+    recorded: set = set()
     for m in mods:
         s = m.get("source") or {}
         folders = folder_by_modid.get(str(s.get("modId")), [])
         if not folders:
             continue
-        folder = folders[0]
+        # Disambiguate shared-modId variants the SAME way the Link path does, so a
+        # rule endpoint resolves to the specific variant it names, not folders[0]
+        # (which mis-attributes ordering constraints across variants of one modId).
+        folder = _best_match([f for f in folders if f not in recorded] or folders, m)
+        recorded.add(folder)
         if s.get("md5"):
             by_md5[s["md5"].lower()] = folder
         if s.get("logicalFilename"):
