@@ -558,7 +558,27 @@ class FomodInstaller:
                     status=InstallResult.FAILED,
                     error_message=error_msg
                 )
-            
+
+            # Phantom-install guard + diagnostics. Some mods (notably SKSE-only
+            # frameworks like OAR) have reported success with N files yet left NO
+            # staging folder afterward. Log the RESOLVED destination and the real
+            # on-disk count so we can see whether files landed in the actual
+            # staging path -- and fail loudly (so the retry re-attempts) if the
+            # folder didn't materialize, instead of claiming a phantom success.
+            on_disk = (sum(1 for p in mod_install_path.rglob("*") if p.is_file())
+                       if mod_install_path.exists() else 0)
+            self.logger.info(
+                f"INSTALL-VERIFY {mod_name}: claimed={len(installed_files)} "
+                f"on_disk={on_disk} dest={mod_install_path} "
+                f"abs={os.path.abspath(mod_install_path)} staging={self.staging_path}")
+            if on_disk == 0:
+                error_msg = (f"Installation completed but no files were installed for "
+                             f"{mod_name} (phantom: {len(installed_files)} copied, 0 on "
+                             f"disk at {mod_install_path})")
+                self.logger.error(error_msg)
+                return InstallationResult(mod_name=mod_name, status=InstallResult.FAILED,
+                                          error_message=error_msg)
+
             return InstallationResult(
                 mod_name=mod_name,
                 status=InstallResult.SUCCESS,
