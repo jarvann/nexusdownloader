@@ -1,0 +1,637 @@
+"""Local authoritative state ledger (SQLite).
+
+The whole reason this exists: Vortex never *guesses* a mod's identity -- it
+records ``modId``/``fileId``/``fileMD5``/``fileSize`` on a download record at the
+moment it downloads (it initiated the nxm URL, so it knows them), and the
+resulting mod points back at that download. We were throwing that knowledge away
+and re-deriving identity from disk filenames (the ``-<modId>-`` regex, name
+globs), which is the root of the wrong-archive / duplicate-mods / "Never
+Installed" bugs. This module is our own version of that authoritative state: we
+write the truth when we know it (download time, install time) and everything
+downstream (Link/Deploy/skip-check/integrity) reads it instead of guessing.
+
+Design:
+- One SQLite DB per game, co-located at ``<staging>/.nxd/state.db`` (WAL mode so
+  many readers + one writer work across the parallel installer AND across
+  processes -- GUI, reconcile, CLI).
+- All WRITES funnel through a single background writer thread (one queue), which
+  both satisfies SQLite's single-writer rule under the 48-thread installer and
+  lets us batch inserts. READS use short-lived per-call connections (WAL allows
+  concurrent readers).
+- Logging is just another table fed through the same writer, so the verbose
+  install log stops hammering the filesystem and lives in one queryable place.
+
+Schema (normalised; identity lives once, on ``downloads``):
+  meta(key, value)
+  collections(id, slug, name, revision_id, revision_number, added_at)
+  downloads(id, local_path, mod_id, file_id, md5, file_size, received,
+            logical_file_name, collection_id, state, downloaded_at)
+  mods(folder, download_id, variant, installer_choices, installed_as_dependency,
+       enabled, file_count, install_time, verified, state)
+  mod_files(id, folder, name, rel_path, size, md5, mtime, created)
+  plugins(name, mod_folder, flag, is_master, masters, could_be_light, enabled,
+          load_index)
+  mod_rules(source_folder, type, ref_folder, ref_raw)
+  logs(id, ts, level, operation, mod_folder, thread, message)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import queue
+import sqlite3
+import threading
+import time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+SCHEMA_VERSION = 1
+DB_DIRNAME = ".nxd"
+DB_FILENAME = "state.db"
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS collections (
+    id              INTEGER PRIMARY KEY,
+    slug            TEXT,
+    name            TEXT,
+    revision_id     INTEGER,
+    revision_number INTEGER,
+    added_at        INTEGER
+);
+CREATE TABLE IF NOT EXISTS downloads (
+    id                TEXT PRIMARY KEY,
+    local_path        TEXT UNIQUE,
+    mod_id            INTEGER,
+    file_id           INTEGER,
+    md5               TEXT,
+    file_size         INTEGER,
+    received          INTEGER,
+    logical_file_name TEXT,
+    collection_id     INTEGER,
+    state             TEXT,
+    downloaded_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_dl_ids  ON downloads(mod_id, file_id);
+CREATE INDEX IF NOT EXISTS ix_dl_md5  ON downloads(md5);
+CREATE INDEX IF NOT EXISTS ix_dl_size ON downloads(file_size);
+
+CREATE TABLE IF NOT EXISTS mods (
+    folder                  TEXT PRIMARY KEY,
+    download_id             TEXT,
+    variant                 TEXT,
+    installer_choices       TEXT,
+    installed_as_dependency INTEGER,
+    enabled                 INTEGER,
+    file_count              INTEGER,
+    install_time            INTEGER,
+    verified                INTEGER,
+    state                   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_mods_dl ON mods(download_id);
+
+CREATE TABLE IF NOT EXISTS mod_files (
+    id       INTEGER PRIMARY KEY,
+    folder   TEXT,
+    name     TEXT,
+    rel_path TEXT,
+    size     INTEGER,
+    md5      TEXT,
+    mtime    INTEGER,
+    created  INTEGER,
+    UNIQUE(folder, rel_path)
+);
+CREATE INDEX IF NOT EXISTS ix_mf_folder ON mod_files(folder);
+CREATE INDEX IF NOT EXISTS ix_mf_name   ON mod_files(name);
+CREATE INDEX IF NOT EXISTS ix_mf_md5    ON mod_files(md5);
+
+CREATE TABLE IF NOT EXISTS plugins (
+    name          TEXT PRIMARY KEY,
+    mod_folder    TEXT,
+    flag          TEXT,
+    is_master     INTEGER,
+    masters       TEXT,
+    could_be_light INTEGER,
+    enabled       INTEGER,
+    load_index    INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_pl_folder ON plugins(mod_folder);
+
+CREATE TABLE IF NOT EXISTS mod_rules (
+    source_folder TEXT,
+    type          TEXT,
+    ref_folder    TEXT,
+    ref_raw       TEXT,
+    PRIMARY KEY (source_folder, type, ref_folder)
+);
+
+CREATE TABLE IF NOT EXISTS logs (
+    id         INTEGER PRIMARY KEY,
+    ts         INTEGER,
+    level      TEXT,
+    operation  TEXT,
+    mod_folder TEXT,
+    thread     TEXT,
+    message    TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_log_ts  ON logs(ts);
+CREATE INDEX IF NOT EXISTS ix_log_op  ON logs(operation);
+CREATE INDEX IF NOT EXISTS ix_log_mod ON logs(mod_folder);
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Path + hashing helpers
+# --------------------------------------------------------------------------- #
+def db_path_for(staging_dir: str) -> str:
+    """Return the per-game DB path co-located with the staging folder."""
+    return os.path.join(staging_dir, DB_DIRNAME, DB_FILENAME)
+
+
+def hash_file(path: str, _bufsize: int = 1024 * 1024) -> Optional[str]:
+    """MD5 of a file, or None if it can't be read. Streams so big files are cheap."""
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(_bufsize), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    return dict(row) if row is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# The ledger
+# --------------------------------------------------------------------------- #
+class _FlushBarrier:
+    """A queue marker that makes the writer commit and signal -- so ``flush()``
+    can guarantee durability before a read on another connection."""
+    __slots__ = ("event",)
+
+    def __init__(self):
+        self.event = threading.Event()
+
+
+class LocalState:
+    """Thread-safe SQLite ledger. Writes go through one background thread (and
+    are batched); reads use short-lived connections (WAL → concurrent reads)."""
+
+    # A write job is (sql, params) for execute, or (sql, [rows]) for executemany
+    # when params is a list of sequences. ``None`` is the shutdown sentinel.
+    def __init__(self, db_path: str, *, busy_timeout_ms: int = 15000):
+        self.db_path = db_path
+        self._busy = busy_timeout_ms
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        # Initialise schema on the calling thread, synchronously.
+        conn = self._connect()
+        try:
+            conn.executescript(_DDL)
+            cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
+            if cur.fetchone() is None:
+                conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+                             (str(SCHEMA_VERSION),))
+            conn.commit()
+        finally:
+            conn.close()
+
+        self._q: "queue.Queue" = queue.Queue()
+        self._closed = False
+        self._writer = threading.Thread(target=self._writer_loop, name="nxd-ledger-writer",
+                                        daemon=True)
+        self._writer.start()
+
+    # -- connection plumbing -------------------------------------------------- #
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=self._busy / 1000.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={self._busy}")
+        return conn
+
+    def _writer_loop(self) -> None:
+        conn = self._connect()
+        pending = 0
+        last_commit = time.time()
+        try:
+            while True:
+                try:
+                    job = self._q.get(timeout=0.5)
+                except queue.Empty:
+                    if pending:
+                        conn.commit()
+                        pending = 0
+                        last_commit = time.time()
+                    continue
+                if job is None:               # shutdown
+                    break
+                if isinstance(job, _FlushBarrier):   # commit + signal the waiter
+                    if pending:
+                        conn.commit()
+                        pending = 0
+                        last_commit = time.time()
+                    job.event.set()
+                    continue
+                sql, params = job
+                try:
+                    if params and isinstance(params, list) and params and \
+                            isinstance(params[0], (list, tuple)):
+                        conn.executemany(sql, params)
+                        pending += len(params)
+                    else:
+                        conn.execute(sql, params or ())
+                        pending += 1
+                except sqlite3.Error as e:
+                    # Never let one bad write kill the writer (and never raise on
+                    # the install thread that enqueued it).
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    _fallback_log(f"ledger write failed: {e} :: {sql[:80]}")
+                # Commit on size or time so a crash loses at most ~1s of writes.
+                if pending >= 500 or (time.time() - last_commit) > 1.0:
+                    conn.commit()
+                    pending = 0
+                    last_commit = time.time()
+            if pending:
+                conn.commit()
+        finally:
+            conn.close()
+
+    def _enqueue(self, sql: str, params) -> None:
+        if not self._closed:
+            self._q.put((sql, params))
+
+    def flush(self, timeout: float = 30.0) -> None:
+        """Block until every queued write has been committed (a real barrier, so a
+        subsequent read on another connection sees the data)."""
+        if self._closed:
+            return
+        barrier = _FlushBarrier()
+        self._q.put(barrier)
+        barrier.event.wait(timeout)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._q.put(None)
+        self._writer.join(timeout=30)
+
+    def __enter__(self) -> "LocalState":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # -- meta ----------------------------------------------------------------- #
+    def set_meta(self, key: str, value: Any) -> None:
+        self._enqueue("INSERT INTO meta(key,value) VALUES(?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (key, json.dumps(value) if not isinstance(value, str) else value))
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._connect() as c:
+            r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    # -- collections ---------------------------------------------------------- #
+    def upsert_collection(self, cid: int, slug: str, name: str,
+                          revision_id: int, revision_number: int) -> None:
+        self._enqueue(
+            "INSERT INTO collections(id,slug,name,revision_id,revision_number,added_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "slug=excluded.slug, name=excluded.name, revision_id=excluded.revision_id, "
+            "revision_number=excluded.revision_number",
+            (cid, slug, name, revision_id, revision_number, int(time.time())))
+
+    # -- downloads ------------------------------------------------------------ #
+    def upsert_download(self, dl_id: str, local_path: str, mod_id: Optional[int],
+                        file_id: Optional[int], md5: str, file_size: int,
+                        received: int, logical_file_name: str,
+                        collection_id: Optional[int], state: str = "finished",
+                        downloaded_at: Optional[int] = None) -> None:
+        self._enqueue(
+            "INSERT INTO downloads(id,local_path,mod_id,file_id,md5,file_size,received,"
+            "logical_file_name,collection_id,state,downloaded_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "local_path=excluded.local_path, mod_id=excluded.mod_id, file_id=excluded.file_id,"
+            "md5=excluded.md5, file_size=excluded.file_size, received=excluded.received,"
+            "logical_file_name=excluded.logical_file_name, collection_id=excluded.collection_id,"
+            "state=excluded.state, downloaded_at=excluded.downloaded_at",
+            (dl_id, local_path, mod_id, file_id, md5, file_size, received,
+             logical_file_name, collection_id, state,
+             downloaded_at if downloaded_at is not None else int(time.time())))
+
+    def get_download(self, dl_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as c:
+            return _row_to_dict(c.execute("SELECT * FROM downloads WHERE id=?", (dl_id,)).fetchone())
+
+    def get_download_by_ids(self, mod_id: int, file_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as c:
+            return _row_to_dict(c.execute(
+                "SELECT * FROM downloads WHERE mod_id=? AND file_id=?",
+                (mod_id, file_id)).fetchone())
+
+    def get_download_by_md5(self, md5: str) -> Optional[Dict[str, Any]]:
+        if not md5:
+            return None
+        with self._connect() as c:
+            return _row_to_dict(c.execute("SELECT * FROM downloads WHERE md5=?", (md5,)).fetchone())
+
+    def get_download_by_path(self, local_path: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as c:
+            return _row_to_dict(c.execute(
+                "SELECT * FROM downloads WHERE local_path=?", (local_path,)).fetchone())
+
+    # -- mods ----------------------------------------------------------------- #
+    def upsert_mod(self, folder: str, download_id: Optional[str], variant: str = "",
+                   installer_choices: Optional[dict] = None,
+                   installed_as_dependency: bool = True, enabled: bool = True,
+                   file_count: int = 0, install_time: Optional[int] = None,
+                   verified: bool = False, state: str = "installed") -> None:
+        self._enqueue(
+            "INSERT INTO mods(folder,download_id,variant,installer_choices,"
+            "installed_as_dependency,enabled,file_count,install_time,verified,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(folder) DO UPDATE SET "
+            "download_id=excluded.download_id, variant=excluded.variant,"
+            "installer_choices=excluded.installer_choices,"
+            "installed_as_dependency=excluded.installed_as_dependency, enabled=excluded.enabled,"
+            "file_count=excluded.file_count, install_time=excluded.install_time,"
+            "verified=excluded.verified, state=excluded.state",
+            (folder, download_id, variant,
+             json.dumps(installer_choices) if installer_choices else None,
+             1 if installed_as_dependency else 0, 1 if enabled else 0, file_count,
+             install_time if install_time is not None else int(time.time()),
+             1 if verified else 0, state))
+
+    def set_mod_verified(self, folder: str, verified: bool, file_count: Optional[int] = None) -> None:
+        if file_count is None:
+            self._enqueue("UPDATE mods SET verified=? WHERE folder=?",
+                          (1 if verified else 0, folder))
+        else:
+            self._enqueue("UPDATE mods SET verified=?, file_count=? WHERE folder=?",
+                          (1 if verified else 0, file_count, folder))
+
+    def get_mod(self, folder: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as c:
+            return _row_to_dict(c.execute("SELECT * FROM mods WHERE folder=?", (folder,)).fetchone())
+
+    def get_mod_by_ids(self, mod_id: int, file_id: int) -> Optional[Dict[str, Any]]:
+        """The installed mod for a (modId,fileId) -- joined via its download."""
+        with self._connect() as c:
+            return _row_to_dict(c.execute(
+                "SELECT m.* FROM mods m JOIN downloads d ON m.download_id=d.id "
+                "WHERE d.mod_id=? AND d.file_id=?", (mod_id, file_id)).fetchone())
+
+    def all_mods(self) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM mods").fetchall()]
+
+    def mod_with_download(self, folder: str) -> Optional[Dict[str, Any]]:
+        """A mod row plus its download's modId/fileId/md5/local_path (for Link)."""
+        with self._connect() as c:
+            r = c.execute(
+                "SELECT m.*, d.mod_id AS dl_mod_id, d.file_id AS dl_file_id, "
+                "d.md5 AS dl_md5, d.local_path AS dl_local_path, "
+                "d.file_size AS dl_file_size, d.logical_file_name AS dl_logical "
+                "FROM mods m LEFT JOIN downloads d ON m.download_id=d.id "
+                "WHERE m.folder=?", (folder,)).fetchone()
+        return _row_to_dict(r)
+
+    def all_mods_with_download(self) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT m.*, d.mod_id AS dl_mod_id, d.file_id AS dl_file_id, "
+                "d.md5 AS dl_md5, d.local_path AS dl_local_path, "
+                "d.file_size AS dl_file_size, d.logical_file_name AS dl_logical "
+                "FROM mods m LEFT JOIN downloads d ON m.download_id=d.id").fetchall()]
+
+    # -- mod_files ------------------------------------------------------------ #
+    def replace_mod_files(self, folder: str,
+                          files: Sequence[Tuple[str, str, int, Optional[str], int, Optional[int]]]
+                          ) -> None:
+        """Replace the file list for a mod. ``files`` = (name, rel_path, size, md5,
+        mtime, created)."""
+        self._enqueue("DELETE FROM mod_files WHERE folder=?", (folder,))
+        if files:
+            rows = [(folder, n, rp, sz, md5, mt, cr) for (n, rp, sz, md5, mt, cr) in files]
+            self._enqueue(
+                "INSERT OR REPLACE INTO mod_files(folder,name,rel_path,size,md5,mtime,created) "
+                "VALUES(?,?,?,?,?,?,?)", rows)
+
+    def mod_files(self, folder: str) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM mod_files WHERE folder=?", (folder,)).fetchall()]
+
+    def find_files_by_md5(self, md5: str) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM mod_files WHERE md5=?", (md5,)).fetchall()]
+
+    def find_files_by_name(self, name: str) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM mod_files WHERE name=?", (name.lower(),)).fetchall()]
+
+    # -- plugins -------------------------------------------------------------- #
+    def upsert_plugin(self, name: str, mod_folder: str, flag: str, is_master: bool,
+                      masters: Optional[list], could_be_light: bool, enabled: bool,
+                      load_index: Optional[int] = None) -> None:
+        self._enqueue(
+            "INSERT INTO plugins(name,mod_folder,flag,is_master,masters,could_be_light,"
+            "enabled,load_index) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "mod_folder=excluded.mod_folder, flag=excluded.flag, is_master=excluded.is_master,"
+            "masters=excluded.masters, could_be_light=excluded.could_be_light,"
+            "enabled=excluded.enabled, load_index=excluded.load_index",
+            (name.lower(), mod_folder, flag, 1 if is_master else 0,
+             json.dumps(masters or []), 1 if could_be_light else 0,
+             1 if enabled else 0, load_index))
+
+    def all_plugins(self) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM plugins").fetchall()]
+
+    # -- rules ---------------------------------------------------------------- #
+    def replace_mod_rules(self, source_folder: str,
+                          rules: Sequence[Tuple[str, Optional[str], Optional[dict]]]) -> None:
+        """Replace the rules for a source mod. ``rules`` = (type, ref_folder, ref_raw)."""
+        self._enqueue("DELETE FROM mod_rules WHERE source_folder=?", (source_folder,))
+        if rules:
+            rows = [(source_folder, t, rf or "", json.dumps(rr) if rr else None)
+                    for (t, rf, rr) in rules]
+            self._enqueue(
+                "INSERT OR REPLACE INTO mod_rules(source_folder,type,ref_folder,ref_raw) "
+                "VALUES(?,?,?,?)", rows)
+
+    def mod_rules(self, source_folder: str) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM mod_rules WHERE source_folder=?", (source_folder,)).fetchall()]
+
+    # -- logs ----------------------------------------------------------------- #
+    def log(self, level: str, message: str, *, operation: str = "",
+            mod_folder: str = "", thread: str = "", ts: Optional[int] = None) -> None:
+        self._enqueue(
+            "INSERT INTO logs(ts,level,operation,mod_folder,thread,message) VALUES(?,?,?,?,?,?)",
+            (ts if ts is not None else int(time.time() * 1000), level, operation,
+             mod_folder, thread, message))
+
+    def query_logs(self, *, operation: Optional[str] = None, level: Optional[str] = None,
+                   mod_folder: Optional[str] = None, since_ms: Optional[int] = None,
+                   limit: int = 1000) -> List[Dict[str, Any]]:
+        clauses, params = [], []
+        if operation:
+            clauses.append("operation=?"); params.append(operation)
+        if level:
+            clauses.append("level=?"); params.append(level)
+        if mod_folder:
+            clauses.append("mod_folder=?"); params.append(mod_folder)
+        if since_ms is not None:
+            clauses.append("ts>=?"); params.append(since_ms)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._connect() as c:
+            return [dict(r) for r in c.execute(
+                f"SELECT * FROM logs {where} ORDER BY ts DESC LIMIT ?", params).fetchall()]
+
+    # -- integrity scan ------------------------------------------------------- #
+    def fast_scan(self, staging_dir: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Cheap integrity check: compare recorded size+mtime to disk. No hashing.
+        Returns {'missing':[...], 'changed':[...], 'mods':int, 'files':int}."""
+        return self._scan(staging_dir, deep=False)
+
+    def deep_scan(self, staging_dir: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Thorough check: re-hash every file and compare md5. Expensive."""
+        return self._scan(staging_dir, deep=True)
+
+    def _scan(self, staging_dir: str, *, deep: bool) -> Dict[str, Any]:
+        missing: List[Dict[str, Any]] = []
+        changed: List[Dict[str, Any]] = []
+        with self._connect() as c:
+            mods = [r["folder"] for r in c.execute("SELECT folder FROM mods").fetchall()]
+            nfiles = 0
+            for folder in mods:
+                for f in c.execute("SELECT * FROM mod_files WHERE folder=?", (folder,)).fetchall():
+                    nfiles += 1
+                    full = os.path.join(staging_dir, folder, f["rel_path"].replace("/", os.sep))
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        missing.append({"folder": folder, "rel_path": f["rel_path"]})
+                        continue
+                    if f["size"] is not None and st.st_size != f["size"]:
+                        changed.append({"folder": folder, "rel_path": f["rel_path"],
+                                        "reason": "size"})
+                        continue
+                    if deep and f["md5"]:
+                        if hash_file(full) != f["md5"]:
+                            changed.append({"folder": folder, "rel_path": f["rel_path"],
+                                            "reason": "md5"})
+                    elif not deep and f["mtime"] is not None and \
+                            int(st.st_mtime) != f["mtime"]:
+                        changed.append({"folder": folder, "rel_path": f["rel_path"],
+                                        "reason": "mtime"})
+        return {"missing": missing, "changed": changed, "mods": len(mods), "files": nfiles}
+
+    def affected_mods(self, scan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """Map a scan result to the mods (and their source download) that need a
+        re-install -- the 'go back to the original mod to retry' lookup."""
+        folders = {i["folder"] for i in scan.get("missing", [])} | \
+                  {i["folder"] for i in scan.get("changed", [])}
+        out: Dict[str, Dict[str, Any]] = {}
+        for folder in folders:
+            out[folder] = self.mod_with_download(folder)
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Logging handler -> ledger
+# --------------------------------------------------------------------------- #
+def _fallback_log(msg: str) -> None:
+    try:
+        logging.getLogger("nxd.ledger").warning(msg)
+    except Exception:
+        pass
+
+
+class SQLiteLogHandler(logging.Handler):
+    """A logging.Handler that writes records into the ledger's ``logs`` table via
+    the same batched background writer (so verbose install logging is one DB
+    place, not thousands of file writes). ``operation``/``mod_folder`` can be
+    attached per-record via ``extra={'operation':..., 'mod_folder':...}``."""
+
+    def __init__(self, state: "LocalState", operation: str = ""):
+        super().__init__()
+        self.state = state
+        self.operation = operation
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.state.log(
+                record.levelname, self.format(record),
+                operation=getattr(record, "operation", self.operation) or "",
+                mod_folder=getattr(record, "mod_folder", "") or "",
+                thread=record.threadName or "",
+                ts=int(record.created * 1000))
+        except Exception:
+            self.handleError(record)
+
+
+# --------------------------------------------------------------------------- #
+# CLI: inspect the ledger
+# --------------------------------------------------------------------------- #
+def _main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="Inspect the NexusDownloader ledger")
+    ap.add_argument("--db", help="path to state.db (or pass --staging)")
+    ap.add_argument("--staging", help="staging dir (derives <staging>/.nxd/state.db)")
+    ap.add_argument("--dump", action="store_true", help="summary counts")
+    ap.add_argument("--logs", action="store_true", help="recent log rows")
+    ap.add_argument("--operation"); ap.add_argument("--level")
+    ap.add_argument("--scan", action="store_true", help="fast integrity scan")
+    ap.add_argument("--deep-scan", action="store_true", help="hash-verify every file")
+    args = ap.parse_args(argv)
+
+    db = args.db or (db_path_for(args.staging) if args.staging else None)
+    if not db or not os.path.exists(db):
+        print(f"!! no ledger at {db}"); return 1
+    st = LocalState(db)
+    try:
+        if args.dump or not (args.logs or args.scan or args.deep_scan):
+            with st._connect() as c:
+                for tbl in ("collections", "downloads", "mods", "mod_files", "plugins",
+                            "mod_rules", "logs"):
+                    n = c.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    print(f"  {tbl:12s}: {n:,}")
+                v = c.execute("SELECT COUNT(*) FROM mods WHERE verified=1").fetchone()[0]
+                print(f"  (mods verified: {v:,})")
+        if args.logs:
+            for r in reversed(st.query_logs(operation=args.operation, level=args.level, limit=200)):
+                print(f"  {r['ts']} [{r['level']}] {r['operation']} {r['mod_folder']} :: {r['message'][:120]}")
+        if args.scan or args.deep_scan:
+            staging = args.staging or os.path.dirname(os.path.dirname(db))
+            res = st.deep_scan(staging) if args.deep_scan else st.fast_scan(staging)
+            print(f"  scanned {res['files']:,} files in {res['mods']:,} mods")
+            print(f"  missing: {len(res['missing'])}  changed: {len(res['changed'])}")
+            for i in (res["missing"] + res["changed"])[:30]:
+                print(f"    {i.get('reason','missing'):7s} {i['folder']}/{i['rel_path']}")
+    finally:
+        st.close()
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_main())
