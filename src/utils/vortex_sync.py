@@ -58,6 +58,33 @@ def _best_match(candidates: List[str], mod: Dict[str, Any]) -> Optional[str]:
     return best if score(best) > 0 else candidates[0]
 
 
+def _match_archive(candidates: List[str], mod: Dict[str, Any],
+                   sizes: Dict[str, int]) -> Optional[str]:
+    """Pick the archive that belongs to *this* mod, preferring an EXACT fileSize
+    match over name overlap.
+
+    Name overlap (``_best_match``) ties when one mod's name is a prefix of
+    another's -- e.g. "Convenient Horses" scores equally against both
+    ``Convenient Horses.zip`` and ``Convenient Horses ... Patch.zip`` -- so
+    ``max()`` hands the SAME archive to both mods, collapsing them onto one
+    archiveId (Vortex then flags them as duplicate mods). The collection entry
+    carries the exact ``fileSize`` of its file, which is unique per file on a
+    Nexus mod page, so we match on that first and only fall back to name overlap
+    when size can't decide (missing/identical sizes)."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    target = (mod.get("source", {}) or {}).get("fileSize")
+    if target:
+        exact = [c for c in candidates if sizes.get(c) == target]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:                    # size tie -> break by name overlap
+            return _best_match(exact, mod)
+    return _best_match(candidates, mod)
+
+
 def _gen_id(seed: str) -> str:
     """Deterministic 12-char download id from a seed (stable across re-runs)."""
     h = hashlib.sha1(seed.encode()).hexdigest()
@@ -109,7 +136,8 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
                profile_id: str, collection_folder: str, collection_id: int, slug: str,
                revision_id: int, revision_number: int,
                install_time_iso: str = "", install_ms: int = 0,
-               all_folders: Optional[List[str]] = None) -> SyncPlan:
+               all_folders: Optional[List[str]] = None,
+               archive_sizes: Optional[Dict[str, int]] = None) -> SyncPlan:
     """Build + validate every record for the sync (pure, no I/O).
 
     ``install_time_iso``/``install_ms`` (passed in by :func:`run` so this stays
@@ -119,6 +147,7 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
     finds full folder<->record parity and never re-stubs our records.
     """
     plan = SyncPlan()
+    sizes = archive_sizes or {}
     info = collection.get("info", {})
     coll_name = info.get("name", collection_folder)   # the mods' "variant"
     recorded: set = set()   # staging folders we've written a mod record for
@@ -147,7 +176,7 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         # Disambiguate shared-modId variants so each mod links its OWN folder,
         # not folders[0] (else every variant but the first shows 'Not Installed').
         folder = _best_match([f for f in folders if f not in recorded] or folders, mod)
-        archive = _best_match(archives, mod)
+        archive = _match_archive(archives, mod, sizes)
 
         dl_id = existing_dl_by_path.get(archive)
         if not dl_id:
@@ -217,7 +246,7 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         s = mod.get("source", {})
         if s.get("type") != "nexus" or not s.get("modId"):
             continue
-        archive = _best_match(downloads_by_modid.get(str(s["modId"]), []), mod) or ""
+        archive = _match_archive(downloads_by_modid.get(str(s["modId"]), []), mod, sizes) or ""
         rules.append(vr.build_collection_rule(mod, archive))
     plan.rule_count = len(rules)
 
@@ -345,6 +374,15 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
         collection = json.load(fh)
 
     downloads = index_by_modid(os.listdir(downloads_dir), archives_only=True)
+    # Exact byte size per archive basename, so build_plan can disambiguate
+    # shared-modId files by fileSize (the way Vortex matches) instead of name.
+    archive_sizes: Dict[str, int] = {}
+    for names in downloads.values():
+        for name in names:
+            try:
+                archive_sizes[name] = os.path.getsize(os.path.join(downloads_dir, name))
+            except OSError:
+                pass
     all_folders = [d for d in os.listdir(staging_dir)
                    if os.path.isdir(os.path.join(staging_dir, d))]
     folders = index_by_modid(all_folders)
@@ -367,7 +405,7 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
                       collection_folder=collection_folder, collection_id=collection_id,
                       slug=slug, revision_id=revision_id, revision_number=revision_number,
                       install_time_iso=install_time_iso, install_ms=install_ms,
-                      all_folders=all_folders)
+                      all_folders=all_folders, archive_sizes=archive_sizes)
 
     if not apply:
         return SyncResult(False, plan, risk, message="dry-run")
