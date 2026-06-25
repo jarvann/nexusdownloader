@@ -85,6 +85,50 @@ def _match_archive(candidates: List[str], mod: Dict[str, Any],
     return _best_match(candidates, mod)
 
 
+def _break_rule_cycles(edges: List[Tuple[str, str, str, dict]],
+                       rules_by_folder: Dict[str, list]) -> int:
+    """Remove rules whose ordering edge closes a cycle, leaving an acyclic set.
+
+    Vortex topo-sorts mods from their before/after rules; a cycle (A before B and
+    B before A) is unsortable and pops the "Cycles" dialog asking the user to
+    delete a rule by hand. We do that automatically: a depth-first walk over the
+    "u loads before v" graph; any edge pointing back to a node still on the
+    recursion stack is a back-edge (the one closing a cycle), so we drop that
+    rule. Removing all DFS back-edges is guaranteed to yield a DAG. ``edges`` is
+    (u, v, src_folder, rule_obj); the rule lives in ``rules_by_folder[src_folder]``
+    and is removed by object identity. Returns the number of rules dropped."""
+    import sys
+    from collections import defaultdict
+
+    adj: Dict[str, list] = defaultdict(list)
+    for u, v, sf, ro in edges:
+        adj[u].append((v, sf, ro))
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: Dict[str, int] = defaultdict(int)
+    dropped = 0
+    sys.setrecursionlimit(max(10000, len(adj) * 4 + 1000))
+
+    def dfs(start: str) -> None:
+        nonlocal dropped
+        color[start] = GRAY
+        for (v, sf, ro) in adj[start]:
+            c = color[v]
+            if c == GRAY:                       # back-edge -> closes a cycle
+                lst = rules_by_folder.get(sf)
+                if lst and ro in lst:
+                    lst.remove(ro)
+                    dropped += 1
+            elif c == WHITE:
+                dfs(v)
+        color[start] = BLACK
+
+    for node in list(adj):
+        if color[node] == WHITE:
+            dfs(node)
+    return dropped
+
+
 def _gen_id(seed: str) -> str:
     """Deterministic 12-char download id from a seed (stable across re-runs)."""
     h = hashlib.sha1(seed.encode()).hexdigest()
@@ -124,6 +168,7 @@ class SyncPlan:
     rule_count: int = 0
     orphan_count: int = 0       # staging folders not in the collection, given bare records
     modrule_count: int = 0      # per-mod before/after conflict rules written
+    dropped_cycle_rules: int = 0  # rules dropped as self-loops / cycle-breakers
     violations: List[str] = field(default_factory=list)     # schema problems
 
     @property
@@ -220,6 +265,10 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         return idh if idh in recorded else None
 
     rules_by_folder: Dict[str, list] = {}
+    # Ordering edges (u loads before v) for cycle detection, each tagged with the
+    # source folder + rule object so we can drop the offending rule if it closes a
+    # cycle. Only rules resolved on BOTH ends participate in the folder graph.
+    ordered_edges: List[Tuple[str, str, str, dict]] = []
     for rule in collection.get("modRules", []):
         if rule.get("type") not in ("before", "after"):
             continue   # only load-order rules resolve file conflicts
@@ -227,15 +276,33 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         if not src_folder:
             continue
         dst_folder = _resolve_ref(rule.get("reference") or {})
+        if dst_folder == src_folder:
+            # Both endpoints collapsed to the SAME installed folder (shared-modId
+            # variants). A rule pointing a mod at itself is a meaningless self-loop
+            # and Vortex flags it as a cycle -- drop it.
+            plan.dropped_cycle_rules += 1
+            continue
         if dst_folder:
             reference = {"id": dst_folder, "idHint": dst_folder,
                          "archiveId": archive_id_by_folder.get(dst_folder, "")}
         else:
             reference = rule.get("reference") or {}
-        rules_by_folder.setdefault(src_folder, []).append(
-            {"type": rule["type"], "reference": reference})
+        rule_obj = {"type": rule["type"], "reference": reference}
+        rules_by_folder.setdefault(src_folder, []).append(rule_obj)
+        if dst_folder:
+            u, v = ((src_folder, dst_folder) if rule["type"] == "before"
+                    else (dst_folder, src_folder))
+            ordered_edges.append((u, v, src_folder, rule_obj))
+
+    # Break any remaining cycles (the collection author's own cyclic rules, or ones
+    # our resolution introduced) by dropping the edge that closes each cycle --
+    # exactly the manual fix Vortex's "Cycles" dialog asks the user to do, so the
+    # cyclic rules never reach Vortex.
+    plan.dropped_cycle_rules += _break_rule_cycles(ordered_edges, rules_by_folder)
 
     for folder, frules in rules_by_folder.items():
+        if not frules:
+            continue   # all rules dropped as cycle-breakers -> no ###rules leaf
         base = f"persistent###mods###{GAME_ID}###{folder}"
         plan.records.update(vr.to_absolute(base, {"rules": frules}))
     plan.modrule_count = sum(len(v) for v in rules_by_folder.values())
