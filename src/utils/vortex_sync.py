@@ -279,7 +279,9 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         if dst_folder == src_folder:
             # Both endpoints collapsed to the SAME installed folder (shared-modId
             # variants). A rule pointing a mod at itself is a meaningless self-loop
-            # and Vortex flags it as a cycle -- drop it.
+            # and Vortex flags it as a cycle -- drop it. Keep the folder in the map
+            # (empty) so a re-Link OVERWRITES any stale cyclic rule we wrote before.
+            rules_by_folder.setdefault(src_folder, [])
             plan.dropped_cycle_rules += 1
             continue
         if dst_folder:
@@ -300,9 +302,10 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
     # cyclic rules never reach Vortex.
     plan.dropped_cycle_rules += _break_rule_cycles(ordered_edges, rules_by_folder)
 
+    # Write rules for every folder we touched -- INCLUDING the ones left empty by
+    # self-loop/cycle dropping. Writing an empty [] overwrites any stale cyclic
+    # rules a prior Link left in the DB, so a re-Link truly clears the cycle.
     for folder, frules in rules_by_folder.items():
-        if not frules:
-            continue   # all rules dropped as cycle-breakers -> no ###rules leaf
         base = f"persistent###mods###{GAME_ID}###{folder}"
         plan.records.update(vr.to_absolute(base, {"rules": frules}))
     plan.modrule_count = sum(len(v) for v in rules_by_folder.values())
