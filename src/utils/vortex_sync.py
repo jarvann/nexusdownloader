@@ -28,7 +28,13 @@ from utils.vortex_schema import (
 )
 
 ARCHIVE_RE = re.compile(r"\.(7z|zip|rar)$", re.IGNORECASE)
-_MODID_RE = re.compile(r"-(\d{2,7})-")
+# Match a modId token with a LOOKAHEAD delimiter so adjacent ids aren't consumed:
+# "SMIM SE 2-08-659-2-08" must yield {08, 659}, not {08, 2} (the real modId 659 is
+# otherwise eaten as the boundary between "-08-" and "-2-"). We index a name under
+# EVERY such token because Vortex never encodes the modId in a fixed position --
+# the folder/archive name is just the masked archive filename (deriveModInstallName)
+# -- so the only robust key is "does this name contain the mod's id as a token".
+_MODID_RE = re.compile(r"-(\d{2,7})(?=[-.])")
 
 
 def _best_match(candidates: List[str], mod: Dict[str, Any]) -> Optional[str]:
@@ -145,9 +151,8 @@ def index_by_modid(names: List[str], *, archives_only: bool = False) -> Dict[str
     for n in names:
         if archives_only and not ARCHIVE_RE.search(n):
             continue
-        m = _MODID_RE.search(n)
-        if m:
-            out.setdefault(m.group(1), []).append(n)
+        for mid in set(_MODID_RE.findall(n)):
+            out.setdefault(mid, []).append(n)
     return out
 
 
