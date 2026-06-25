@@ -143,6 +143,24 @@ def read_instance_id(staging_dir: str, target_data_dir: str) -> Optional[str]:
     return None
 
 
+def write_staging_tag(staging_dir: str, instance_id: str, game_id: str = GAME_ID) -> None:
+    """Write Vortex's ``__vortex_staging_folder`` marker into the staging root.
+
+    Vortex creates this to mark a folder as its own; staging we build ourselves
+    lacks it, so Vortex warns "Mod Staging Folder invalid" on launch. The format
+    mirrors ``writeStagingTag`` in Vortex's stagingDirectory.ts exactly:
+    ``{"instance": <app.instanceId>, "game": <gameId>}``. Skip silently if we
+    don't have an instance id (writing a bad one is worse than no marker)."""
+    if not instance_id or not os.path.isdir(staging_dir):
+        return
+    marker = os.path.join(staging_dir, STAGING_MARKER)
+    try:
+        with open(marker, "w", encoding="utf-8") as fh:
+            json.dump({"instance": instance_id, "game": game_id}, fh)
+    except OSError:
+        pass
+
+
 def _hardlink(src: str, dst: str) -> None:
     """Hard-link ``src`` to ``dst`` (replacing any existing target).
 
@@ -379,6 +397,9 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
         instance_id = vortex_db.read_app_instance_id(db_path, node=node)
     except Exception:
         instance_id = None
+    # Stamp the staging marker so Vortex stops warning "Mod Staging Folder
+    # invalid" (our staging is built by us, not Vortex, so it lacks the tag).
+    write_staging_tag(staging_dir, instance_id, game_id)
     result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
                     instance_id=instance_id,
                     deployment_time_ms=deployment_time_ms, workers=workers,
