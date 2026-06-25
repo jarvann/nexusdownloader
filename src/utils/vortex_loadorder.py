@@ -26,6 +26,7 @@ the load-order files Vortex writes:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import struct
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -164,10 +165,19 @@ def is_master_block(name: str, path: Optional[str] = None) -> bool:
     return False
 
 
+# Bethesda Creation Club plugins follow a fixed scheme: "cc" + a 3-char dev
+# code + "sse" + a 3-digit number (e.g. ccBGSSSE001, ccafdsse001, cceejsse001).
+# Match THAT, not any "cc" prefix -- collection mods legitimately start with "cc"
+# (Creation Club *patches/addons* like "cc open helmets.esp", "ccquest -
+# experience patch.esp"), and a bare startswith("cc") was wrongly dropping those
+# from plugins.txt, leaving them disabled in-game.
+_BASE_CC_RE = re.compile(r"^cc[a-z0-9]{3}sse\d{3}", re.IGNORECASE)
+
+
 def is_vanilla_master(name: str, vanilla: Iterable[str] = SKYRIMSE_VANILLA) -> bool:
     """True for base-game / Creation Club plugins (excluded from plugins.txt)."""
     low = name.lower()
-    return low in set(vanilla) or low.startswith("cc")
+    return low in set(vanilla) or bool(_BASE_CC_RE.match(low))
 
 
 def order_plugins(plugin_names: Sequence[str],
