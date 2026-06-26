@@ -97,6 +97,7 @@ class DownloadWorkerThread(QThread):
         self.endorse_only = endorse_only
         self.config_manager = config_manager
         self.staging = staging          # enables ledger recording of downloads when set
+        self.process = None             # the loadcollection subprocess (for graceful stop)
         self.is_cancelled = False
         self.is_paused = False
         self.resume_requested = False
@@ -257,6 +258,13 @@ class DownloadWorkerThread(QThread):
         self.status_changed.emit(f"Starting {operation_type} process...")
         
         try:
+            # New process group / session so we can deliver a graceful CTRL_BREAK
+            # (Windows) or SIGTERM (POSIX) to the downloader without hitting the GUI.
+            popen_extra = {}
+            if os.name == "nt":
+                popen_extra["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_extra["start_new_session"] = True
             process = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
@@ -264,19 +272,21 @@ class DownloadWorkerThread(QThread):
                 cwd=os.path.dirname(script_dir),
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                **popen_extra
             )
-            
+            self.process = process
+
             # Monitor process output
             for line in process.stdout:
                 if self.is_cancelled:
-                    process.terminate()
+                    self._stop_process_gracefully(process)
                     break
-                
-                # Handle pause logic - terminate process when paused
+
+                # Handle pause logic - stop current downloads when paused
                 if self.is_paused:
-                    self.status_changed.emit("Pausing operation - terminating current downloads...")
-                    process.terminate()
+                    self.status_changed.emit("Pausing operation - stopping current downloads...")
+                    self._stop_process_gracefully(process)
                     break
                 
                 line = line.strip()
@@ -601,13 +611,42 @@ class DownloadWorkerThread(QThread):
         except Exception as e:
             self.log_message_received.emit("ERROR", f"Error handling progress update: {str(e)}")
     
+    def _stop_process_gracefully(self, process, timeout: float = 12.0):
+        """Ask the downloader to wind down (graceful), then hard-kill if it won't.
+
+        Sends CTRL_BREAK (Windows) / SIGTERM (POSIX) so loadcollection flips its
+        cancel token, stops queuing, aborts in-flight files and flushes the
+        ledger. If it hasn't exited within ``timeout`` we escalate to kill().
+        """
+        if not process or process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                import signal as _sig
+                process.send_signal(_sig.CTRL_BREAK_EVENT)   # -> SIGBREAK in the child
+            else:
+                process.terminate()                          # -> SIGTERM
+        except Exception:
+            pass
+        try:
+            process.wait(timeout)
+        except Exception:
+            try:
+                process.kill()                               # last-resort hard stop
+            except Exception:
+                pass
+
     def cancel_operation(self):
         """Cancel the current operation gracefully."""
         self.is_cancelled = True
         self.is_paused = False  # Clear paused state
         self.resume_requested = False  # Clear resume request
         self.status_changed.emit("Cancelling operation...")
-        
+
+        # Signal the subprocess immediately -- don't wait for the next stdout line
+        # (a stalled/slow download could otherwise delay the cancel for a while).
+        self._stop_process_gracefully(self.process)
+
         # Force thread to emit finished signal when cancelled
         if hasattr(self, '_should_emit_finished'):
             self._should_emit_finished = True
@@ -2082,30 +2121,47 @@ Operation Statistics:
         Args:
             event: Qt close event
         """
-        download_running = bool(self.download_thread and self.download_thread.isRunning())
-        install_thread = getattr(getattr(self, 'install_tab', None), 'install_thread', None)
-        install_running = bool(install_thread and install_thread.isRunning())
+        # Every long-running worker, with how to cancel it. Each entry is
+        # (label, thread, cancel_callable) -- covers downloads (subprocess),
+        # install, the one-click pipeline, and the ledger/integrity pass.
+        itab = getattr(self, "install_tab", None)
+        candidates = [
+            ("download", self.download_thread,
+             getattr(self.download_thread, "cancel_operation", None)),
+            ("install", getattr(itab, "install_thread", None),
+             None),
+            ("pipeline", getattr(itab, "_pipeline", None), None),
+            ("integrity scan", getattr(getattr(itab, "ledger_panel", None), "_worker", None), None),
+        ]
+        workers = []
+        for label, thread, cancel_fn in candidates:
+            if thread is not None and thread.isRunning():
+                workers.append((label, thread, cancel_fn or getattr(thread, "cancel", None)))
 
-        if download_running or install_running:
-            op = "download" if download_running else "install"
+        if workers:
+            names = ", ".join(w[0] for w in workers)
             reply = QMessageBox.question(
-                self,
-                "Close Application",
-                f"A {op} operation is in progress. Cancel and exit?",
-                QMessageBox.Yes | QMessageBox.No
-            )
+                self, "Close Application",
+                f"An operation is in progress ({names}). Cancel and exit?",
+                QMessageBox.Yes | QMessageBox.No)
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
 
-            # Ask each worker to stop, then wait a bounded time. We accept the
-            # close regardless so the UI can never get stuck on a slow worker.
-            if download_running:
-                self.download_thread.cancel_operation()
-                self.download_thread.wait(5000)
-            if install_running:
-                install_thread.cancel()
-                install_thread.wait(5000)
+            # Request cancellation on each worker, then wait a bounded time. We
+            # accept the close regardless so the UI can never wedge on a slow
+            # worker, and we never let a stray KeyboardInterrupt escape here.
+            for label, thread, cancel_fn in workers:
+                try:
+                    if callable(cancel_fn):
+                        cancel_fn()
+                except Exception:
+                    pass
+            for label, thread, _ in workers:
+                try:
+                    thread.wait(8000)
+                except (KeyboardInterrupt, Exception):
+                    pass
 
         self._cleanup_async_logger()
         event.accept()
@@ -2136,16 +2192,38 @@ Operation Statistics:
 def main():
     """Main entry point for the GUI application."""
     app = QApplication(sys.argv)
-    
+
     # Set application metadata
     app.setApplicationName("NexusDownloader")
     app.setApplicationVersion("2.0")
     app.setOrganizationName("NexusDownloader")
-    
+
     # Create and show main window
     window = MainWindow()
     window.show()
-    
+
+    # Graceful shutdown on Ctrl-C / kill: route the signal to an orderly close
+    # (cancel workers, wind down) instead of a raw KeyboardInterrupt traceback.
+    # Two pieces are needed because Qt's C++ event loop otherwise starves Python
+    # signal delivery:
+    #   * a QTimer that periodically yields to the interpreter so the handler runs;
+    #   * the handler triggers window.close() on the GUI thread via a queued call.
+    try:
+        from PySide6.QtCore import QTimer, QMetaObject, Qt
+        from utils.cancellation import install_graceful_shutdown
+
+        def _request_quit(signum):
+            print(f"\nReceived signal {signum}; shutting down gracefully…", flush=True)
+            QMetaObject.invokeMethod(window, "close", Qt.QueuedConnection)
+
+        if install_graceful_shutdown(_request_quit):
+            _sig_timer = QTimer()
+            _sig_timer.start(200)                  # ~5x/sec: let Python run signal handlers
+            _sig_timer.timeout.connect(lambda: None)
+            app._sig_timer = _sig_timer            # keep a ref alive
+    except Exception:
+        pass                                       # signals are a nicety, not required
+
     # Start application event loop
     sys.exit(app.exec())
 

@@ -20,21 +20,31 @@ from PySide6.QtWidgets import (
 )
 
 from utils import local_state, state_reconcile
+from utils.cancellation import CancellationToken
 
 
 class _LedgerWorker(QThread):
-    """Runs a blocking ledger op (reconcile/scan) off the UI thread."""
+    """Runs a blocking ledger op (reconcile/scan) off the UI thread.
+
+    The op callable receives ``(progress_emit, should_cancel)`` so long passes
+    (baseline hashing, deep verify) can bail promptly when the user cancels or
+    closes the app.
+    """
     progress = Signal(str)
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn: Callable[[Callable[[str], None]], object]):
+    def __init__(self, fn: Callable[[Callable[[str], None], Callable[[], bool]], object]):
         super().__init__()
         self._fn = fn
+        self._token = CancellationToken()
+
+    def cancel(self):
+        self._token.cancel()
 
     def run(self):
         try:
-            self.done.emit(self._fn(self.progress.emit))
+            self.done.emit(self._fn(self.progress.emit, lambda: self._token.cancelled))
         except Exception as e:           # surface, don't crash the UI thread
             self.failed.emit(str(e))
 
@@ -145,10 +155,12 @@ class LedgerPanel(QGroupBox):
         self.output.clear()
         self._log("Building baseline (identity + md5 of every staged file). This can take a while…")
         self._start(
-            lambda log: state_reconcile.reconcile(staging, downloads, collection,
-                                                  do_hash=True, log=log),
-            lambda res: self._log(f"Baseline done: {res.get('mods', 0)} mods, "
-                                  f"{res.get('files', 0):,} files."))
+            lambda log, cancel: state_reconcile.reconcile(staging, downloads, collection,
+                                                          do_hash=True, log=log,
+                                                          should_cancel=cancel),
+            lambda res: self._log(
+                f"Baseline {'cancelled' if res.get('cancelled') else 'done'}: "
+                f"{res.get('mods', 0)} mods, {res.get('files', 0):,} files."))
 
     def _scan(self, deep: bool):
         staging, _, _ = self._paths()
@@ -161,13 +173,16 @@ class LedgerPanel(QGroupBox):
         kind = "deep (md5)" if deep else "fast (size+mtime)"
         self._log(f"Verifying staging — {kind} scan…")
 
-        def work(log):
+        def work(log, cancel):
             st = local_state.get_ledger(db)
-            return st.deep_scan(staging) if deep else st.fast_scan(staging)
+            return st.deep_scan(staging, should_cancel=cancel) if deep \
+                else st.fast_scan(staging, should_cancel=cancel)
         self._start(work, lambda res: self._show_scan(res))
 
     def _show_scan(self, res: Dict):
         self._last_scan = res
+        if res.get("cancelled"):
+            self._log("Scan cancelled — partial results below.")
         miss, chg = res.get("missing", []), res.get("changed", [])
         self._log(f"Scanned {res.get('files', 0):,} files in {res.get('mods', 0):,} mods.")
         self._log(f"  missing: {len(miss)}   changed: {len(chg)}")

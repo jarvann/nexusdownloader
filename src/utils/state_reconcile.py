@@ -309,19 +309,23 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
 
 
 def reconcile_files(staging_dir: str, *, do_hash: bool = True, workers: int = 16,
-                    resume: bool = False, log: Callable[[str], None] = print) -> Dict[str, int]:
+                    resume: bool = False, log: Callable[[str], None] = print,
+                    should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, int]:
     """SLOW pass: walk (and optionally md5-hash) every staged file to lay/refresh
     the integrity baseline. Operates on the mods already recorded by
-    :func:`reconcile_mods`."""
+    :func:`reconcile_mods`. ``should_cancel`` (optional) is polled per mod so a
+    cancel stops the walk promptly."""
     st = ls.LocalState(ls.db_path_for(staging_dir))
     try:
         folders = [m["folder"] for m in st.all_mods()
                    if not (resume and m["verified"] and (m["file_count"] or 0) > 0)]
         log(f"{'hashing' if do_hash else 'walking'} files for {len(folders)} mods "
             f"({workers} workers)...")
-        t0, total = time.time(), [0]
+        t0, total, cancelled = time.time(), [0], False
 
         def do_folder(folder):
+            if should_cancel is not None and should_cancel():
+                return
             folder_abs = os.path.join(staging_dir, folder)
             rows = _walk_mod_files(folder_abs, do_hash)
             st.replace_mod_files(folder, rows)
@@ -330,19 +334,26 @@ def reconcile_files(staging_dir: str, *, do_hash: bool = True, workers: int = 16
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for i, _ in enumerate(ex.map(do_folder, folders), 1):
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
                 if i % 500 == 0:
                     log(f"   {i}/{len(folders)} mods, {total[0]:,} files, {time.time()-t0:.0f}s")
         st.flush()
-        log(f"done: {len(folders)} mods, {total[0]:,} files in {time.time()-t0:.0f}s")
-        return {"mods": len(folders), "files": total[0]}
+        log(f"{'cancelled after' if cancelled else 'done:'} {total[0]:,} files in {time.time()-t0:.0f}s")
+        return {"mods": len(folders), "files": total[0], "cancelled": cancelled}
     finally:
         st.close()
 
 
 def reconcile(staging_dir: str, downloads_dir: str, collection_path: str, *,
               do_hash: bool = True, workers: int = 16, resume: bool = False,
-              log: Callable[[str], None] = print) -> Dict[str, int]:
+              log: Callable[[str], None] = print,
+              should_cancel: Optional[Callable[[], bool]] = None) -> Dict[str, int]:
     """Full bootstrap: identity refresh (fast) + integrity baseline (slow)."""
     m = reconcile_mods(staging_dir, downloads_dir, collection_path, log=log)
-    f = reconcile_files(staging_dir, do_hash=do_hash, workers=workers, resume=resume, log=log)
+    if should_cancel is not None and should_cancel():
+        return {**m, "cancelled": True}
+    f = reconcile_files(staging_dir, do_hash=do_hash, workers=workers, resume=resume,
+                        log=log, should_cancel=should_cancel)
     return {**m, **f}

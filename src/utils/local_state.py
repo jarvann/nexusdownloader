@@ -635,22 +635,27 @@ class LocalState:
                 f"SELECT * FROM logs {where} ORDER BY ts DESC LIMIT ?", params).fetchall()]
 
     # -- integrity scan ------------------------------------------------------- #
-    def fast_scan(self, staging_dir: str) -> Dict[str, List[Dict[str, Any]]]:
+    def fast_scan(self, staging_dir: str, should_cancel=None) -> Dict[str, List[Dict[str, Any]]]:
         """Cheap integrity check: compare recorded size+mtime to disk. No hashing.
-        Returns {'missing':[...], 'changed':[...], 'mods':int, 'files':int}."""
-        return self._scan(staging_dir, deep=False)
+        Returns {'missing':[...], 'changed':[...], 'mods':int, 'files':int,
+        'cancelled':bool}."""
+        return self._scan(staging_dir, deep=False, should_cancel=should_cancel)
 
-    def deep_scan(self, staging_dir: str) -> Dict[str, List[Dict[str, Any]]]:
+    def deep_scan(self, staging_dir: str, should_cancel=None) -> Dict[str, List[Dict[str, Any]]]:
         """Thorough check: re-hash every file and compare md5. Expensive."""
-        return self._scan(staging_dir, deep=True)
+        return self._scan(staging_dir, deep=True, should_cancel=should_cancel)
 
-    def _scan(self, staging_dir: str, *, deep: bool) -> Dict[str, Any]:
+    def _scan(self, staging_dir: str, *, deep: bool, should_cancel=None) -> Dict[str, Any]:
         missing: List[Dict[str, Any]] = []
         changed: List[Dict[str, Any]] = []
+        cancelled = False
         with self._connect() as c:
             mods = [r["folder"] for r in c.execute("SELECT folder FROM mods").fetchall()]
             nfiles = 0
             for folder in mods:
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
                 for f in c.execute("SELECT * FROM mod_files WHERE folder=?", (folder,)).fetchall():
                     nfiles += 1
                     full = os.path.join(staging_dir, folder, f["rel_path"].replace("/", os.sep))
@@ -671,7 +676,8 @@ class LocalState:
                             int(st.st_mtime) != f["mtime"]:
                         changed.append({"folder": folder, "rel_path": f["rel_path"],
                                         "reason": "mtime"})
-        return {"missing": missing, "changed": changed, "mods": len(mods), "files": nfiles}
+        return {"missing": missing, "changed": changed, "mods": len(mods),
+                "files": nfiles, "cancelled": cancelled}
 
     def affected_mods(self, scan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         """Map a scan result to the mods (and their source download) that need a

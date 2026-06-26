@@ -42,10 +42,18 @@ class PipelineWorker(QThread):
         self.do_baseline = do_baseline
         self.do_link, self.do_deploy = do_link, do_deploy
         self._cancel = False
+        self._active_installer = None     # set during the install phase
         self._summary: List[str] = []
 
     def cancel(self):
         self._cancel = True
+        # Propagate into the running installer so queued mods stop immediately.
+        inst = self._active_installer
+        if inst is not None and hasattr(inst, "cancel"):
+            try:
+                inst.cancel()
+            except Exception:
+                pass
 
     # -- orchestration ------------------------------------------------------- #
     def run(self):
@@ -123,9 +131,13 @@ class PipelineWorker(QThread):
                     self.p["staging"], None, self.workers,
                     {"installation_timeout_seconds": 600},
                     self.temp_root or None) as inst:
+                self._active_installer = inst        # so cancel() can reach it
+                if self._cancel:                     # cancelled before we started
+                    inst.cancel()
                 inst.set_progress_callback(
                     lambda c, t, n: self.progress.emit(c, t, n))
                 results = inst.install_collection_parallel(collection, self.p["downloads"])
+            self._active_installer = None
             ok = sum(1 for r in results if r.status == InstallResult.SUCCESS)
             fail = sum(1 for r in results if r.status == InstallResult.FAILED)
             skip = sum(1 for r in results if r.status == InstallResult.SKIPPED)
@@ -143,7 +155,8 @@ class PipelineWorker(QThread):
         res = state_reconcile.reconcile(
             self.p["staging"], self.p["downloads"], self.p["collection"],
             do_hash=True, workers=self.workers,
-            log=lambda m: self.log.emit("INFO", m))
+            log=lambda m: self.log.emit("INFO", m),
+            should_cancel=lambda: self._cancel)
         self._summary.append(f"Baseline: {res.get('mods', 0)} mods, "
                              f"{res.get('files', 0):,} files hashed")
 

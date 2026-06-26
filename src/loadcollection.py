@@ -21,6 +21,24 @@ try:
 except Exception:  # pragma: no cover - ledger is a non-critical add-on here
     _LEDGER_AVAILABLE = False
 
+# Cooperative cancellation shared with download.py and honoured by the download /
+# endorse loops. A graceful kill signal (Ctrl-C, SIGTERM, or the GUI's
+# CTRL_BREAK) flips this token; queued work then skips and in-flight work stops,
+# so the process winds down cleanly (flushing the ledger) instead of crashing.
+try:
+    import download as _download_mod
+    from utils.cancellation import CancellationToken, install_graceful_shutdown
+    _CANCEL_TOKEN = CancellationToken()
+    _download_mod.set_cancel_token(_CANCEL_TOKEN)
+except Exception:
+    _CANCEL_TOKEN = None
+    def install_graceful_shutdown(_fn):  # type: ignore
+        return False
+
+
+def _cancelled() -> bool:
+    return _CANCEL_TOKEN is not None and _CANCEL_TOKEN.cancelled
+
 
 lock = threading.Lock()
 COUNTER = 0
@@ -184,6 +202,14 @@ def main(mods, gamefolder, max_threads=10, logger=None, staging=None, collection
             futures[fut] = (mod_id, file_id)
 
         for future in concurrent.futures.as_completed(futures):
+            if _cancelled():
+                # Stop scheduling more work; cancel anything not yet started and
+                # let in-flight downloads abort between chunks. The pool drains fast.
+                executor.shutdown(wait=False, cancel_futures=True)
+                if logger:
+                    logger.warning("Cancellation requested — winding down downloads…")
+                print("CANCELLED: download wind-down", flush=True)
+                break
             mod_id, file_id = futures[future]
             try:
                 path = future.result()
@@ -244,6 +270,11 @@ def endorse_mods(mods, max_threads=10, logger=None, staging=None):
             futures[executor.submit(endorse_mod, GAME_DOMAIN, mod_id, file_id)] = (mod_id, file_id)
 
         for future in concurrent.futures.as_completed(futures):
+            if _cancelled():
+                executor.shutdown(wait=False, cancel_futures=True)
+                if logger:
+                    logger.warning("Cancellation requested — stopping endorsement…")
+                break
             mod_id, file_id = futures[future]
             try:
                 result = future.result()
@@ -278,6 +309,15 @@ if __name__ == '__main__':
     logger = setup_logger(GAME_DOMAIN if GAME_DOMAIN else "unknown", operation_type)
     # Reload mods with logger for proper error logging
     mods = load_mods_from_json(args.json, logger)
+
+    # Graceful shutdown: a kill signal flips the cancel token; the loops wind down
+    # and we exit cleanly (ledger flushed) instead of dying on a raw traceback.
+    def _on_signal(signum):
+        if _CANCEL_TOKEN:
+            _CANCEL_TOKEN.cancel()
+        logger.warning(f"Received signal {signum}; cancelling and shutting down gracefully…")
+        print("CANCELLED: signal received", flush=True)
+    install_graceful_shutdown(_on_signal)
 
     if args.endorseonly:
         logger.verbose("Endorsing mods only, no downloads will be performed.")

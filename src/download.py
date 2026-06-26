@@ -66,6 +66,23 @@ _module_logger = logging.getLogger(__name__)
 MAX_DOWNLOAD_RETRIES = 3
 RETRY_BACKOFF_BASE = 3  # seconds; doubles each attempt (3s, 6s, ...)
 
+# Cooperative cancellation: the orchestrator sets a CancellationToken here; each
+# download checks it so a cancel makes queued files skip instantly and an
+# in-flight file stop between chunks (cleaning its partial) instead of running to
+# completion. None => no cancellation wired (plain CLI use).
+_CANCEL = None
+
+class _DownloadCancelled(Exception):
+    """Internal: a download aborted mid-stream because cancellation was requested."""
+
+def set_cancel_token(token):
+    """Install the cancellation token download_file should honour (or None)."""
+    global _CANCEL
+    _CANCEL = token
+
+def _is_cancelled() -> bool:
+    return _CANCEL is not None and _CANCEL.cancelled
+
 def set_download_logger(logger):
     global LOGGER
     LOGGER = logger
@@ -142,6 +159,10 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter,
         logger.verbose(f"mod {mod_id} file {file_id} already downloaded; "
                        f"skipped (no API call). (#{current_counter})")
         return
+    # Queued-but-not-started work bails immediately on cancel (no API call,
+    # no network) so a cancel drains the pool fast.
+    if _is_cancelled():
+        return
 
     download_start = time.time()
     logger.info(f"Starting download for mod {mod_id}, file {file_id} (#{current_counter})")
@@ -197,6 +218,11 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter,
                 last_emit = 0.0
                 with open(file_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
+                        # Honour a cancel mid-file: stop, drop the partial, and
+                        # report the abort (the running download "receives" the
+                        # cancellation request rather than finishing a huge file).
+                        if _is_cancelled():
+                            raise _DownloadCancelled()
                         f.write(chunk)
                         downloaded_size += len(chunk)
                         # Throttle progress records to ~2/sec per thread to bound stdout volume
@@ -219,6 +245,16 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter,
             speed = speed_bps / 1024 / 1024  # MB/s
             logger.info(f"Successfully downloaded {filename} ({downloaded_size} bytes, {speed:.2f} MB/s, Time: {elapsed}) (#{current_counter})")
             return file_path
+
+        except _DownloadCancelled:
+            emit_status("ERR", lane, filename)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)        # drop the partial; it's not complete
+                except OSError:
+                    pass
+            logger.info(f"Cancelled mid-download: {filename} (partial removed) (#{current_counter})")
+            return None
 
         except (requests.exceptions.RequestException, OSError) as e:
             last_error = e
