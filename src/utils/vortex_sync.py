@@ -64,33 +64,6 @@ def _best_match(candidates: List[str], mod: Dict[str, Any]) -> Optional[str]:
     return best if score(best) > 0 else candidates[0]
 
 
-def _match_archive(candidates: List[str], mod: Dict[str, Any],
-                   sizes: Dict[str, int]) -> Optional[str]:
-    """Pick the archive that belongs to *this* mod, preferring an EXACT fileSize
-    match over name overlap.
-
-    Name overlap (``_best_match``) ties when one mod's name is a prefix of
-    another's -- e.g. "Convenient Horses" scores equally against both
-    ``Convenient Horses.zip`` and ``Convenient Horses ... Patch.zip`` -- so
-    ``max()`` hands the SAME archive to both mods, collapsing them onto one
-    archiveId (Vortex then flags them as duplicate mods). The collection entry
-    carries the exact ``fileSize`` of its file, which is unique per file on a
-    Nexus mod page, so we match on that first and only fall back to name overlap
-    when size can't decide (missing/identical sizes)."""
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    target = (mod.get("source", {}) or {}).get("fileSize")
-    if target:
-        exact = [c for c in candidates if sizes.get(c) == target]
-        if len(exact) == 1:
-            return exact[0]
-        if len(exact) > 1:                    # size tie -> break by name overlap
-            return _best_match(exact, mod)
-    return _best_match(candidates, mod)
-
-
 def _break_rule_cycles(edges: List[Tuple[str, str, str, dict]],
                        rules_by_folder: Dict[str, list]) -> int:
     """Remove rules whose ordering edge closes a cycle, leaving an acyclic set.
@@ -181,77 +154,98 @@ class SyncPlan:
         return len(self.records)
 
 
-def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List[str]],
-               folders_by_modid: Dict[str, List[str]], existing_dl_by_path: Dict[str, str],
+def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
                profile_id: str, collection_folder: str, collection_id: int, slug: str,
                revision_id: int, revision_number: int,
-               install_time_iso: str = "", install_ms: int = 0,
-               all_folders: Optional[List[str]] = None,
-               archive_sizes: Optional[Dict[str, int]] = None) -> SyncPlan:
-    """Build + validate every record for the sync (pure, no I/O).
+               install_time_iso: str = "", install_ms: int = 0) -> SyncPlan:
+    """Build + validate every record for the sync (pure; reads only ``ledger_mods``).
 
-    ``install_time_iso``/``install_ms`` (passed in by :func:`run` so this stays
-    deterministic) stamp the install-time / install-completed fields Vortex writes.
-    ``all_folders`` (every staging subfolder) lets us write a bare record for any
-    folder that isn't a collection member, so Vortex's "Mods changed on disk" scan
-    finds full folder<->record parity and never re-stubs our records.
+    ``ledger_mods`` is the authoritative state from :mod:`utils.local_state`
+    (``all_mods_with_download`` rows -- each carries its staging folder plus the
+    joined download's modId/fileId/md5/local_path). We PROJECT those into Vortex
+    records: no disk globbing, no archive/folder guessing, so the wrong-archive /
+    duplicate-mods / "Never Installed" failure modes are structurally impossible.
+    ``install_time_iso``/``install_ms`` stamp Vortex's install-time fields.
     """
     plan = SyncPlan()
-    sizes = archive_sizes or {}
     info = collection.get("info", {})
     coll_name = info.get("name", collection_folder)   # the mods' "variant"
-    recorded: set = set()   # staging folders we've written a mod record for
-    # Maps for translating collection.modRules into per-mod conflict rules:
-    # resolve a rule endpoint (by md5 / logical name) to the folder we actually
-    # installed it into, plus that folder's download (archive) id.
+    recorded: set = set()
+    # Maps for translating collection.modRules into per-mod conflict rules: resolve
+    # a rule endpoint (by md5 / logical name) to the folder it's installed in.
     folder_by_md5: Dict[str, str] = {}
     folder_by_logical: Dict[str, str] = {}
     archive_id_by_folder: Dict[str, str] = {}
+    archive_by_modid: Dict[str, str] = {}
+    written_downloads: set = set()
+
+    # Collection entries indexed by (modId,fileId) so a ledger mod -- which holds
+    # the authoritative download identity -- can pull its display metadata.
+    coll_by_modfile: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for m in collection.get("mods", []):
+        s = m.get("source") or {}
+        if s.get("type") == "nexus" and s.get("modId") and s.get("fileId"):
+            coll_by_modfile[(int(s["modId"]), int(s["fileId"]))] = m
 
     def add(record_type: str, base: str, leaves: Dict[str, Any]):
         plan.violations.extend(
             f"{base.split('###')[-1]}: {v}" for v in validate_record(record_type, leaves))
         plan.records.update(vr.to_absolute(base, leaves))
 
-    for mod in collection.get("mods", []):
-        s = mod.get("source", {})
-        if s.get("type") != "nexus" or not s.get("modId") or not s.get("fileId"):
-            plan.skipped_manual += 1
-            continue
-        folders = folders_by_modid.get(str(s["modId"]), [])
-        archives = downloads_by_modid.get(str(s["modId"]), [])
-        if not folders or not archives:
-            plan.skipped_no_disk += 1
-            continue
-        # Disambiguate shared-modId variants so each mod links its OWN folder,
-        # not folders[0] (else every variant but the first shows 'Not Installed').
-        folder = _best_match([f for f in folders if f not in recorded] or folders, mod)
-        archive = _match_archive(archives, mod, sizes)
+    # Phase 1: project each LEDGER mod into Vortex records. The ledger already holds
+    # the exact folder<->download<->identity, so there is nothing to match here.
+    for row in ledger_mods:
+        folder = row["folder"]
+        dl_id = row.get("download_id") or ""
+        mid = row.get("dl_mod_id")
+        fid = row.get("dl_file_id")
+        archive = row.get("dl_local_path") or ""
+        md5 = row.get("dl_md5") or ""
+        mod_data = coll_by_modfile.get((mid, fid)) if (mid and fid) else None
 
-        dl_id = existing_dl_by_path.get(archive)
-        if not dl_id:
-            dl_id = _gen_id(f"{s['modId']}-{s['fileId']}")
-            base, leaves = vr.build_download(s, mod.get("name", ""), archive, dl_id,
+        # download record (once per id) from the ledger's authoritative metadata.
+        # Only for real nexus identities -- orphans (user/manual mods) get a bare
+        # mod record with no download, so skip building one with a null modId.
+        if dl_id and mid and fid and dl_id not in written_downloads:
+            dsrc = {"type": "nexus", "modId": mid, "fileId": fid, "md5": md5,
+                    "fileSize": row.get("dl_file_size") or 0,
+                    "logicalFilename": row.get("dl_logical") or ""}
+            name = (mod_data or {}).get("name", "") or row.get("dl_logical") or ""
+            base, leaves = vr.build_download(dsrc, name, archive, dl_id,
                                              folder=folder, collection_id=collection_id)
             add("download", base, leaves)
+            written_downloads.add(dl_id)
             plan.new_downloads += 1
+        if mid and archive:
+            archive_by_modid.setdefault(str(mid), archive)
 
-        base, leaves = vr.build_mod(s, mod, folder, dl_id, archive,
-                                    variant=coll_name, installed_as_dependency=True,
-                                    install_time=install_time_iso)
-        add("mod", base, leaves)
-        base, leaves = vr.build_profile_modstate(profile_id, folder)
-        add("profile_modstate", base, leaves)
+        if mod_data is not None:
+            s = mod_data.get("source", {})
+            base, leaves = vr.build_mod(s, mod_data, folder, dl_id, archive,
+                                        variant=coll_name, installed_as_dependency=True,
+                                        install_time=install_time_iso)
+            add("mod", base, leaves)
+            base, leaves = vr.build_profile_modstate(profile_id, folder)
+            add("profile_modstate", base, leaves)
+            plan.mod_count += 1
+            plan.profile_enables += 1
+            archive_id_by_folder[folder] = dl_id
+            if md5:
+                folder_by_md5[md5.lower()] = folder
+            lf = (s.get("logicalFilename") or mod_data.get("name") or "").lower()
+            if lf:
+                folder_by_logical[lf] = folder
+        else:
+            # A staging folder with no matching collection nexus entry (the user's
+            # own mods, manual installs). Bare record -- identical to Vortex's own
+            # stub -- so refreshMods sees parity and never re-stubs it.
+            base, leaves = vr.build_orphan_mod(folder, install_time=install_time_iso)
+            plan.records.update(vr.to_absolute(base, leaves))
+            base, leaves = vr.build_profile_modstate(profile_id, folder)
+            add("profile_modstate", base, leaves)
+            plan.orphan_count += 1
+            plan.profile_enables += 1
         recorded.add(folder)
-        # Index this mod for modRule resolution (md5 + logical name -> its folder).
-        archive_id_by_folder[folder] = dl_id
-        if s.get("md5"):
-            folder_by_md5[s["md5"].lower()] = folder
-        lf = (s.get("logicalFilename") or mod.get("name") or "").lower()
-        if lf:
-            folder_by_logical[lf] = folder
-        plan.mod_count += 1
-        plan.profile_enables += 1
 
     # Phase 1b: translate the collection's modRules into per-mod conflict rules.
     # Vortex resolves file conflicts from each mod's own `rules` array; without
@@ -321,21 +315,21 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
         s = mod.get("source", {})
         if s.get("type") != "nexus" or not s.get("modId"):
             continue
-        archive = _match_archive(downloads_by_modid.get(str(s["modId"]), []), mod, sizes) or ""
+        archive = archive_by_modid.get(str(s["modId"]), "")
         rules.append(vr.build_collection_rule(mod, archive))
     plan.rule_count = len(rules)
 
+    # The collection's own download (so Vortex reads collection identity from
+    # downloads.files[archiveId].modInfo.nexus.ids). Stable id per revision; always
+    # (re)written -- idempotent on re-Link.
     coll_archive = collection_folder + ".7z"
-    coll_dl_id = existing_dl_by_path.get(coll_archive) or _gen_id(f"coll-{revision_id}")
-    if coll_archive not in existing_dl_by_path:
-        # Register the collection's own download so Vortex can read the collection
-        # identity from downloads.files[archiveId].modInfo.nexus.ids (the linkup).
-        base, leaves = vr.build_collection_download(
-            info, coll_archive, coll_dl_id, collection_id=collection_id, slug=slug,
-            revision_id=revision_id, revision_number=revision_number,
-            folder=collection_folder)
-        plan.records.update(vr.to_absolute(base, leaves))   # download record (no member schema)
-        plan.new_downloads += 1
+    coll_dl_id = _gen_id(f"coll-{revision_id}")
+    base, leaves = vr.build_collection_download(
+        info, coll_archive, coll_dl_id, collection_id=collection_id, slug=slug,
+        revision_id=revision_id, revision_number=revision_number,
+        folder=collection_folder)
+    plan.records.update(vr.to_absolute(base, leaves))   # download record (no member schema)
+    plan.new_downloads += 1
 
     base, leaves = vr.build_collection_mod(info, collection_folder, coll_dl_id, rules,
                                            revision_id, revision_number, collection_id, slug,
@@ -348,21 +342,6 @@ def build_plan(collection: Dict[str, Any], *, downloads_by_modid: Dict[str, List
     base, leaves = vr.build_collection_revision(info, collection.get("mods", []),
                                                 revision_id, revision_number, collection_id, slug)
     plan.records.update(vr.to_absolute(base, leaves))   # manifest has no record schema
-
-    # Phase 3: bare records for staging folders that aren't collection members
-    # (old versions, manually-added mods, duplicates) so refreshMods sees parity.
-    for folder in (all_folders or []):
-        if folder in recorded or folder.startswith("__vortex"):
-            continue
-        # Orphans are intentionally bare (no modId/source) -- identical to the stub
-        # Vortex itself writes -- so they're schema-exempt; don't validate as "mod".
-        base, leaves = vr.build_orphan_mod(folder, install_time=install_time_iso)
-        plan.records.update(vr.to_absolute(base, leaves))
-        base, leaves = vr.build_profile_modstate(profile_id, folder)
-        add("profile_modstate", base, leaves)
-        recorded.add(folder)
-        plan.orphan_count += 1
-        plan.profile_enables += 1
 
     return plan
 
@@ -440,7 +419,7 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     """
     import json
     import time
-    from utils import vortex_db
+    from utils import vortex_db, local_state, state_reconcile
 
     install_ms = int(time.time() * 1000)
     install_time_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
@@ -448,26 +427,21 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     with open(collection_path, "r", encoding="utf-8") as fh:
         collection = json.load(fh)
 
-    downloads = index_by_modid(os.listdir(downloads_dir), archives_only=True)
-    # Exact byte size per archive basename, so build_plan can disambiguate
-    # shared-modId files by fileSize (the way Vortex matches) instead of name.
-    archive_sizes: Dict[str, int] = {}
-    for names in downloads.values():
-        for name in names:
-            try:
-                archive_sizes[name] = os.path.getsize(os.path.join(downloads_dir, name))
-            except OSError:
-                pass
-    all_folders = [d for d in os.listdir(staging_dir)
-                   if os.path.isdir(os.path.join(staging_dir, d))]
-    folders = index_by_modid(all_folders)
     collection_folder = os.path.basename(os.path.dirname(collection_path))
     revision_id, revision_number = parse_revision_from_folder(collection_folder)
 
-    # existing downloads localPath -> id
-    raw_dl = vortex_db.read_prefix(db_path, "persistent###downloads###files###", node=node)
-    existing_dl_by_path = {v: k.split("###")[3] for k, v in raw_dl.items()
-                           if k.endswith("###localPath")}
+    # The ledger is the authoritative source for what's installed. Self-heal an
+    # empty one (first run / fresh checkout) with a quick disk reconcile -- no
+    # hashing needed here; Link only needs identity, not the integrity baseline.
+    state = local_state.LocalState(local_state.db_path_for(staging_dir))
+    try:
+        ledger_mods = state.all_mods_with_download()
+        if not ledger_mods:
+            state_reconcile.reconcile(staging_dir, downloads_dir, collection_path,
+                                      do_hash=False, log=lambda *_: None)
+            ledger_mods = state.all_mods_with_download()
+    finally:
+        state.close()
 
     # drift assessment against the target Vortex version
     app = vortex_db.read_prefix(db_path, "app###appVersion", node=node)
@@ -475,12 +449,10 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     risk = assess_risk(target_version,
                        _sample_live_records(vortex_db.read_prefix, db_path))
 
-    plan = build_plan(collection, downloads_by_modid=downloads, folders_by_modid=folders,
-                      existing_dl_by_path=existing_dl_by_path, profile_id=profile_id,
+    plan = build_plan(collection, ledger_mods=ledger_mods, profile_id=profile_id,
                       collection_folder=collection_folder, collection_id=collection_id,
                       slug=slug, revision_id=revision_id, revision_number=revision_number,
-                      install_time_iso=install_time_iso, install_ms=install_ms,
-                      all_folders=all_folders, archive_sizes=archive_sizes)
+                      install_time_iso=install_time_iso, install_ms=install_ms)
 
     if not apply:
         return SyncResult(False, plan, risk, message="dry-run")

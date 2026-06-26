@@ -102,6 +102,11 @@ RECORD_SCHEMAS: Dict[str, RecordSchema] = {
             "attributes.installTime": "str", "attributes.isPrimary": "bool",
             # 2.0.x additions
             "attributes.installedAsDependency": "bool", "attributes.variant": "str",
+            # FOMOD choices Vortex's InstallDriver stamps on the mod (the `options`
+            # list flattens to one JSON leaf; `type` is "fomod"). Legitimate mod
+            # attributes -- whitelist them so a collection with FOMOD mods validates.
+            "attributes.installerChoices.type": "str",
+            "attributes.installerChoices.options": "array",
             # collection-only attributes (present when type == "collection")
             "attributes.collectionId": "int", "attributes.collectionSlug": "str",
             "attributes.revisionId": "int", "attributes.revisionNumber": "int",
