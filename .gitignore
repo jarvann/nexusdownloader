@@ -207,3 +207,6 @@ nul
 
 # Node deps for the Vortex DB bridge (vortex_leveldb.js / vortex_sync.js are tracked)
 node_modules/
+
+# Windows Mark-of-the-Web alternate-data-stream artifacts
+*:Zone.Identifier
