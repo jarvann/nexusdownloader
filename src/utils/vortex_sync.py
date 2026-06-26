@@ -430,16 +430,14 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     collection_folder = os.path.basename(os.path.dirname(collection_path))
     revision_id, revision_number = parse_revision_from_folder(collection_folder)
 
-    # The ledger is the authoritative source for what's installed. Self-heal an
-    # empty one (first run / fresh checkout) with a quick disk reconcile -- no
-    # hashing needed here; Link only needs identity, not the integrity baseline.
+    # Refresh the download+mod identity from disk before projecting. This is the
+    # FAST reconcile (no file walk / hashing -- Link only needs identity), cheap
+    # enough to run every Link so newly-installed mods are always picked up.
+    state_reconcile.reconcile_mods(staging_dir, downloads_dir, collection_path,
+                                   log=lambda *_: None)
     state = local_state.LocalState(local_state.db_path_for(staging_dir))
     try:
         ledger_mods = state.all_mods_with_download()
-        if not ledger_mods:
-            state_reconcile.reconcile(staging_dir, downloads_dir, collection_path,
-                                      do_hash=False, log=lambda *_: None)
-            ledger_mods = state.all_mods_with_download()
     finally:
         state.close()
 

@@ -354,6 +354,14 @@ class LocalState:
             return _row_to_dict(c.execute(
                 "SELECT * FROM downloads WHERE local_path=?", (local_path,)).fetchone())
 
+    def download_ids_by_path(self) -> Dict[str, str]:
+        """All recorded local_path -> id, so a reconcile keeps a download's id
+        stable across runs (avoids a local_path UNIQUE conflict when the id source
+        changes, e.g. Vortex closed vs open)."""
+        with self._connect() as c:
+            return {r["local_path"]: r["id"] for r in
+                    c.execute("SELECT id, local_path FROM downloads").fetchall()}
+
     # -- mods ----------------------------------------------------------------- #
     def upsert_mod(self, folder: str, download_id: Optional[str], variant: str = "",
                    installer_choices: Optional[dict] = None,

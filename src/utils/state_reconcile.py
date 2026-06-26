@@ -96,9 +96,13 @@ def _match_collection_mod(cands: List[dict], archive: str,
 
 def _ensure_download(st: "ls.LocalState", archive: str, mod_data: Optional[dict],
                      collection_id: Optional[int], vortex_ids: Dict[str, str],
-                     archive_sizes: Dict[str, int], written: set) -> str:
+                     archive_sizes: Dict[str, int], written: set,
+                     existing_ids: Dict[str, str]) -> str:
     s = (mod_data or {}).get("source") or {}
-    dl_id = vortex_ids.get(archive)
+    # Stable id: a previously-recorded id for this file wins (so re-runs don't flip
+    # it and trip the local_path UNIQUE), then Vortex's archiveId, then a
+    # deterministic gen from modId-fileId.
+    dl_id = existing_ids.get(archive) or vortex_ids.get(archive)
     if not dl_id:
         dl_id = (_gen_id(f"{s['modId']}-{s['fileId']}")
                  if s.get("modId") and s.get("fileId") else _gen_id(archive))
@@ -130,16 +134,18 @@ def find_collection_json(staging_dir: str) -> Optional[str]:
     return max(cands, key=os.path.getmtime) if cands else None
 
 
-def reconcile(staging_dir: str, downloads_dir: str, collection_path: str, *,
-              do_hash: bool = True, workers: int = 16, resume: bool = False,
-              log: Callable[[str], None] = print) -> Dict[str, int]:
-    """Build/refresh the ledger from disk. Returns summary counts."""
+def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *,
+                   log: Callable[[str], None] = print) -> Dict[str, int]:
+    """FAST pass: refresh the download + mod identity from disk (no file walk, no
+    hashing). This is all Link needs, so :func:`utils.vortex_sync.run` calls it on
+    every Link to keep the ledger current after new installs -- cheap enough to
+    run unconditionally (listdir + matching, no per-file stat)."""
     collection = json.load(open(collection_path, encoding="utf-8"))
     info = collection.get("info", {})
     coll_name = info.get("name", os.path.basename(os.path.dirname(collection_path)))
 
     all_archives = [n for n in os.listdir(downloads_dir) if ARCHIVE_RE.search(n)]
-    archive_sizes: Dict[str, int] = {}
+    archive_sizes = {}
     for n in all_archives:
         try:
             archive_sizes[n] = os.path.getsize(os.path.join(downloads_dir, n))
@@ -164,51 +170,64 @@ def reconcile(staging_dir: str, downloads_dir: str, collection_path: str, *,
         rev_id, rev_no = _parse_revision(os.path.basename(os.path.dirname(collection_path)))
         cid = _collection_id(collection)
         st.upsert_collection(cid or 0, info.get("domainName", "") or "", coll_name, rev_id, rev_no)
-
-        already = set()
-        if resume:
-            already = {m["folder"] for m in st.all_mods()
-                       if m["verified"] and (m["file_count"] or 0) > 0}
-            if already:
-                log(f"resume: skipping {len(already)} already-verified mods")
-
-        written, plans, matched, orphan = set(), [], 0, 0
+        existing_ids = st.download_ids_by_path()   # keep ids stable across re-runs
+        written, matched, orphan = set(), 0, 0
         for folder in staging_folders:
-            if folder in already:
-                continue
             archive = folder_to_archive.get(folder)
             mod_data = dl_id = None
             if archive:
                 cands = mods_by_modid.get(_modid_of(archive) or "", [])
                 mod_data = _match_collection_mod(cands, archive, archive_sizes.get(archive))
                 dl_id = _ensure_download(st, archive, mod_data, cid, vortex_dl_ids,
-                                         archive_sizes, written)
+                                         archive_sizes, written, existing_ids)
                 matched += 1
             else:
                 orphan += 1
             st.upsert_mod(folder, dl_id, variant=coll_name,
                           installer_choices=(mod_data or {}).get("choices"),
-                          file_count=0, verified=False, state="installed")
-            plans.append((folder, os.path.join(staging_dir, folder)))
+                          state="installed")
         st.flush()
-        log(f"mods recorded: {len(plans)} (matched: {matched}, orphan: {orphan})")
+        log(f"mods recorded: {len(staging_folders)} (matched: {matched}, orphan: {orphan})")
+        return {"mods": len(staging_folders), "matched": matched, "orphan": orphan}
+    finally:
+        st.close()
 
-        t0 = time.time()
-        total = [0]
 
-        def do_folder(item):
-            folder, folder_abs = item
+def reconcile_files(staging_dir: str, *, do_hash: bool = True, workers: int = 16,
+                    resume: bool = False, log: Callable[[str], None] = print) -> Dict[str, int]:
+    """SLOW pass: walk (and optionally md5-hash) every staged file to lay/refresh
+    the integrity baseline. Operates on the mods already recorded by
+    :func:`reconcile_mods`."""
+    st = ls.LocalState(ls.db_path_for(staging_dir))
+    try:
+        folders = [m["folder"] for m in st.all_mods()
+                   if not (resume and m["verified"] and (m["file_count"] or 0) > 0)]
+        log(f"{'hashing' if do_hash else 'walking'} files for {len(folders)} mods "
+            f"({workers} workers)...")
+        t0, total = time.time(), [0]
+
+        def do_folder(folder):
+            folder_abs = os.path.join(staging_dir, folder)
             rows = _walk_mod_files(folder_abs, do_hash)
             st.replace_mod_files(folder, rows)
             st.set_mod_verified(folder, verified=bool(rows), file_count=len(rows))
             total[0] += len(rows)
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for i, _ in enumerate(ex.map(do_folder, plans), 1):
+            for i, _ in enumerate(ex.map(do_folder, folders), 1):
                 if i % 500 == 0:
-                    log(f"   {i}/{len(plans)} mods, {total[0]:,} files, {time.time()-t0:.0f}s")
+                    log(f"   {i}/{len(folders)} mods, {total[0]:,} files, {time.time()-t0:.0f}s")
         st.flush()
-        log(f"done: {len(plans)} mods, {total[0]:,} files in {time.time()-t0:.0f}s")
-        return {"mods": len(plans), "files": total[0], "matched": matched, "orphan": orphan}
+        log(f"done: {len(folders)} mods, {total[0]:,} files in {time.time()-t0:.0f}s")
+        return {"mods": len(folders), "files": total[0]}
     finally:
         st.close()
+
+
+def reconcile(staging_dir: str, downloads_dir: str, collection_path: str, *,
+              do_hash: bool = True, workers: int = 16, resume: bool = False,
+              log: Callable[[str], None] = print) -> Dict[str, int]:
+    """Full bootstrap: identity refresh (fast) + integrity baseline (slow)."""
+    m = reconcile_mods(staging_dir, downloads_dir, collection_path, log=log)
+    f = reconcile_files(staging_dir, do_hash=do_hash, workers=workers, resume=resume, log=log)
+    return {**m, **f}
