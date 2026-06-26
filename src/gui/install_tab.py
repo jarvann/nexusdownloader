@@ -443,6 +443,27 @@ class InstallTab(QWidget):
         
         layout.addWidget(options_group)
 
+        # One-click pipeline: Install -> Baseline -> Link -> Deploy/Finalize.
+        oneclick = QGroupBox("One-Click Setup")
+        oc = QVBoxLayout(oneclick)
+        self.oc_install = QCheckBox("Install"); self.oc_install.setChecked(True)
+        self.oc_baseline = QCheckBox("Checksum baseline (slow)")
+        self.oc_link = QCheckBox("Link to Vortex"); self.oc_link.setChecked(True)
+        self.oc_deploy = QCheckBox("Deploy + finalize"); self.oc_deploy.setChecked(True)
+        self.oc_force = QCheckBox("Force (override Vortex version/schema warnings)")
+        ocrow = QHBoxLayout()
+        for cb in (self.oc_install, self.oc_baseline, self.oc_link, self.oc_deploy, self.oc_force):
+            ocrow.addWidget(cb)
+        ocrow.addStretch(1)
+        oc.addLayout(ocrow)
+        self.oneclick_btn = QPushButton("▶  Run Everything  (Install → Link → Deploy)")
+        self.oneclick_btn.setStyleSheet("QPushButton { font-weight: bold; padding: 8px; }")
+        self.oneclick_btn.clicked.connect(self.run_pipeline)
+        oc.addWidget(self.oneclick_btn)
+        self.oc_status = QLabel("")
+        oc.addWidget(self.oc_status)
+        layout.addWidget(oneclick)
+
         # Local-state / integrity panel: build the checksum baseline, verify
         # staging against it, and repair broken mods from their source download.
         from gui.ledger_panel import LedgerPanel
@@ -709,6 +730,92 @@ class InstallTab(QWidget):
         self.log_message("ERROR", f"Vortex sync failed: {msg}")
         QMessageBox.critical(self, "Vortex sync failed", msg)
 
+    def _install_temp_root(self) -> str:
+        """The optional install-temp override (blank = system %TEMP%), read fresh
+        from src/config.json so a value saved this session is picked up without a
+        restart. Shared by the normal install and the one-click pipeline."""
+        try:
+            return (self._load_config().get("downloads") or {}).get("install_temp_dir") or ""
+        except Exception as e:
+            self.log_message("DEBUG", f"Could not read install_temp_dir from config: {e}")
+            return ""
+
+    # ----- One-click pipeline ------------------------------------------------ #
+    def run_pipeline(self):
+        """Run the whole flow (Install -> Baseline -> Link -> Deploy) in order."""
+        if getattr(self, "_pipeline", None) and self._pipeline.isRunning():
+            return
+        from gui.session_paths import session_paths
+        from gui.pipeline import PipelineWorker
+        s = session_paths()
+        paths = {
+            "collection": self.collection_path or s.collection,
+            "downloads": self.downloads_path or s.downloads,
+            "staging": self.game_path or s.staging,
+            "game_data": s.game_data,
+            "localappdata": s.localappdata,
+        }
+        need = [k for k in ("collection", "downloads", "staging") if not paths[k]]
+        if self.oc_deploy.isChecked() and not paths["game_data"]:
+            need.append("game_data")
+        if need:
+            QMessageBox.information(
+                self, "Paths needed",
+                "Set these first (Game/Collection header + Deploy tab): "
+                + ", ".join(need))
+            return
+        steps = []
+        if self.oc_install.isChecked(): steps.append("Install")
+        if self.oc_baseline.isChecked(): steps.append("Checksum baseline")
+        if self.oc_link.isChecked(): steps.append("Link")
+        if self.oc_deploy.isChecked(): steps.append("Deploy")
+        if QMessageBox.question(
+                self, "Run Everything",
+                "Run, in order:\n  • " + "\n  • ".join(steps) +
+                "\n\nLink/Deploy need Vortex CLOSED — the run will wait if it's open.\n"
+                "Continue?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        self.oneclick_btn.setEnabled(False)
+        self.start_install_btn.setEnabled(False)
+        self.log_message("INFO", "One-click pipeline started.")
+        self._pipeline = PipelineWorker(
+            paths, workers=self.max_workers_spinbox.value(),
+            temp_root=self._install_temp_root(),
+            force=self.oc_force.isChecked(),
+            do_install=self.oc_install.isChecked(),
+            do_baseline=self.oc_baseline.isChecked(),
+            do_link=self.oc_link.isChecked(),
+            do_deploy=self.oc_deploy.isChecked())
+        self._pipeline.phase.connect(self._pipe_phase)
+        self._pipeline.progress.connect(self.update_progress)
+        self._pipeline.log.connect(self.log_message)
+        self._pipeline.waiting_vortex.connect(self._pipe_waiting)
+        self._pipeline.failed.connect(self._pipe_failed)
+        self._pipeline.finished_ok.connect(self._pipe_done)
+        self._pipeline.start()
+
+    def _pipe_phase(self, label, idx, total):
+        self.oc_status.setText(f"Phase {idx}/{total}: {label}…")
+
+    def _pipe_waiting(self, waiting):
+        if waiting:
+            self.oc_status.setText("⏳ Waiting for you to CLOSE Vortex…")
+
+    def _pipe_failed(self, phase, msg):
+        self.oneclick_btn.setEnabled(True)
+        self.start_install_btn.setEnabled(True)
+        self.oc_status.setText(f"✗ Failed at: {phase}")
+        QMessageBox.warning(self, f"Pipeline stopped — {phase}", msg)
+
+    def _pipe_done(self, summary):
+        self.oneclick_btn.setEnabled(True)
+        self.start_install_btn.setEnabled(True)
+        self.oc_status.setText("✓ Done.")
+        if hasattr(self, "ledger_panel"):
+            self.ledger_panel.refresh_status()
+        QMessageBox.information(self, "All done", summary or "Pipeline complete.")
+
     def start_installation(self):
         """Start the installation process."""
         # Log debug information
@@ -768,14 +875,7 @@ class InstallTab(QWidget):
         self.log_message("DEBUG", f"Paths - downloads: {self.downloads_path}")
         self.log_message("DEBUG", f"Paths - staging: {self.game_path}")
         
-        # Pull the optional install-temp override (blank = system %TEMP%). Read it
-        # fresh from src/config.json -- the same file the Settings dialog writes to --
-        # so a value just saved this session is picked up without a restart.
-        temp_root = ""
-        try:
-            temp_root = (self._load_config().get("downloads") or {}).get("install_temp_dir") or ""
-        except Exception as e:
-            self.log_message("DEBUG", f"Could not read install_temp_dir from config: {e}")
+        temp_root = self._install_temp_root()
         if temp_root:
             self.log_message("INFO", f"Using override install temp dir: {temp_root}")
 
