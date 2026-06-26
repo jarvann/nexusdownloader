@@ -11,9 +11,11 @@ write the truth when we know it (download time, install time) and everything
 downstream (Link/Deploy/skip-check/integrity) reads it instead of guessing.
 
 Design:
-- One SQLite DB per game, co-located at ``<staging>/.nxd/state.db`` (WAL mode so
-  many readers + one writer work across the parallel installer AND across
-  processes -- GUI, reconcile, CLI).
+- One SQLite DB per game, stored in the app data dir (``%APPDATA%/NexusDownloader``
+  / ``~/.local/share/nexusdownloader``), NOT inside Vortex's staging root -- so
+  Vortex's mod scan never mistakes it for a mod. WAL mode so many readers + one
+  writer work across the parallel installer AND across processes (GUI, reconcile,
+  CLI).
 - All WRITES funnel through a single background writer thread (one queue), which
   both satisfies SQLite's single-writer rule under the 48-thread installer and
   lets us batch inserts. READS use short-lived per-call connections (WAL allows
@@ -42,14 +44,17 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 1
-DB_DIRNAME = ".nxd"
 DB_FILENAME = "state.db"
+# App-owned data dir name (the ledger must NOT live inside Vortex's staging root,
+# or Vortex's folder scan treats it as a mod and our own reconcile walks it).
+APP_DIRNAME = "NexusDownloader"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -148,9 +153,45 @@ CREATE INDEX IF NOT EXISTS ix_log_mod ON logs(mod_folder);
 # --------------------------------------------------------------------------- #
 # Path + hashing helpers
 # --------------------------------------------------------------------------- #
+def app_data_dir() -> str:
+    """Return the app-owned data directory (created if missing).
+
+    The ledger lives here -- NOT inside Vortex's staging root -- so Vortex's mod
+    scan never sees it. Honours an explicit ``NEXUSDOWNLOADER_DATA_DIR`` override,
+    then the OS convention: ``%APPDATA%\\NexusDownloader`` on Windows,
+    ``$XDG_DATA_HOME/nexusdownloader`` (or ``~/.local/share/...``) elsewhere.
+    """
+    override = os.environ.get("NEXUSDOWNLOADER_DATA_DIR")
+    if override:
+        base = override
+    elif os.name == "nt":
+        base = os.path.join(os.environ.get("APPDATA")
+                            or os.path.join(os.path.expanduser("~"), "AppData", "Roaming"),
+                            APP_DIRNAME)
+    else:
+        base = os.path.join(os.environ.get("XDG_DATA_HOME")
+                            or os.path.join(os.path.expanduser("~"), ".local", "share"),
+                            APP_DIRNAME.lower())
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
 def db_path_for(staging_dir: str) -> str:
-    """Return the per-game DB path co-located with the staging folder."""
-    return os.path.join(staging_dir, DB_DIRNAME, DB_FILENAME)
+    """Return the ledger DB path for a given staging folder.
+
+    One DB per staging root, stored in the app data dir (never inside staging).
+    The filename is derived deterministically from the absolute, case-normalised
+    staging path -- so every process (GUI, reconcile, CLI, the parallel installer)
+    resolves the same file for the same game, while distinct games/instances stay
+    isolated. A readable prefix (the staging basename) plus a short hash keeps the
+    name both human-recognisable and collision-free.
+    """
+    norm = os.path.normcase(os.path.abspath(staging_dir))
+    digest = hashlib.md5(norm.encode("utf-8")).hexdigest()[:12]
+    prefix = re.sub(r"[^A-Za-z0-9_-]", "_", os.path.basename(norm.rstrip("\\/"))) or "staging"
+    ledgers = os.path.join(app_data_dir(), "ledgers")
+    os.makedirs(ledgers, exist_ok=True)
+    return os.path.join(ledgers, f"{prefix}-{digest}-{DB_FILENAME}")
 
 
 def hash_file(path: str, _bufsize: int = 1024 * 1024) -> Optional[str]:
@@ -650,7 +691,7 @@ def _main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Inspect the NexusDownloader ledger")
     ap.add_argument("--db", help="path to state.db (or pass --staging)")
-    ap.add_argument("--staging", help="staging dir (derives <staging>/.nxd/state.db)")
+    ap.add_argument("--staging", help="staging dir (derives the app-data ledger path)")
     ap.add_argument("--dump", action="store_true", help="summary counts")
     ap.add_argument("--logs", action="store_true", help="recent log rows")
     ap.add_argument("--operation"); ap.add_argument("--level")
