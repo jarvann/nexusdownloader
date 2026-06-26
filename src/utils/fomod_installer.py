@@ -7,6 +7,7 @@ based on collection.json instructions, mimicking Vortex behavior.
 
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import logging
@@ -108,6 +109,86 @@ class FomodInstaller:
         self._space_cond = threading.Condition()
         self._temp_min_headroom = 1 * 1024 ** 3   # always keep >= 1 GiB free
         self._temp_safety_factor = 3              # extracted size ~= 3x compressed
+
+        # Decide how files get placed temp -> staging (see _init_placement).
+        self._init_placement()
+
+    # --------------------------------------------------------------------- #
+    # File placement strategy (temp extraction -> staging)
+    # --------------------------------------------------------------------- #
+    def _init_placement(self) -> None:
+        """Pick the fastest SAFE way to move extracted files into staging:
+
+          * 'hardlink' — temp and staging are on the SAME volume: link instead of
+            copy. A metadata op (instant, zero bytes moved); the file is "written"
+            the moment 7-Zip wrote it to temp. Temp cleanup just drops the link.
+          * 'robocopy' — different volumes, Windows, robocopy present: copy the
+            extracted tree with robocopy /MT (multi-threaded). Install concurrency
+            is capped so workers x robocopy-threads can't swamp the machine.
+          * 'copy'     — anything else: the original per-file shutil.copy2.
+
+        Every path still falls back to copy2 per-file on error, so a wrong guess
+        can never break an install -- it only loses the speedup.
+        """
+        self._robocopy_mt = 0
+        try:
+            staging_dev = os.stat(self.staging_path).st_dev
+            temp_probe = str(self._temp_root) if self._temp_root else str(self.temp_dir)
+            temp_dev = os.stat(temp_probe).st_dev
+        except OSError:
+            staging_dev, temp_dev = 0, 1            # assume different -> safe path
+
+        if staging_dev == temp_dev:
+            self._placement_mode = "hardlink"
+        elif os.name == "nt" and shutil.which("robocopy"):
+            self._placement_mode = "robocopy"
+            # Cap parallelism: robocopy /MT:K per mod x N workers = N*K threads.
+            # Keep the product near 2x CPU so a cross-disk copy can't thrash.
+            cpus = os.cpu_count() or 4
+            self._robocopy_mt = max(2, min(8, cpus))
+        else:
+            self._placement_mode = "copy"
+        self.logger.info(f"File placement mode: {self._placement_mode}"
+                         + (f" (robocopy /MT:{self._robocopy_mt})" if self._robocopy_mt else ""))
+
+    def placement_worker_cap(self, requested: int) -> int:
+        """Safe install-worker count for the chosen placement mode.
+
+        For robocopy each worker may spawn /MT:K threads, so cap workers so
+        workers*K stays near 2x CPU. hardlink/copy are unaffected.
+        """
+        if self._placement_mode == "robocopy" and self._robocopy_mt:
+            cpus = os.cpu_count() or 4
+            safe = max(2, (2 * cpus) // self._robocopy_mt)
+            return max(2, min(requested, safe))
+        return requested
+
+    def _hardlink_or_copy(self, src_ext: str, dst_ext: str) -> None:
+        """Hardlink src->dst; if the link can't be made (cross-device slipped
+        through, FS without links, existing dst), fall back to a real copy."""
+        try:
+            if os.path.exists(dst_ext):
+                os.remove(dst_ext)                  # os.link won't overwrite
+            os.link(src_ext, dst_ext)
+        except OSError:
+            shutil.copy2(src_ext, dst_ext)
+
+    def _robocopy_tree(self, src_dir: Path, dst_dir: Path) -> bool:
+        """Multi-threaded cross-volume copy of a whole tree via robocopy /MT.
+
+        robocopy exit codes 0-7 are success (8+ are real errors); the quiet flags
+        suppress its per-file output. Returns False so the caller can fall back to
+        the per-file copy if robocopy isn't usable for this tree.
+        """
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            cmd = ["robocopy", str(src_dir), str(dst_dir), "/E",
+                   f"/MT:{self._robocopy_mt or 8}", "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/R:1", "/W:1"]
+            rc = subprocess.run(cmd, capture_output=True, text=True).returncode
+            return rc < 8
+        except (OSError, subprocess.SubprocessError) as e:
+            self.logger.warning(f"robocopy failed ({e}); falling back to per-file copy")
+            return False
 
     def _resolve_temp_root(self, temp_root: Optional[str]) -> Optional[str]:
         """Validate/create the temp override; also point child extractors at it.
@@ -467,10 +548,15 @@ class FomodInstaller:
             return ("\\\\?\\UNC\\" + ap[2:]) if ap.startswith("\\\\") else ("\\\\?\\" + ap)
         try:
             os.makedirs(ext(dst.parent), exist_ok=True)
-            shutil.copy2(ext(src), ext(dst))
+            if self._placement_mode == "hardlink":
+                # Same volume: link instead of copy (instant, zero bytes moved).
+                # Falls back to copy2 internally if the link can't be made.
+                self._hardlink_or_copy(ext(src), ext(dst))
+            else:
+                shutil.copy2(ext(src), ext(dst))
             return True
         except (OSError, FileNotFoundError) as e:
-            self.logger.warning(f"Failed to copy (even with long-path prefix) {dst}: {e}")
+            self.logger.warning(f"Failed to place (even with long-path prefix) {dst}: {e}")
             return False
 
     def _install_simple(self, mod_name: str, archive_path: Path, mod_data: Dict[str, Any] = None) -> InstallationResult:
@@ -517,18 +603,37 @@ class FomodInstaller:
                     self._release_temp_space()
                     raise  # Re-raise other extraction errors (including BCJ2 with helpful message from archive handler)
 
-            # Copy files to install location with smart path detection
+            # Place files into staging with smart path detection.
             installed_files = []
             root_path = self._find_mod_root(temp_extract)
-            
-            for item in root_path.rglob("*"):
-                if item.is_file():
-                    # Skip FOMOD files and metadata
-                    rel_path = item.relative_to(root_path)
-                    if not self._should_skip_file(rel_path):
-                        dest_path = mod_install_path / rel_path
-                        if self._copy_long(item, dest_path):
-                            installed_files.append(dest_path)
+
+            # Cross-volume + robocopy available: copy the whole tree multi-threaded
+            # in one shot, then drop the few skip-pattern files. (Hardlink/copy
+            # modes use the per-file path below; robocopy falls back to it too if
+            # the tree copy didn't succeed.)
+            placed_by_robocopy = False
+            if self._placement_mode == "robocopy" and self._robocopy_tree(root_path, mod_install_path):
+                placed_by_robocopy = True
+                for item in mod_install_path.rglob("*"):
+                    if item.is_file():
+                        rel_path = item.relative_to(mod_install_path)
+                        if self._should_skip_file(rel_path):
+                            try:
+                                item.unlink()
+                            except OSError:
+                                pass
+                        else:
+                            installed_files.append(item)
+
+            if not placed_by_robocopy:
+                for item in root_path.rglob("*"):
+                    if item.is_file():
+                        # Skip FOMOD files and metadata
+                        rel_path = item.relative_to(root_path)
+                        if not self._should_skip_file(rel_path):
+                            dest_path = mod_install_path / rel_path
+                            if self._copy_long(item, dest_path):
+                                installed_files.append(dest_path)
             
             # Clean up temp extraction immediately after copying
             if temp_extract and temp_extract.exists():
@@ -1566,9 +1671,20 @@ class ParallelFomodInstaller(FomodInstaller):
             self._thread_temp_dirs.clear()
             
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - cleanup all temp directories."""
-        super().__exit__(exc_type, exc_val, exc_tb)
+        """Context manager exit - explicit, logged purge of ALL temp scratch.
+
+        Removes the per-thread temp dirs and then the whole temp root. When files
+        were hardlinked into staging this is near-instant (only the temp directory
+        entries are dropped; the data persists via the staging links). Never
+        raises -- a temp-cleanup hiccup must not fail the install.
+        """
         self._cleanup_thread_temp_dirs()
+        try:
+            if self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+                self.logger.info(f"Purged install temp scratch: {self.temp_dir}")
+        except Exception as e:
+            self.logger.warning(f"Temp purge issue (ignored): {e}")
         
     def _install_mod_thread_safe(self, mod_data: Dict[str, Any], downloads_path: Union[str, Path]) -> InstallationResult:
         """Thread-safe version of install_mod that uses per-thread temp directories."""
@@ -1594,7 +1710,7 @@ class ParallelFomodInstaller(FomodInstaller):
                 with self._progress_lock:
                     self._completed_count += 1
                     if self._progress_callback:
-                        self._progress_callback(self._completed_count, self._total_count, mod_name)
+                        self._progress_callback(min(self._completed_count, self._total_count), self._total_count, mod_name)
                     if self._installation_callback:
                         self._installation_callback(mod_name, True, "Already installed, skipped", 0)
 
@@ -1651,7 +1767,7 @@ class ParallelFomodInstaller(FomodInstaller):
             with self._progress_lock:
                 self._completed_count += 1
                 if self._progress_callback:
-                    self._progress_callback(self._completed_count, self._total_count, mod_name)
+                    self._progress_callback(min(self._completed_count, self._total_count), self._total_count, mod_name)
                 if self._installation_callback:
                     success = result.status in [InstallResult.SUCCESS, InstallResult.SKIPPED]
                     file_count = len(result.installed_files)
@@ -1676,7 +1792,7 @@ class ParallelFomodInstaller(FomodInstaller):
             with self._progress_lock:
                 self._completed_count += 1
                 if self._progress_callback:
-                    self._progress_callback(self._completed_count, self._total_count, mod_name)
+                    self._progress_callback(min(self._completed_count, self._total_count), self._total_count, mod_name)
                 if self._installation_callback:
                     self._installation_callback(mod_name, False, error_msg)
                     
@@ -1761,6 +1877,20 @@ class ParallelFomodInstaller(FomodInstaller):
             mods = available_mods
             self._total_count = len(mods)
         
+        # Make the progress total EXACT: whatever's already counted (installed +
+        # any missing-marked) plus the mods we're about to attempt, each of which
+        # increments exactly once. This stops the numerator overshooting the
+        # denominator (the old "4950/4949").
+        self._total_count = self._completed_count + len(mods)
+
+        # In robocopy placement mode, cap concurrency so workers x /MT threads
+        # can't swamp a cross-disk copy (no effect for hardlink/copy modes).
+        capped = self.placement_worker_cap(self.max_workers)
+        if capped != self.max_workers:
+            self.logger.info(f"Capping install concurrency {self.max_workers} -> {capped} "
+                             f"for robocopy placement")
+            self.set_concurrency(capped)
+
         self.logger.info(f"Installing collection with {len(mods)} mods using {self.max_workers} threads")
 
         # Size the pool to the upper bound; the limiter gates actual concurrency
