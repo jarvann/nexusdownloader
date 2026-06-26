@@ -48,7 +48,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 4
 DB_FILENAME = "state.db"

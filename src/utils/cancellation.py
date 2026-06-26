@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import signal
 import threading
-from typing import Callable, List, Optional
+from typing import Callable, List
 
 
 class OperationCancelled(Exception):

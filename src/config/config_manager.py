@@ -8,7 +8,7 @@ import os
 import json
 import threading
 from pathlib import Path
-from typing import Dict, Any, Callable, Optional, List, Union
+from typing import Dict, Any, Callable, Optional, List
 from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
@@ -127,7 +127,6 @@ class AppConfig:
 
 class ConfigurationError(Exception):
     """Custom exception for configuration errors"""
-    pass
 
 
 class ConfigManager:
@@ -299,7 +298,6 @@ class ConfigManager:
         """Migrate from version 1.0 to 1.1"""
         # Add any version-specific migration logic here
         # For example, new fields, changed defaults, etc.
-        pass
     
     def _backup_corrupted_config(self):
         """Create backup of corrupted configuration"""
@@ -702,8 +700,7 @@ def example_usage():
     
     # Setup logging
     logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    
+
     # Create configuration manager
     config_manager = ConfigManager("example_config.json")
     

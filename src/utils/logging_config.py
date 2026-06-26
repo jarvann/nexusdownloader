@@ -12,7 +12,7 @@ import time
 import logging
 import logging.handlers
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Dict, Optional, Any, List
+from typing import TYPE_CHECKING, Dict, Optional, Any
 
 if TYPE_CHECKING:
     from config.config_manager import LoggingConfig

@@ -9,13 +9,12 @@ display scaling based on the number of active operations.
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QProgressBar, QHeaderView, QGroupBox,
-    QScrollArea, QFrame, QCheckBox, QPushButton, QSizePolicy
+    QFrame, QCheckBox, QSizePolicy
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtGui import QFont, QColor
-from typing import List, Dict, Any
+from typing import List
 from datetime import timedelta
-import time
 
 from progress_tracking import DownloadProgress
 

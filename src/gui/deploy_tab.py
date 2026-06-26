@@ -10,7 +10,6 @@ live deploy grid, mirroring the Download/Install phases.
 import os
 import glob
 import re
-from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QThread, Signal

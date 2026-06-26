@@ -7,10 +7,9 @@ mod staging paths, and game-specific settings.
 
 import os
 import json
-import sqlite3
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
 # Try to import lz4 for potential compressed state files
@@ -206,7 +205,6 @@ class VortexConfigReader:
                 self._log("INFO", f"Found download path: {config.download_path}")
             
             # Extract game configurations
-            games_config = settings.get('gameMode', {})
             discovered_games = state_data.get('session', {}).get('gameMode', {}).get('known', {})
             
             for game_id, game_info in discovered_games.items():

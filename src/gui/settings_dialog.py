@@ -11,8 +11,6 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QSpinBox, QCheckBox, QComboBox, QGroupBox,
     QDialogButtonBox, QFileDialog, QMessageBox, QLabel
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
 from typing import Optional
 import logging
 

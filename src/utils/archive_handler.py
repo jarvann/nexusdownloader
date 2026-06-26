@@ -12,7 +12,7 @@ import zipfile
 import logging
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union
 from dataclasses import dataclass
 
 try:

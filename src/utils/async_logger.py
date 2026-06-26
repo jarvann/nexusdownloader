@@ -9,11 +9,10 @@ logging operations.
 import logging
 import threading
 import queue
-import time
-from typing import Optional, Any
+from typing import Optional
 
 try:
-    from PySide6.QtCore import QObject, Signal, QThread
+    from PySide6.QtCore import QObject, QThread
     QT_AVAILABLE = True
 except ImportError:
     # Fallback to standard threading if Qt not available

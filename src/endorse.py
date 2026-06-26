@@ -1,6 +1,5 @@
 import requests
 import logging
-from datetime import timedelta
 
 # Import unified logging
 try:

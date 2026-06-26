@@ -7,8 +7,6 @@ with collection-based automation.
 
 import os
 import json
-import threading
-import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -17,20 +15,17 @@ import html as _html
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog,
     QTextEdit, QProgressBar, QGroupBox, QGridLayout, QListWidget, QSplitter,
-    QListWidgetItem, QMessageBox, QComboBox, QSpinBox, QCheckBox, QInputDialog,
-    QDialog, QScrollArea, QDialogButtonBox, QStyle
+    QListWidgetItem, QMessageBox, QSpinBox, QCheckBox, QInputDialog, QDialog,
+    QScrollArea, QDialogButtonBox, QStyle
 )
-from PySide6.QtCore import QThread, Signal, Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QThread, Signal, Qt
 
 # Import installation utilities
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from utils.fomod_installer import create_fomod_installer, create_parallel_fomod_installer, InstallationResult, InstallResult
-from utils.unified_logging import get_logger, create_operation_logger
-from utils.archive_handler import get_archive_handler
-from utils.vortex_config import get_vortex_config_reader
+from utils.unified_logging import create_operation_logger
 
 
 class VortexSyncWorkerThread(QThread):

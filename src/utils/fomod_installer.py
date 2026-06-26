@@ -6,7 +6,6 @@ based on collection.json instructions, mimicking Vortex behavior.
 """
 
 import os
-import json
 import shutil
 import tempfile
 import time
@@ -15,12 +14,12 @@ import threading
 import concurrent.futures
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any, Tuple, Callable
+from typing import Dict, List, Optional, Union, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .archive_handler import ArchiveHandler, get_archive_handler, _external_tools
-from .unified_logging import get_logger, create_operation_logger
+from .archive_handler import get_archive_handler, _external_tools
+from .unified_logging import get_logger
 
 
 class InstallResult(Enum):
@@ -246,8 +245,7 @@ class FomodInstaller:
         source = mod_data.get("source", {})
         logical_filename = source.get("logicalFilename", "")
         mod_id = source.get("modId")
-        file_id = source.get("fileId")
-        
+
         # Common archive extensions
         extensions = ['.zip', '.7z', '.rar', '.tar.gz', '.tar.bz2']
         expected_size = source.get("fileSize")
@@ -1505,7 +1503,6 @@ class ParallelFomodInstaller(FomodInstaller):
         
         # Thread safety locks
         self._temp_dir_lock = threading.Lock()
-        self._staging_lock = threading.Lock()
         self._progress_lock = threading.Lock()
         
         # Progress tracking for concurrent operations

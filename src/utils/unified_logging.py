@@ -5,14 +5,13 @@ Provides consistent logging across all modules with proper file rotation,
 standardized naming conventions, and centralized configuration.
 """
 
-import os
 import sys
 import time
 import logging
 import logging.handlers
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 import threading
 import json
 

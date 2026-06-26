@@ -10,31 +10,26 @@ import sys
 import os
 import json
 import time
-import threading
 import logging
-from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QPushButton,
-    QHBoxLayout, QLineEdit, QFileDialog, QProgressBar, QMenuBar,
-    QMenu, QDialog, QFormLayout, QDialogButtonBox, QMessageBox,
-    QComboBox, QSpinBox, QGroupBox, QGridLayout, QSplitter, 
-    QStatusBar, QMainWindow, QTabWidget, QCheckBox
+    QHBoxLayout, QLineEdit, QFileDialog, QProgressBar, QFormLayout,
+    QMessageBox, QSpinBox, QGroupBox, QGridLayout, QStatusBar,
+    QMainWindow, QTabWidget
 )
-from PySide6.QtCore import QThread, Signal, QTimer, Qt, QMutex
-from PySide6.QtGui import QAction, QFont, QIcon
+from PySide6.QtCore import QThread, Signal, QTimer, QMutex
+from PySide6.QtGui import QAction, QIcon
 
 # Add parent directory to path for relative imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # Import application modules
-from progress_tracking import ProgressTracker, DownloadProgress
+from progress_tracking import ProgressTracker
 from gui.settings_dialog import SettingsDialog
 from gui.progress_monitor import ProgressMonitorWidget
 from gui.install_tab import InstallTab
 from gui.deploy_tab import DeployTab
-from gui.collection_selector import CollectionSelector
-from utils.vortex_config import get_vortex_config_reader
 
 # Import Phase 1 modules
 try:
@@ -1083,7 +1078,6 @@ class MainWindow(QMainWindow):
         """Setup connections between tabs for data sharing."""
         # When downloads folder is selected in download tab, update install tab
         # This would need to be connected to the file dialog signals
-        pass
 
     def _create_menu_bar(self):
         """Create the application menu bar with all actions."""

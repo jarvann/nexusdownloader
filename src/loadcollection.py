@@ -3,13 +3,13 @@ import argparse
 import concurrent.futures
 import logging
 import sys
-import download, endorse  # Import modules
+import download  # Import module (endorse is used via its from-import below)
 from download import download_file, set_download_logger, CONFIG  # Importing functions from download.py
 from endorse import endorse_mod, set_endorse_logger  # Importing functions from endorse.py
 import threading
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 # The local-state ledger is optional: a bare CLI run without a staging dir still
 # downloads fine, it just doesn't record into the ledger. Import defensively so a

@@ -27,7 +27,7 @@ import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 FLAG_MASTER = 0x00000001     # ESM
 FLAG_LIGHT = 0x00000200      # ESL / light master (Skyrim SE / Fallout 4)
