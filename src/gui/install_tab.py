@@ -218,28 +218,53 @@ class InstallWorkerThread(QThread):
             self.installation_complete.emit(mod_name, success, message, file_count)
 
 
+def collection_mod_key(m: dict) -> str:
+    """Stable per-mod key for remembering selections across installs.
+
+    Prefers the collection entry's ``tag`` (a stable per-file identifier Nexus
+    assigns), falling back to ``modId-fileId`` then the name.
+    """
+    s = m.get("source") or {}
+    if s.get("tag"):
+        return f"tag:{s['tag']}"
+    if s.get("modId") and s.get("fileId"):
+        return f"mf:{s['modId']}-{s['fileId']}"
+    return f"name:{m.get('name', '')}"
+
+
+def collection_key_for(cdata: dict) -> str:
+    """Stable per-collection key (name + game) for scoping saved selections."""
+    info = cdata.get("info", {}) or {}
+    return f"{info.get('domainName', '')}:{info.get('name', '') or 'collection'}"
+
+
 class OptionalSelectionDialog(QDialog):
     """Let the user opt IN to optional collection mods, and shows off-site/manual
-    mods they must download themselves. Optionals are unchecked by default."""
+    mods they must download themselves. Pre-checks any previously-saved choices
+    for this collection (``preselected`` = set of mod keys)."""
 
-    def __init__(self, optional_mods, offsite_mods, parent=None):
+    def __init__(self, optional_mods, offsite_mods, parent=None, preselected=None):
         super().__init__(parent)
         self.setWindowTitle("Choose optional mods")
         self.resize(560, 520)
         self._checks = []
+        preselected = preselected or set()
         layout = QVBoxLayout(self)
 
+        remembered = sum(1 for m in optional_mods if collection_mod_key(m) in preselected)
+        hint = (f"  ({remembered} remembered from a previous install)" if remembered else "")
         layout.addWidget(QLabel(
             f"<b>{len(optional_mods)} optional mod(s)</b> are not installed by "
-            "default. Check any you want to include:"))
+            f"default. Check any you want to include:{hint}"))
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
         for m in optional_mods:
             cb = QCheckBox(f"{m.get('name', '?')}  (v{m.get('version', '?')})")
-            cb.setChecked(False)
             cb._mod = m
+            cb._key = collection_mod_key(m)
+            cb.setChecked(cb._key in preselected)   # restore prior choice
             self._checks.append(cb)
             inner_layout.addWidget(cb)
         inner_layout.addStretch()
@@ -274,6 +299,11 @@ class OptionalSelectionDialog(QDialog):
 
     def selected_mods(self):
         return [c._mod for c in self._checks if c.isChecked()]
+
+    def all_states(self):
+        """{mod_key: checked} for EVERY optional shown -- so de-selections are
+        remembered too, not just additions."""
+        return {c._key: c.isChecked() for c in self._checks}
 
 
 class InstallTab(QWidget):
@@ -845,12 +875,17 @@ class InstallTab(QWidget):
             offsite = [m for m in mods if _is_offsite(m)]
             selected_optional = []
             if not self.skip_optional.isChecked() and (optional or offsite):
-                dlg = OptionalSelectionDialog(optional, offsite, self)
+                # Restore the user's prior optional choices for THIS collection.
+                coll_key = collection_key_for(cdata)
+                preselected = self._load_optional_selection(coll_key)
+                dlg = OptionalSelectionDialog(optional, offsite, self, preselected=preselected)
                 if dlg.exec() != QDialog.Accepted:
                     self.log_message("INFO", "Installation cancelled at optionals dialog.")
                     self.overall_progress.setVisible(False)
                     return
                 selected_optional = dlg.selected_mods()
+                # Remember the choices (checked AND unchecked) for next time.
+                self._save_optional_selection(coll_key, dlg.all_states())
             sel_ids = {id(m) for m in selected_optional}
             filtered = [m for m in mods if (not m.get("optional")) or (id(m) in sel_ids)]
             if len(filtered) != len(mods):
@@ -905,6 +940,33 @@ class InstallTab(QWidget):
         self.log_message("DEBUG", "Installation process started")
         self.log_message("INFO", "Starting installation process...")
     
+    def _load_optional_selection(self, collection_key: str) -> set:
+        """Set of mod keys the user previously opted into for this collection."""
+        try:
+            if not self.game_path:
+                return set()
+            from utils import local_state
+            led = local_state.get_ledger(local_state.db_path_for(self.game_path))
+            return {k for k, sel in led.get_collection_options(collection_key).items() if sel}
+        except Exception as e:
+            self.log_message("DEBUG", f"optional-selection load skipped: {e}")
+            return set()
+
+    def _save_optional_selection(self, collection_key: str, states: dict) -> None:
+        """Persist the user's optional choices (checked + unchecked) for re-use."""
+        try:
+            if not self.game_path:
+                return
+            from utils import local_state
+            led = local_state.get_ledger(local_state.db_path_for(self.game_path))
+            led.set_collection_options(collection_key, states)
+            led.flush()
+            chosen = sum(1 for v in states.values() if v)
+            self.log_message("INFO", f"Saved {chosen}/{len(states)} optional selections "
+                                     f"for this collection.")
+        except Exception as e:
+            self.log_message("DEBUG", f"optional-selection save skipped: {e}")
+
     def cancel_installation(self):
         """Cancel the current installation."""
         if self.install_thread and self.install_thread.isRunning():

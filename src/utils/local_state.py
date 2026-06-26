@@ -50,7 +50,7 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_FILENAME = "state.db"
 # App-owned data dir name (the ledger must NOT live inside Vortex's staging root,
 # or Vortex's folder scan treats it as a mod and our own reconcile walks it).
@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS collections (
     revision_id     INTEGER,
     revision_number INTEGER,
     added_at        INTEGER
+);
+CREATE TABLE IF NOT EXISTS collection_options (
+    collection_key TEXT,             -- stable per-collection key (name/slug)
+    mod_key        TEXT,             -- stable per-mod key (collection tag, or modId-fileId)
+    selected       INTEGER,          -- 1 = user opted this optional mod in
+    updated_at     INTEGER,
+    PRIMARY KEY (collection_key, mod_key)
 );
 CREATE TABLE IF NOT EXISTS downloads (
     id                TEXT PRIMARY KEY,
@@ -389,6 +396,30 @@ class LocalState:
             "slug=excluded.slug, name=excluded.name, game=excluded.game, "
             "revision_id=excluded.revision_id, revision_number=excluded.revision_number",
             (cid, slug, name, game, revision_id, revision_number, int(time.time())))
+
+    def set_collection_options(self, collection_key: str,
+                               selections: Dict[str, bool]) -> None:
+        """Persist the user's optional-mod opt-in choices for a collection.
+
+        ``selections`` maps a stable per-mod key -> selected. Both checked and
+        unchecked optionals are stored, so a deliberate de-selection persists too
+        (not just additions).
+        """
+        now = int(time.time())
+        rows = [(collection_key, mod_key, 1 if sel else 0, now)
+                for mod_key, sel in selections.items()]
+        if rows:
+            self._enqueue(
+                "INSERT INTO collection_options(collection_key,mod_key,selected,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(collection_key,mod_key) DO UPDATE SET "
+                "selected=excluded.selected, updated_at=excluded.updated_at", rows)
+
+    def get_collection_options(self, collection_key: str) -> Dict[str, bool]:
+        """Return {mod_key: selected} previously saved for a collection ({} if none)."""
+        with self._connect() as c:
+            return {r["mod_key"]: bool(r["selected"]) for r in c.execute(
+                "SELECT mod_key, selected FROM collection_options WHERE collection_key=?",
+                (collection_key,)).fetchall()}
 
     def link_downloads_to_collection(self, collection_id: int, game: str) -> None:
         """Associate this game's not-yet-linked downloads with a collection.
