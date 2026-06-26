@@ -134,6 +134,114 @@ def find_collection_json(staging_dir: str) -> Optional[str]:
     return max(cands, key=os.path.getmtime) if cands else None
 
 
+def _index_disk_archives(downloads_dir: str) -> Tuple[Dict[str, int], Dict[str, List[str]], Dict[str, str]]:
+    """Scan the downloads folder once. Returns:
+      * sizes:        archive name -> size on disk
+      * by_modid:     modId (str) -> [archive names] (Nexus files carry -<modId>-)
+      * by_name_lc:   lower-cased name -> actual name (for exact off-site matches)
+    """
+    sizes: Dict[str, int] = {}
+    by_modid: Dict[str, List[str]] = {}
+    by_name_lc: Dict[str, str] = {}
+    if not os.path.isdir(downloads_dir):
+        return sizes, by_modid, by_name_lc
+    for n in os.listdir(downloads_dir):
+        if not ARCHIVE_RE.search(n):
+            continue
+        try:
+            sizes[n] = os.path.getsize(os.path.join(downloads_dir, n))
+        except OSError:
+            sizes[n] = 0
+        by_name_lc[n.lower()] = n
+        mid = _modid_of(n)
+        if mid:
+            by_modid.setdefault(mid, []).append(n)
+    return sizes, by_modid, by_name_lc
+
+
+def reconcile_downloads(downloads_dir: str, collection_path: str, game: str,
+                        staging_dir: str, *, log: Callable[[str], None] = print
+                        ) -> Dict[str, object]:
+    """True-up the downloads folder against the collection, into the ledger.
+
+    Focused ONLY on mods directly in the collection. For each:
+      * Nexus mod (has modId): matched to a disk archive by modId + exact fileSize
+        -- the same trusted key Vortex uses -- and recorded with source='nexus'.
+      * Off-site mod (``type: browse``, no modId): matched by its exact archive
+        name (the collection entry's ``name``), or md5/size, and recorded with
+        source='browse' so the UI can list the ones you must fetch manually.
+    Files found on disk are state='present'; expected-but-absent files are
+    state='missing' (recorded with a NULL path) so nothing is silently dropped.
+    ``collection_id`` is left NULL here -- Link back-fills it from Vortex.
+    Download ids are deterministic so the live per-file write during the actual
+    download updates the very same row.
+    """
+    collection = json.load(open(collection_path, encoding="utf-8"))
+    sizes, by_modid, by_name_lc = _index_disk_archives(downloads_dir)
+    cid = _collection_id(collection)
+    info = collection.get("info", {})
+    coll_name = info.get("name", os.path.basename(os.path.dirname(collection_path)))
+    rev_id, rev_no = _parse_revision(os.path.basename(os.path.dirname(collection_path)))
+
+    counts = {"nexus_present": 0, "nexus_missing": 0,
+              "offsite_present": 0, "offsite_missing": 0}
+    offsite_missing: List[str] = []
+
+    st = ls.LocalState(ls.db_path_for(staging_dir))
+    try:
+        st.upsert_collection(cid or 0, info.get("domainName", "") or game, coll_name,
+                             rev_id, rev_no, game=game)
+        for m in collection.get("mods", []):
+            s = m.get("source") or {}
+            mod_id, file_id = s.get("modId"), s.get("fileId")
+            md5 = s.get("md5", "") or ""
+            want_size = s.get("fileSize") or 0
+            logical = s.get("logicalFilename") or m.get("name", "") or ""
+
+            if s.get("type") == "nexus" and mod_id:
+                # Match by modId + exact fileSize among same-modId archives on disk.
+                cands = by_modid.get(str(mod_id), [])
+                hit = next((n for n in cands if want_size and sizes.get(n) == want_size), None)
+                hit = hit or (cands[0] if len(cands) == 1 else None)
+                dl_id = _gen_id(f"{mod_id}-{file_id}") if file_id else _gen_id(logical or str(mod_id))
+                if hit:
+                    st.upsert_download(dl_id, hit, mod_id, file_id, md5, sizes.get(hit, want_size),
+                                       sizes.get(hit, 0), logical, None, state="present",
+                                       game=game, source="nexus")
+                    counts["nexus_present"] += 1
+                else:
+                    st.upsert_download(dl_id, None, mod_id, file_id, md5, want_size, 0, logical,
+                                       None, state="missing", game=game, source="nexus")
+                    counts["nexus_missing"] += 1
+            else:
+                # Off-site: the collection entry's `name` IS the expected archive.
+                name = m.get("name", "") or logical
+                hit = by_name_lc.get(name.lower())
+                dl_id = _gen_id(name or md5 or s.get("tag", ""))
+                if hit:
+                    st.upsert_download(dl_id, hit, None, None, md5, sizes.get(hit, want_size),
+                                       sizes.get(hit, 0), name, None, state="present",
+                                       game=game, source="browse")
+                    counts["offsite_present"] += 1
+                else:
+                    st.upsert_download(dl_id, None, None, None, md5, want_size, 0, name, None,
+                                       state="missing", game=game, source="browse")
+                    counts["offsite_missing"] += 1
+                    offsite_missing.append(name)
+        st.flush()
+    finally:
+        st.close()
+
+    log(f"download true-up [{game}]: nexus {counts['nexus_present']} present / "
+        f"{counts['nexus_missing']} missing; off-site {counts['offsite_present']} present / "
+        f"{counts['offsite_missing']} missing")
+    if offsite_missing:
+        log("  off-site mods to fetch manually (see the Collection page):")
+        for n in offsite_missing:
+            log(f"    - {n}")
+    return {**counts, "offsite_missing_names": offsite_missing}
+
+
 def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *,
                    log: Callable[[str], None] = print) -> Dict[str, int]:
     """FAST pass: refresh the download + mod identity from disk (no file walk, no

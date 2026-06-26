@@ -437,6 +437,12 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
                                    log=lambda *_: None)
     state = local_state.LocalState(local_state.db_path_for(staging_dir))
     try:
+        # Back-fill the collection id onto downloads recorded at download time
+        # (before Vortex knew the collection). Match on the game domain we stored.
+        game_domain = (collection.get("info") or {}).get("domainName", "")
+        if collection_id and game_domain:
+            state.link_downloads_to_collection(int(collection_id), game_domain)
+            state.flush()
         ledger_mods = state.all_mods_with_download()
     finally:
         state.close()

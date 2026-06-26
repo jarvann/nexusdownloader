@@ -174,7 +174,7 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter,
         if os.path.exists(file_path):
             elapsed = timedelta(seconds=time.time() - download_start)
             logger.info(f"File {filename} already exists. Skipping download. (#{current_counter}, Time: {elapsed})")
-            return
+            return file_path
 
         if attempt == 1:
             logger.info(f"Starting download of {filename} (#{current_counter})")
@@ -218,7 +218,7 @@ def download_file(game_domain, gamefolder, mod_id, file_id, current_counter,
             elapsed = timedelta(seconds=time.time() - download_start)
             speed = speed_bps / 1024 / 1024  # MB/s
             logger.info(f"Successfully downloaded {filename} ({downloaded_size} bytes, {speed:.2f} MB/s, Time: {elapsed}) (#{current_counter})")
-            return True
+            return file_path
 
         except (requests.exceptions.RequestException, OSError) as e:
             last_error = e

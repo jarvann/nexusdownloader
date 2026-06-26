@@ -11,6 +11,16 @@ import time
 import os
 from datetime import datetime, timedelta
 
+# The local-state ledger is optional: a bare CLI run without a staging dir still
+# downloads fine, it just doesn't record into the ledger. Import defensively so a
+# path/dependency hiccup never breaks downloads.
+try:
+    from utils import state_reconcile, local_state
+    from utils.vortex_sync import _gen_id
+    _LEDGER_AVAILABLE = True
+except Exception:  # pragma: no cover - ledger is a non-critical add-on here
+    _LEDGER_AVAILABLE = False
+
 
 lock = threading.Lock()
 COUNTER = 0
@@ -86,7 +96,53 @@ def load_mods_from_json(file_path, logger=None):
         return []
 
 # Main function to execute concurrent downloads
-def main(mods, gamefolder, max_threads=10, logger=None):
+def _open_ledger(staging, collection_path, download_dir, game, logger):
+    """Open the ledger and true-up existing downloads vs the collection.
+
+    Returns ``(ledger, dl_lookup)`` or ``(None, {})`` when the ledger isn't in
+    play (no staging dir, missing collection, or import failure). ``dl_lookup``
+    maps ``(modId, fileId) -> source dict`` so the live per-file write knows each
+    file's md5/size/logical name without re-parsing the collection.
+    """
+    if not (_LEDGER_AVAILABLE and staging and collection_path and os.path.exists(collection_path)):
+        return None, {}
+    try:
+        # True-up: record what's already on disk + flag off-site mods to fetch.
+        state_reconcile.reconcile_downloads(
+            download_dir, collection_path, game, staging,
+            log=(logger.info if logger else print))
+        ledger = local_state.get_ledger(local_state.db_path_for(staging))
+        lookup = {}
+        coll = json.load(open(collection_path, encoding="utf-8"))
+        for m in coll.get("mods", []):
+            s = m.get("source") or {}
+            if s.get("modId") and s.get("fileId"):
+                lookup[(s["modId"], s["fileId"])] = (s, m.get("name", "") or "")
+        return ledger, lookup
+    except Exception as e:                       # never let the ledger break downloads
+        if logger:
+            logger.warning(f"Ledger true-up skipped ({e}); downloads continue normally.")
+        return None, {}
+
+
+def _record_download(ledger, lookup, mod_id, file_id, path, game, logger):
+    """Upsert one freshly-downloaded file into the ledger (best-effort)."""
+    if not (ledger and path):
+        return
+    try:
+        s, name = lookup.get((mod_id, file_id), ({}, ""))
+        dl_id = _gen_id(f"{mod_id}-{file_id}")
+        size = os.path.getsize(path)
+        ledger.upsert_download(
+            dl_id, os.path.basename(path), mod_id, file_id, s.get("md5", "") or "",
+            size, size, s.get("logicalFilename") or name, None,
+            state="downloaded", game=game, source="nexus")
+    except Exception as e:
+        if logger:
+            logger.debug(f"Ledger write skipped for mod {mod_id} file {file_id}: {e}")
+
+
+def main(mods, gamefolder, max_threads=10, logger=None, staging=None, collection_path=None):
     overall_start = time.time()
     if logger:
         logger.verbose(f"Starting downloads for {len(mods)} mods with {max_threads} threads.")
@@ -114,17 +170,24 @@ def main(mods, gamefolder, max_threads=10, logger=None):
         logger.verbose(f"{len(complete)} mod(s) already on disk -- skipping the Nexus "
                        f"API for those (fast, rate-limit-safe resume).")
 
+    # Ledger: true-up what's on disk now (incl. off-site mods), then record each
+    # file as it lands. No-op when not launched with a staging dir.
+    ledger, dl_lookup = _open_ledger(staging, collection_path, download_dir, GAME_DOMAIN, logger)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_threads)) as executor:
-        futures = []
+        futures = {}
         for mod_id, file_id in mods:
             current_counter = incrementCOUNTER_ThreadSafe()
-            futures.append(executor.submit(
+            fut = executor.submit(
                 download_file, GAME_DOMAIN, gamefolder, mod_id, file_id, current_counter,
-                already_have=(str(mod_id) in complete)))
+                already_have=(str(mod_id) in complete))
+            futures[fut] = (mod_id, file_id)
 
         for future in concurrent.futures.as_completed(futures):
+            mod_id, file_id = futures[future]
             try:
-                future.result()
+                path = future.result()
+                _record_download(ledger, dl_lookup, mod_id, file_id, path, GAME_DOMAIN, logger)
                 incrementCOMPLETED_COUNTER_ThreadSafe()
                 # This print statement is intentionally left as print for GUI progress parsing
                 print(f"0000\tCompleted download for file {COMPLETED_COUNTER} of {len(mods)}")
@@ -140,6 +203,12 @@ def main(mods, gamefolder, max_threads=10, logger=None):
                 if logger:
                     logger.error(f"Error downloading file: {e}")
 
+    if ledger:
+        try:
+            ledger.flush()
+        except Exception:
+            pass
+
     overall_end = time.time()
     final_message = f"Total Execution Time for download: {timedelta(seconds=(overall_end - overall_start))}. Aren't you glad you decided to download using this instead of Vortex?"
 
@@ -147,20 +216,47 @@ def main(mods, gamefolder, max_threads=10, logger=None):
     if logger:
         logger.verbose(final_message)
 
-def endorse_mods(mods, max_threads=10, logger=None):
+def endorse_mods(mods, max_threads=10, logger=None, staging=None):
+    # `mods` only ever contains Nexus files (load_mods_from_json drops entries
+    # without a modId), so off-site mods are already excluded from endorsement.
+    # If we have a ledger, skip mods already endorsed in a previous run and record
+    # newly-endorsed ones with a timestamp.
+    ledger = None
+    if _LEDGER_AVAILABLE and staging:
+        try:
+            ledger = local_state.get_ledger(local_state.db_path_for(staging))
+            already = ledger.endorsed_ids(GAME_DOMAIN)
+            before = len(mods)
+            mods = [(mid, fid) for (mid, fid) in mods if (mid, fid) not in already]
+            if logger and before != len(mods):
+                logger.verbose(f"Skipping {before - len(mods)} mod(s) already endorsed "
+                               f"in a previous run.")
+        except Exception as e:
+            if logger:
+                logger.warning(f"Endorsement ledger unavailable ({e}); endorsing all.")
+            ledger = None
+
     if logger:
         logger.verbose(f"Starting endorsement for {len(mods)} mods with {max_threads} threads.")
     with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_threads)) as executor:
-        futures = []
+        futures = {}
         for mod_id, file_id in mods:
-            futures.append(executor.submit(endorse_mod, GAME_DOMAIN, mod_id, file_id))
+            futures[executor.submit(endorse_mod, GAME_DOMAIN, mod_id, file_id)] = (mod_id, file_id)
 
         for future in concurrent.futures.as_completed(futures):
+            mod_id, file_id = futures[future]
             try:
-                future.result()
+                result = future.result()
+                if ledger and result:                 # only record genuine successes
+                    ledger.mark_endorsed(mod_id, file_id)
             except Exception as e:
                 if logger:
                     logger.error(f"Error endorsing mod file: {e}")
+    if ledger:
+        try:
+            ledger.flush()
+        except Exception:
+            pass
     if logger:
         logger.verbose("Finished endorsing all mods.")
 
@@ -171,6 +267,7 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--maxthreads', help="The total number of active download threads you want, it's 1:1 for files",
                         required=False, default=10, type=int)
     parser.add_argument('-e', '--endorseonly', action='store_true', help="Endorse mods only without downloading them", default=False)
+    parser.add_argument('-s', '--staging', help="Vortex mod staging dir; enables recording downloads into the local ledger (true-up + per-file)", required=False, default='', type=str)
     args = parser.parse_args()
 
     # Temporary logger for loading JSON to get game domain
@@ -184,9 +281,10 @@ if __name__ == '__main__':
 
     if args.endorseonly:
         logger.verbose("Endorsing mods only, no downloads will be performed.")
-        endorse_mods(mods, args.maxthreads, logger)
+        endorse_mods(mods, args.maxthreads, logger, staging=(args.staging or None))
         exit(0)
     else:
-        main(mods, args.gamefolder, args.maxthreads, logger)
+        main(mods, args.gamefolder, args.maxthreads, logger,
+             staging=(args.staging or None), collection_path=args.json)
 
     exit(0)

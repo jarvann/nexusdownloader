@@ -77,8 +77,9 @@ class DownloadWorkerThread(QThread):
     log_message_received = Signal(str, str)       # Log level and message
     operation_finished = Signal(str, dict)        # Completion with final stats
     
-    def __init__(self, json_path: str, game_folder: str, max_threads: int = 10, 
-                 endorse_only: bool = False, config_manager: Optional['ConfigManager'] = None):
+    def __init__(self, json_path: str, game_folder: str, max_threads: int = 10,
+                 endorse_only: bool = False, config_manager: Optional['ConfigManager'] = None,
+                 staging: str = ""):
         """
         Initialize the download worker thread.
         
@@ -95,6 +96,7 @@ class DownloadWorkerThread(QThread):
         self.max_threads = max_threads
         self.endorse_only = endorse_only
         self.config_manager = config_manager
+        self.staging = staging          # enables ledger recording of downloads when set
         self.is_cancelled = False
         self.is_paused = False
         self.resume_requested = False
@@ -247,7 +249,9 @@ class DownloadWorkerThread(QThread):
         ]
         if self.endorse_only:
             args.append("--endorseonly")
-        
+        if self.staging:
+            args.extend(["--staging", self.staging])
+
         operation_type = "endorsement" if self.endorse_only else "download"
         self.log_message_received.emit("INFO", f"Starting {operation_type} with {self.max_threads} threads")
         self.status_changed.emit(f"Starting {operation_type} process...")
@@ -1645,10 +1649,23 @@ class MainWindow(QMainWindow):
         else:
             return False
 
+    def _download_staging(self) -> str:
+        """Best-effort staging dir for ledger recording during download.
+
+        Uses the staging folder the user already configured on the Install tab
+        (persisted across sessions). Returns "" if none is set yet -- downloads
+        still run, they just won't be recorded into the ledger until Install/Link.
+        """
+        try:
+            staging = getattr(getattr(self, "install_tab", None), "game_path", "") or ""
+            return staging if os.path.isdir(staging) else ""
+        except Exception:
+            return ""
+
     def _execute_download_operation(self, json_path: str, game_folder: str):
         """
         Execute the download operation in a separate thread.
-        
+
         Args:
             json_path: Path to collection JSON file
             game_folder: Target folder for downloads
@@ -1660,10 +1677,12 @@ class MainWindow(QMainWindow):
         config = self.config_manager.get_config()
         max_threads = config.downloads.max_concurrent_downloads
         
-        # Create and configure download thread
+        # Create and configure download thread. Pass the configured staging dir
+        # (if any) so the downloader records into the local ledger as files land.
         self.download_thread = DownloadWorkerThread(
-            json_path, game_folder, max_threads, 
-            endorse_only=False, config_manager=self.config_manager
+            json_path, game_folder, max_threads,
+            endorse_only=False, config_manager=self.config_manager,
+            staging=self._download_staging()
         )
         
         # Connect thread signals to UI update methods
@@ -1860,7 +1879,8 @@ Operation Statistics:
         
         self.download_thread = DownloadWorkerThread(
             json_path, game_folder, max_threads,
-            endorse_only=True, config_manager=self.config_manager
+            endorse_only=True, config_manager=self.config_manager,
+            staging=self._download_staging()
         )
         
         # Connect essential signals

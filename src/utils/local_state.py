@@ -50,7 +50,7 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 DB_FILENAME = "state.db"
 # App-owned data dir name (the ledger must NOT live inside Vortex's staging root,
 # or Vortex's folder scan treats it as a mod and our own reconcile walks it).
@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS collections (
     id              INTEGER PRIMARY KEY,
     slug            TEXT,
     name            TEXT,
+    game            TEXT,
     revision_id     INTEGER,
     revision_number INTEGER,
     added_at        INTEGER
@@ -72,6 +73,8 @@ CREATE TABLE IF NOT EXISTS collections (
 CREATE TABLE IF NOT EXISTS downloads (
     id                TEXT PRIMARY KEY,
     local_path        TEXT UNIQUE,
+    game              TEXT,
+    source            TEXT,
     mod_id            INTEGER,
     file_id           INTEGER,
     md5               TEXT,
@@ -80,11 +83,13 @@ CREATE TABLE IF NOT EXISTS downloads (
     logical_file_name TEXT,
     collection_id     INTEGER,
     state             TEXT,
-    downloaded_at     INTEGER
+    downloaded_at     INTEGER,
+    endorsed_at       INTEGER          -- NULL until endorsed; unix-ms when endorsed
 );
 CREATE INDEX IF NOT EXISTS ix_dl_ids  ON downloads(mod_id, file_id);
 CREATE INDEX IF NOT EXISTS ix_dl_md5  ON downloads(md5);
 CREATE INDEX IF NOT EXISTS ix_dl_size ON downloads(file_size);
+CREATE INDEX IF NOT EXISTS ix_dl_game ON downloads(game);
 
 CREATE TABLE IF NOT EXISTS mods (
     folder                  TEXT PRIMARY KEY,
@@ -148,6 +153,30 @@ CREATE INDEX IF NOT EXISTS ix_log_ts  ON logs(ts);
 CREATE INDEX IF NOT EXISTS ix_log_op  ON logs(operation);
 CREATE INDEX IF NOT EXISTS ix_log_mod ON logs(mod_folder);
 """
+
+
+# Columns added after v1. ``CREATE TABLE IF NOT EXISTS`` leaves an existing table
+# untouched, so new columns on old DBs are added here idempotently.
+_ADDED_COLUMNS = {
+    "downloads": {"game": "TEXT", "source": "TEXT", "endorsed_at": "INTEGER"},
+    "collections": {"game": "TEXT"},
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add any post-v1 columns missing from an *existing* DB (idempotent).
+
+    Runs BEFORE the DDL so indexes on new columns can be created. A table that
+    doesn't exist yet (fresh DB) has no columns to report -- skip it and let the
+    DDL create it complete.
+    """
+    for table, cols in _ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not have:                      # table not created yet -> DDL handles it
+            continue
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 # --------------------------------------------------------------------------- #
@@ -235,10 +264,14 @@ class LocalState:
         # Initialise schema on the calling thread, synchronously.
         conn = self._connect()
         try:
+            _migrate(conn)            # add new columns BEFORE the DDL builds their indexes
             conn.executescript(_DDL)
             cur = conn.execute("SELECT value FROM meta WHERE key='schema_version'")
             if cur.fetchone() is None:
                 conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+                             (str(SCHEMA_VERSION),))
+            else:
+                conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                              (str(SCHEMA_VERSION),))
             conn.commit()
         finally:
@@ -348,29 +381,46 @@ class LocalState:
 
     # -- collections ---------------------------------------------------------- #
     def upsert_collection(self, cid: int, slug: str, name: str,
-                          revision_id: int, revision_number: int) -> None:
+                          revision_id: int, revision_number: int,
+                          game: str = "") -> None:
         self._enqueue(
-            "INSERT INTO collections(id,slug,name,revision_id,revision_number,added_at) "
-            "VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-            "slug=excluded.slug, name=excluded.name, revision_id=excluded.revision_id, "
-            "revision_number=excluded.revision_number",
-            (cid, slug, name, revision_id, revision_number, int(time.time())))
+            "INSERT INTO collections(id,slug,name,game,revision_id,revision_number,added_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "slug=excluded.slug, name=excluded.name, game=excluded.game, "
+            "revision_id=excluded.revision_id, revision_number=excluded.revision_number",
+            (cid, slug, name, game, revision_id, revision_number, int(time.time())))
+
+    def link_downloads_to_collection(self, collection_id: int, game: str) -> None:
+        """Associate this game's not-yet-linked downloads with a collection.
+
+        Downloads are recorded at download time, before Vortex (and thus the
+        ledger) knows the numeric collectionId. Link learns it and calls this to
+        back-fill ``collection_id`` on every download for the game that doesn't
+        already point at a collection.
+        """
+        self._enqueue(
+            "UPDATE downloads SET collection_id=? WHERE game=? AND collection_id IS NULL",
+            (collection_id, game))
 
     # -- downloads ------------------------------------------------------------ #
     def upsert_download(self, dl_id: str, local_path: str, mod_id: Optional[int],
                         file_id: Optional[int], md5: str, file_size: int,
                         received: int, logical_file_name: str,
                         collection_id: Optional[int], state: str = "finished",
-                        downloaded_at: Optional[int] = None) -> None:
+                        downloaded_at: Optional[int] = None,
+                        game: Optional[str] = None, source: Optional[str] = None) -> None:
         self._enqueue(
-            "INSERT INTO downloads(id,local_path,mod_id,file_id,md5,file_size,received,"
-            "logical_file_name,collection_id,state,downloaded_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-            "local_path=excluded.local_path, mod_id=excluded.mod_id, file_id=excluded.file_id,"
+            "INSERT INTO downloads(id,local_path,game,source,mod_id,file_id,md5,file_size,"
+            "received,logical_file_name,collection_id,state,downloaded_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "local_path=excluded.local_path, game=excluded.game, source=excluded.source, "
+            "mod_id=excluded.mod_id, file_id=excluded.file_id, "
             "md5=excluded.md5, file_size=excluded.file_size, received=excluded.received,"
-            "logical_file_name=excluded.logical_file_name, collection_id=excluded.collection_id,"
+            "logical_file_name=excluded.logical_file_name, "
+            # collection_id is back-filled by Link; never clobber a known id with NULL.
+            "collection_id=COALESCE(excluded.collection_id, downloads.collection_id),"
             "state=excluded.state, downloaded_at=excluded.downloaded_at",
-            (dl_id, local_path, mod_id, file_id, md5, file_size, received,
+            (dl_id, local_path, game, source, mod_id, file_id, md5, file_size, received,
              logical_file_name, collection_id, state,
              downloaded_at if downloaded_at is not None else int(time.time())))
 
@@ -394,6 +444,26 @@ class LocalState:
         with self._connect() as c:
             return _row_to_dict(c.execute(
                 "SELECT * FROM downloads WHERE local_path=?", (local_path,)).fetchone())
+
+    def mark_endorsed(self, mod_id: int, file_id: int,
+                      when_ms: Optional[int] = None) -> None:
+        """Record when a download's mod was endorsed (so a later run skips it).
+        ``when_ms`` defaults to now; pass None-clearing isn't supported here."""
+        self._enqueue(
+            "UPDATE downloads SET endorsed_at=? WHERE mod_id=? AND file_id=?",
+            (when_ms if when_ms is not None else int(time.time() * 1000), mod_id, file_id))
+
+    def endorsed_ids(self, game: Optional[str] = None) -> set:
+        """Set of ``(mod_id, file_id)`` already endorsed -- used to skip them on a
+        re-endorse pass. Optionally scoped to a game."""
+        sql = ("SELECT mod_id, file_id FROM downloads "
+               "WHERE endorsed_at IS NOT NULL AND mod_id IS NOT NULL")
+        params: Tuple = ()
+        if game:
+            sql += " AND game=?"
+            params = (game,)
+        with self._connect() as c:
+            return {(r["mod_id"], r["file_id"]) for r in c.execute(sql, params).fetchall()}
 
     def download_ids_by_path(self) -> Dict[str, str]:
         """All recorded local_path -> id, so a reconcile keeps a download's id
