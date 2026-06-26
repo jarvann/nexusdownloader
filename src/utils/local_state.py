@@ -409,6 +409,15 @@ class LocalState:
                         collection_id: Optional[int], state: str = "finished",
                         downloaded_at: Optional[int] = None,
                         game: Optional[str] = None, source: Optional[str] = None) -> None:
+        # local_path is UNIQUE (one file = one download). Make this writer
+        # authoritative: release the path from any OTHER row that holds it (a
+        # true-up best-guess the live download has now corrected), so claiming it
+        # here can't trip the UNIQUE constraint. NULL paths (missing rows) are
+        # untouched -- NULL never equals the path value.
+        if local_path:
+            self._enqueue(
+                "UPDATE downloads SET local_path=NULL, state='missing' "
+                "WHERE local_path=? AND id<>?", (local_path, dl_id))
         self._enqueue(
             "INSERT INTO downloads(id,local_path,game,source,mod_id,file_id,md5,file_size,"
             "received,logical_file_name,collection_id,state,downloaded_at) "

@@ -186,6 +186,7 @@ def reconcile_downloads(downloads_dir: str, collection_path: str, game: str,
     counts = {"nexus_present": 0, "nexus_missing": 0,
               "offsite_present": 0, "offsite_missing": 0}
     offsite_missing: List[str] = []
+    claimed: set = set()      # each on-disk archive is assigned to ONE entry only
 
     st = ls.LocalState(ls.db_path_for(staging_dir))
     try:
@@ -199,12 +200,15 @@ def reconcile_downloads(downloads_dir: str, collection_path: str, game: str,
             logical = s.get("logicalFilename") or m.get("name", "") or ""
 
             if s.get("type") == "nexus" and mod_id:
-                # Match by modId + exact fileSize among same-modId archives on disk.
-                cands = by_modid.get(str(mod_id), [])
+                # Match by modId + exact fileSize among same-modId archives on disk,
+                # skipping archives already claimed by another entry (mods with
+                # multiple files share a modId -> must not map two entries to one file).
+                cands = [n for n in by_modid.get(str(mod_id), []) if n not in claimed]
                 hit = next((n for n in cands if want_size and sizes.get(n) == want_size), None)
                 hit = hit or (cands[0] if len(cands) == 1 else None)
                 dl_id = _gen_id(f"{mod_id}-{file_id}") if file_id else _gen_id(logical or str(mod_id))
                 if hit:
+                    claimed.add(hit)
                     st.upsert_download(dl_id, hit, mod_id, file_id, md5, sizes.get(hit, want_size),
                                        sizes.get(hit, 0), logical, None, state="present",
                                        game=game, source="nexus")
@@ -217,8 +221,11 @@ def reconcile_downloads(downloads_dir: str, collection_path: str, game: str,
                 # Off-site: the collection entry's `name` IS the expected archive.
                 name = m.get("name", "") or logical
                 hit = by_name_lc.get(name.lower())
+                if hit in claimed:
+                    hit = None
                 dl_id = _gen_id(name or md5 or s.get("tag", ""))
                 if hit:
+                    claimed.add(hit)
                     st.upsert_download(dl_id, hit, None, None, md5, sizes.get(hit, want_size),
                                        sizes.get(hit, 0), name, None, state="present",
                                        game=game, source="browse")
