@@ -12,11 +12,13 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+import html as _html
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog,
     QTextEdit, QProgressBar, QGroupBox, QGridLayout, QListWidget, QSplitter,
     QListWidgetItem, QMessageBox, QComboBox, QSpinBox, QCheckBox, QInputDialog,
-    QDialog, QScrollArea, QDialogButtonBox
+    QDialog, QScrollArea, QDialogButtonBox, QStyle
 )
 from PySide6.QtCore import QThread, Signal, Qt, QTimer
 from PySide6.QtGui import QFont
@@ -238,6 +240,14 @@ def collection_key_for(cdata: dict) -> str:
     return f"{info.get('domainName', '')}:{info.get('name', '') or 'collection'}"
 
 
+def collection_mod_message(m: dict) -> str:
+    """The collection author's note/warning for a mod, if any.
+
+    Lives in the top-level ``instructions`` field (and, for off-site mods, in
+    ``source.instructions``)."""
+    return (m.get("instructions") or (m.get("source") or {}).get("instructions") or "").strip()
+
+
 class OptionalSelectionDialog(QDialog):
     """Let the user opt IN to optional collection mods, and shows off-site/manual
     mods they must download themselves. Pre-checks any previously-saved choices
@@ -260,13 +270,33 @@ class OptionalSelectionDialog(QDialog):
         scroll.setWidgetResizable(True)
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
+        info_icon = self.style().standardIcon(QStyle.SP_MessageBoxInformation)
         for m in optional_mods:
             cb = QCheckBox(f"{m.get('name', '?')}  (v{m.get('version', '?')})")
             cb._mod = m
             cb._key = collection_mod_key(m)
             cb.setChecked(cb._key in preselected)   # restore prior choice
             self._checks.append(cb)
-            inner_layout.addWidget(cb)
+
+            msg = collection_mod_message(m)
+            if msg:
+                # Row = [checkbox] … [ⓘ]; the author's note shows on hover.
+                row = QWidget()
+                row_l = QHBoxLayout(row)
+                row_l.setContentsMargins(0, 0, 0, 0)
+                tip = ('<div style="max-width:380px; white-space:pre-wrap">'
+                       + _html.escape(msg) + '</div>')
+                cb.setToolTip(tip)                  # hovering the name shows it too
+                row_l.addWidget(cb)
+                row_l.addStretch()
+                badge = QLabel()
+                badge.setPixmap(info_icon.pixmap(16, 16))
+                badge.setToolTip(tip)
+                badge.setCursor(Qt.WhatsThisCursor)
+                row_l.addWidget(badge)
+                inner_layout.addWidget(row)
+            else:
+                inner_layout.addWidget(cb)
         inner_layout.addStretch()
         scroll.setWidget(inner)
         layout.addWidget(scroll, 1)
