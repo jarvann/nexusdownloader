@@ -565,6 +565,40 @@ class LocalState:
 
 
 # --------------------------------------------------------------------------- #
+# Process-wide shared ledgers (one writer per DB, reused by logging + data)
+# --------------------------------------------------------------------------- #
+_LEDGERS: Dict[str, "LocalState"] = {}
+_LEDGERS_LOCK = threading.Lock()
+
+
+def get_ledger(db_path: str) -> "LocalState":
+    """Return the process-wide :class:`LocalState` for ``db_path``, opening it
+    once. Sharing one instance (hence one writer thread) across logging and data
+    writes avoids cross-connection write contention under WAL."""
+    with _LEDGERS_LOCK:
+        st = _LEDGERS.get(db_path)
+        if st is None or st._closed:
+            st = LocalState(db_path)
+            _LEDGERS[db_path] = st
+        return st
+
+
+def close_ledgers() -> None:
+    """Flush + close all shared ledgers (registered with atexit)."""
+    with _LEDGERS_LOCK:
+        for st in _LEDGERS.values():
+            try:
+                st.close()
+            except Exception:
+                pass
+        _LEDGERS.clear()
+
+
+import atexit as _atexit          # noqa: E402  (kept local to the registry)
+_atexit.register(close_ledgers)
+
+
+# --------------------------------------------------------------------------- #
 # Logging handler -> ledger
 # --------------------------------------------------------------------------- #
 def _fallback_log(msg: str) -> None:
@@ -595,6 +629,18 @@ class SQLiteLogHandler(logging.Handler):
                 ts=int(record.created * 1000))
         except Exception:
             self.handleError(record)
+
+
+def attach_operation_logging(logger: logging.Logger, staging_dir: str,
+                             operation: str) -> SQLiteLogHandler:
+    """Route ``logger`` into the staging ledger's ``logs`` table for ``operation``
+    (install/link/deploy/...). Returns the handler so the caller can
+    ``logger.removeHandler(...)`` when the operation ends. Logging shares the
+    process-wide ledger writer, so it's cheap and contention-free."""
+    handler = SQLiteLogHandler(get_ledger(db_path_for(staging_dir)), operation)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    return handler
 
 
 # --------------------------------------------------------------------------- #

@@ -97,6 +97,8 @@ class InstallWorkerThread(QThread):
 
     def run(self):
         """Run the installation process."""
+        logger = None
+        ledger_handler = None
         try:
             self.log_message.emit("DEBUG", "InstallWorkerThread.run() started")
             self.log_message.emit("INFO", f"Starting installation from {self.collection_path}")
@@ -122,6 +124,15 @@ class InstallWorkerThread(QThread):
             self.log_message.emit("DEBUG", "Creating installer logger")
             # Setup installer logger using unified logging system
             logger = create_operation_logger("install", "skyrimse")
+            # Route this operation's logs into the ledger (one queryable place).
+            # The parallel installer logs through the same-named "install" logger,
+            # so this captures the per-mod lines too. Detached in `finally`.
+            try:
+                from utils import local_state
+                ledger_handler = local_state.attach_operation_logging(
+                    logger, self.staging_path, "install")
+            except Exception as e:
+                self.log_message.emit("DEBUG", f"ledger logging unavailable: {e}")
             self.log_message.emit("DEBUG", f"Logger created with handlers: {[type(h).__name__ for h in logger.handlers]}")
             logger.info("Installation process started from GUI")
             
@@ -191,7 +202,10 @@ class InstallWorkerThread(QThread):
             import traceback
             traceback.print_exc()
             self.log_message.emit("ERROR", f"Installation failed: {str(e)}")
-    
+        finally:
+            if ledger_handler is not None and logger is not None:
+                logger.removeHandler(ledger_handler)
+
     def _on_progress_update(self, current: int, total: int, mod_name: str):
         """Callback for parallel installer progress updates."""
         if not self.is_cancelled:
@@ -428,6 +442,13 @@ class InstallTab(QWidget):
         options_layout.addWidget(self.max_workers_spinbox, 1, 2)
         
         layout.addWidget(options_group)
+
+        # Local-state / integrity panel: build the checksum baseline, verify
+        # staging against it, and repair broken mods from their source download.
+        from gui.ledger_panel import LedgerPanel
+        self.ledger_panel = LedgerPanel(
+            lambda: (self.game_path, self.downloads_path, self.collection_path))
+        layout.addWidget(self.ledger_panel)
         
         # Control buttons
         control_layout = QHBoxLayout()
@@ -625,12 +646,14 @@ class InstallTab(QWidget):
     def _on_sync_dryrun(self, res):
         p = res.plan
         force = bool(p.violations) or (not res.risk.safe)
+        cyc = f" ({p.dropped_cycle_rules} cyclic dropped)" if p.dropped_cycle_rules else ""
         lines = [
             f"This will register {p.mod_count} mods and link the collection in Vortex.",
+            "  (projected from the local ledger — no disk guessing)",
             "",
-            f"  New downloads to register : {p.new_downloads}",
-            f"  Collection requires-rules : {p.rule_count}",
-            f"  Skipped (no files on disk): {p.skipped_no_disk}",
+            f"  Downloads to register     : {p.new_downloads}",
+            f"  Orphan mods (yours/manual): {p.orphan_count}",
+            f"  Conflict rules written    : {p.modrule_count}{cyc}",
             f"  Total DB keys to write    : {p.total_keys}",
             "",
         ]
