@@ -20,6 +20,7 @@ because Python has no reliable LevelDB writer on Windows.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -40,14 +41,99 @@ class VortexBusyError(RuntimeError):
     """Raised when Vortex is running / holding the DB lock and we must not write."""
 
 
+class NodeNotFoundError(RuntimeError):
+    """Raised when the Node.js runtime the LevelDB bridge needs can't be located.
+
+    Kept distinct from :class:`VortexBusyError` so a missing runtime is reported
+    as exactly that ("install Node / fix PATH") instead of masquerading as a
+    locked database.
+    """
+
+
 def _bridge_path() -> str:
     # vortex_leveldb.js sits at the project root next to run_gui.py
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "..", "vortex_leveldb.js"))
 
 
+def _node_candidates() -> List[str]:
+    """Likely ``node`` executables, in priority order.
+
+    PATH first (the common case), then an explicit override env var, then the
+    standard Windows/Unix install locations -- so a process launched without the
+    user's interactive PATH (a GUI double-click, a fresh terminal after a Node
+    reinstall) can still find it.
+    """
+    out: List[str] = []
+
+    def add(p: Optional[str]) -> None:
+        if p and p not in out:
+            out.append(p)
+
+    # Explicit override wins if set.
+    add(os.environ.get("NEXUS_NODE") or os.environ.get("NODE"))
+    # Whatever PATH resolves (handles nvm/volta shims, custom installs).
+    add(shutil.which("node"))
+    add(shutil.which("node.exe"))
+
+    if os.name == "nt":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local = os.environ.get("LOCALAPPDATA", "")
+        appdata = os.environ.get("APPDATA", "")
+        for base in (pf, pf86):
+            add(os.path.join(base, "nodejs", "node.exe"))
+        # nvm-windows symlinks the active version here; also raw npm shim dir.
+        add(os.path.join(appdata, "npm", "node.exe") if appdata else None)
+        for root in (os.path.join(local, "Programs", "nodejs") if local else "",
+                     os.path.join(appdata, "nvm") if appdata else "",
+                     os.environ.get("NVM_HOME", ""), os.environ.get("NVM_SYMLINK", "")):
+            if root:
+                add(os.path.join(root, "node.exe"))
+                for hit in sorted(glob.glob(os.path.join(root, "v*", "node.exe")), reverse=True):
+                    add(hit)
+    else:
+        for p in ("/usr/local/bin/node", "/usr/bin/node", "/opt/homebrew/bin/node"):
+            add(p)
+        nvm = os.path.join(os.path.expanduser("~"), ".nvm", "versions", "node")
+        for hit in sorted(glob.glob(os.path.join(nvm, "*", "bin", "node")), reverse=True):
+            add(hit)
+    return out
+
+
+_NODE_CACHE: Optional[str] = None
+
+
+def resolve_node() -> str:
+    """Return a usable ``node`` executable path, or raise :class:`NodeNotFoundError`.
+
+    Result is cached for the process. The chosen candidate is verified by running
+    ``node --version`` so a stale path (uninstalled version) is skipped rather
+    than failing later mid-read.
+    """
+    global _NODE_CACHE
+    if _NODE_CACHE:
+        return _NODE_CACHE
+    tried = _node_candidates()
+    for cand in tried:
+        try:
+            r = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0:
+            _NODE_CACHE = cand
+            return cand
+    raise NodeNotFoundError(
+        "Node.js could not be found. The Vortex database bridge needs Node to "
+        "read/write state.v2. Install Node.js (https://nodejs.org) and ensure "
+        "'node' is on your PATH, or set the NEXUS_NODE environment variable to "
+        "the full path of node.exe.\n  Looked in: "
+        + (", ".join(tried) if tried else "(PATH only — nothing found)"))
+
+
 def _run_bridge(cmd: str, db_path: str, *args: Optional[str],
-                node: str = "node", timeout: float = 120.0) -> subprocess.CompletedProcess:
+                node: Optional[str] = None, timeout: float = 120.0) -> subprocess.CompletedProcess:
+    node = node or resolve_node()
     argv = [node, _bridge_path(), cmd, db_path]
     argv.extend(a for a in args if a is not None)
     # The bridge emits UTF-8 JSON (mod names contain non-ASCII chars). Decode as
@@ -57,7 +143,7 @@ def _run_bridge(cmd: str, db_path: str, *args: Optional[str],
                           encoding="utf-8", errors="replace")
 
 
-def probe(db_path: str, node: str = "node") -> bool:
+def probe(db_path: str, node: Optional[str] = None) -> bool:
     """Return True if the DB can be opened exclusively (Vortex not holding it)."""
     try:
         res = _run_bridge("probe", db_path, node=node, timeout=30)
@@ -80,7 +166,7 @@ def is_vortex_running() -> bool:
     return False
 
 
-def ensure_available(db_path: str, node: str = "node") -> None:
+def ensure_available(db_path: str, node: Optional[str] = None) -> None:
     """Raise :class:`VortexBusyError` if Vortex is running or holds the DB lock."""
     if is_vortex_running():
         raise VortexBusyError(
@@ -107,7 +193,7 @@ def backup_db(db_path: str) -> str:
 
 
 def write_records(db_path: str, records: Dict[str, str], *,
-                  backup: bool = True, node: str = "node",
+                  backup: bool = True, node: Optional[str] = None,
                   delete_prefixes: Optional[list] = None) -> WriteResult:
     """Atomically write ``{full###key: json_value}`` records after safety checks.
 
@@ -141,7 +227,7 @@ def write_records(db_path: str, records: Dict[str, str], *,
             pass
 
 
-def read_prefix(db_path: str, prefix: str, node: str = "node",
+def read_prefix(db_path: str, prefix: str, node: Optional[str] = None,
                 suffix: Optional[str] = None) -> Dict[str, object]:
     """Read keys under ``prefix`` (optionally only those ending with ``suffix``).
 
@@ -202,7 +288,7 @@ def find_state_db() -> Optional[str]:
     return existing[0]
 
 
-def read_app_instance_id(db_path: str, node: str = "node") -> Optional[str]:
+def read_app_instance_id(db_path: str, node: Optional[str] = None) -> Optional[str]:
     """Return Vortex's ``app.instanceId`` -- the value the deployment manifest's
     ``instance`` field MUST match.
 
@@ -217,14 +303,14 @@ def read_app_instance_id(db_path: str, node: str = "node") -> Optional[str]:
     return val if isinstance(val, str) else None
 
 
-def read_active_profile(db_path: str, node: str = "node") -> Optional[str]:
+def read_active_profile(db_path: str, node: Optional[str] = None) -> Optional[str]:
     """Return the id of the currently active Vortex profile."""
     data = read_prefix(db_path, "settings###profiles###activeProfileId", node=node)
     val = data.get("settings###profiles###activeProfileId")
     return val if isinstance(val, str) else None
 
 
-def read_vortex_games(db_path: str, node: str = "node") -> List[Dict[str, Any]]:
+def read_vortex_games(db_path: str, node: Optional[str] = None) -> List[Dict[str, Any]]:
     """Read the mod-managed games Vortex knows about, with their paths.
 
     Modern Vortex keeps everything in the LevelDB (no JSON to parse), so we pull:
@@ -265,7 +351,7 @@ def read_vortex_games(db_path: str, node: str = "node") -> List[Dict[str, Any]]:
 
 
 def read_collection_identity(db_path: str, game: str = "skyrimse",
-                             node: str = "node") -> Optional[Tuple[int, str]]:
+                             node: Optional[str] = None) -> Optional[Tuple[int, str]]:
     """Find an installed collection's ``(collectionId, slug)`` from existing state.
 
     Looks first in the installed mod records (the common "update" case), then
@@ -296,7 +382,7 @@ def read_collection_identity(db_path: str, game: str = "skyrimse",
     return (cid, slug) if (cid is not None and slug) else None
 
 
-def collection_diagnostic(db_path: str, game: str = "skyrimse", node: str = "node") -> str:
+def collection_diagnostic(db_path: str, game: str = "skyrimse", node: Optional[str] = None) -> str:
     """Short diagnostic of what the DB read sees -- included in errors so a failure
     is self-explaining (db path, how many mods / collection records were found)."""
     try:

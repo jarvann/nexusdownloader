@@ -283,8 +283,11 @@ class NexusLogger:
     def _setup_file_handlers(self, logger: logging.Logger):
         """Setup rotating file handlers"""
         
-        # Main log file (all messages)
-        main_handler = logging.handlers.RotatingFileHandler(
+        # Import custom rotating handler
+        from .unified_logging import CustomRotatingFileHandler
+        
+        # Main log file (all messages) with proper rotation naming
+        main_handler = CustomRotatingFileHandler(
             self.log_dir / "nexusdownloader.log",
             maxBytes=self.max_file_size,
             backupCount=self.backup_count,
@@ -297,9 +300,9 @@ class NexusLogger:
         ))
         logger.addHandler(main_handler)
         
-        # Error log file (errors and warnings only)
-        error_handler = logging.handlers.RotatingFileHandler(
-            self.log_dir / "errors.log",
+        # Error log file (errors and warnings only) with proper rotation naming
+        error_handler = CustomRotatingFileHandler(
+            self.log_dir / "nexusdownloader_errors.log",
             maxBytes=self.max_file_size,
             backupCount=self.backup_count,
             encoding='utf-8'
@@ -312,10 +315,10 @@ class NexusLogger:
         ))
         logger.addHandler(error_handler)
         
-        # Performance log file (if enabled)
+        # Performance log file (if enabled) with proper rotation naming
         if self.performance_metrics:
-            perf_handler = logging.handlers.RotatingFileHandler(
-                self.log_dir / "performance.log",
+            perf_handler = CustomRotatingFileHandler(
+                self.log_dir / "nexusdownloader_performance.log",
                 maxBytes=self.max_file_size,
                 backupCount=self.backup_count,
                 encoding='utf-8'

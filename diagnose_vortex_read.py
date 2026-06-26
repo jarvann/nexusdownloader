@@ -12,6 +12,7 @@ plus the raw bridge stdout/stderr when a read errors.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import subprocess
 
@@ -33,11 +34,16 @@ def main() -> None:
     hr("node + bridge")
     bridge = vortex_db._bridge_path()
     print("bridge path :", bridge, "exists:", os.path.exists(bridge))
+    print("PATH `node` :", shutil.which("node"))
+    print("candidates  :")
+    for c in vortex_db._node_candidates():
+        print("   ", c)
     try:
-        v = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=15)
-        print("node        :", (v.stdout or v.stderr).strip(), "rc:", v.returncode)
+        node = vortex_db.resolve_node()
+        v = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=15)
+        print("RESOLVED    :", node, "->", (v.stdout or v.stderr).strip())
     except Exception as e:
-        print("node        : NOT RUNNABLE ->", type(e).__name__, e)
+        print("RESOLVED    : FAILED ->", type(e).__name__, e)
     classic = os.path.join(os.path.dirname(bridge), "node_modules", "classic-level")
     print("classic-level dir exists:", os.path.isdir(classic))
 

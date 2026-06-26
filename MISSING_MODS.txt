@@ -1,0 +1,123 @@
+# DOMAIN collection (gnfjwh, rev 232) — missing mods as of finalize check
+# 4960 total | installed ~4845 | MISSING 115
+
+## NOT DOWNLOADED (3) — re-run downloader, or grab manually:
+  https://www.nexusmods.com/skyrimspecialedition/mods/101883?tab=files  (file 431389)  Shadow's More Perk Points - ESLified - Perk Points at Skill Levels 50-75-100 (ESL)
+  https://www.nexusmods.com/skyrimspecialedition/mods/659?tab=files  (file 59069)  Static Mesh Improvement Mod - SMIM - SMIM SE 2-08
+  https://www.nexusmods.com/skyrimspecialedition/mods/19080?tab=files  (file 743640)  RaceMenu - RaceMenu Anniversary Edition v0-4-19-14
+
+## MANUAL — no Nexus API source (11) — download by hand (page/patreon/discord), drop in /mnt/l/vortexdownloads/skyrimse:
+  TAWOBA REMASTERED 6.1 CBBE SE.7z
+  Halo'sPoserSE.7z
+  SOS Futanari - Lovergirl Skin Patch 1.0.0.zip
+  High Poly Head
+  MaxsuBlockOverhaul-V0.24a.7z
+  [SE] BDOR Mountain Spirit.7z
+  [SE] DM BDOR Corbicanus by Team TAL, em486.zip
+  [SSE] H2135 Fantasy Series9 CBBE 3BA CBPC-SMP Bodyslide v1.3.7z
+  [SE] BDOR La Orzeca by Team TAL(converted by em486).7z
+  domain dip patches.rar
+  dae steam integration fix.rar
+
+## DOWNLOADED BUT NOT INSTALLED (101) — re-run INSTALL (skip-already-installed handles the rest):
+  modId 97193 file 530831  Dynamic Random Female idle animation
+  modId 92912 file 415178  OAR Random Unarmed Workout Animations VARIANTS
+  modId 111456 file 537752  Sa'chil - Chooey's Choice
+  modId 27859 file 474487  Skyrim Souls RE - Updated (Anniversary Edition)
+  modId 85946 file 538718  Smoother Walk -Skyrim Speeds (ESL)
+  modId 106914 file 460938  Sa'chil Body and Texture Patches
+  modId 146752 file 613765  Plastic chair - vergilchair.zip
+  modId 168048 file 703561  Skeleton Banging Shield
+  modId 123949 file 681431  Gunslicer Animations All in One OAR
+  modId 114218 file 481156  UIExtensions Ultrawide Patch - Loose
+  modId 118601 file 606094  Flora Additions - Waterplants - Seasonal Patch PBR
+  modId 154489 file 705837  Diverse HQ PBR shrubs
+  modId 116324 file 509046  Flora Additions - Waterplants
+  modId 154489 file 705838  Diverse HQ PBR shrubs - Seasons pack
+  modId 92362 file 392717  Ocato's Recital Standalone
+  modId 113926 file 716967  Dancing CS True Light WSU
+  modId 172778 file 731760  Slightly Bigger  Trees - NOTWL
+  modId 138443 file 737447  CS Light
+  modId 138128 file 656344  iLluminous Elementals
+  modId 95305 file 404923  Halo's Poser for Photo Mode - Merged
+  modId 176702 file 739378  TRX SOS Khajiit-yllux Fomod
+  modId 174919 file 735935  Weapon Check and Sigma Animation Priority Tweaks
+  modId 172266 file 722591  Eivor - Sprint Attacks for BFCO
+  modId 177167 file 741039  Enhanced Khajiit KCCE Patch
+  modId 167838 file 701872  Molag Bal - Vigilant Replacer - ESLified
+  modId 177324 file 741721  EK JKJ Patch
+  modId 167838 file 708870  Molag Bal - Vigilant Replacer Moveset - ESL
+  modId 114317 file 481541  Bloodskal blade - Base
+  modId 167246 file 698627  Bloodskal Weapon Art - BFCO
+  modId 167838 file 708868  MolagReplacerVigilant - NoRaceMenu - ESL
+  modId 172922 file 723192  AOTDC - Chest Patch - NO Wyrmstooth
+  modId 156418 file 654524  Miscellaneous Quests Rewards Revamp
+  modId 157018 file 657623  Companions Rewards Revamp
+  modId 156067 file 654522  Thieves' Guild Rewards Revamp
+  modId 156125 file 654523  College of Winterhold Rewards Revamp
+  modId 156617 file 654532  Side Quests Rewards Revamp
+  modId 176481 file 741600  Enhanced Khajiit V1.02.02
+  modId 171955 file 718748  Waking Nightmare - Alternative Ending
+  modId 177162 file 741427  Aetherius Crossing
+  modId 174946 file 732444  WNAE - AFDI Wintersun patch
+  modId 177162 file 741031  Aetherius Crossing - CS Patch
+  modId 177246 file 741805  HorsePower   Lost Grimoire   Patches
+  modId 176987 file 740377  First-Person Swimming Animation
+  modId 153122 file 645198  Dynamic Location Pop-ups
+  modId 175885 file 741911  A Chance Arrangement Plus Plus ESL
+  modId 175490 file 734770  InsaneDragon - PBR
+  modId 175504 file 735912  RaySense - Cover Animation
+  modId 175498 file 734752  Open Animation Replacer - RaySense
+  modId 175062 file 739973  Disabled Reference Integrity Fix AE (SKSE)
+  modId 176688 file 741918  Mihail Meshes Optimization Project
+  modId 176894 file 740423  Distant Volcanic Eruption
+  modId 176023 file 736684  HIMBO SliderPresets Pack 02
+  modId 159916 file 668911  Dilon Reyth Reborn - Soul Cairn Trees
+  modId 174031 file 728329  CS Light - Dimhollow
+  modId 177169 file 741050  Clearings Overhaul
+  modId 175830 file 735985  nirn necessities - alt colors
+  modId 176622 file 739110  Fresh Ink - Blip for newly received documents
+  modId 176571 file 740254  What Remains - ESL
+  modId 176345 file 737991  Remiel - Cleaned Audio
+  modId 175520 file 735904  Obi's Hedge Knight Armor
+  modId 176067 file 736882  No Airborne Footsteps SKSE
+  modId 174828 file 739749  Wheeler - Skyrim Souls Slow Time Fix
+  modId 176517 file 738634  splashes of skyrim crash-fix
+  modId 174927 file 732341  BloodskalV2
+  modId 174995 file 732844  Depths of Skyrim - Mesh Fixes
+  modId 177327 file 741743  2-4k. New Dragon Word Wall SFW
+  modId 175934 file 741725  Project Bro Hes There
+  modId 77409 file 325421  Mum's the Word
+  modId 174007 file 734482  Diagonal Sprint
+  modId 176379 file 739526  Tramp Stamp (CBBE 3BA)
+  modId 175559 file 735024  Underwater Bubbles
+  modId 175189 file 733587  Icons for Skill Books
+  modId 176365 file 738065  Bow Animation Fix
+  modId 174752 file 736655  Unique Jarl Throne Sitting Animation
+  modId 176454 file 738407  No Auto-Equip Behaviour - Latest Version
+  modId 54337 file 290941  Extraplanar Sword Techniques - Magicka Cost
+  modId 54337 file 702856  Extraplanar Sword Techniques
+  modId 175270 file 739061  A Dark Warrior's Tale
+  modId 176593 file 739085  Unpoisoned Blocking - Latest Version
+  modId 170595 file 735998  Moonblade - 2k Textures
+  modId 174752 file 736659  Unique Jarl Throne Sitting Animation- TE BOS Patch
+  modId 84133 file 355938  Lively's Convenient Horses Patches
+  modId 176724 file 740594  Skeleton Auto Patch
+  modId 9519 file 254231  Convenient Horses Anniversary Edition Patch
+  modId 9519 file 254743  Convenient Horses
+  modId 175928 file 736304  Heart Of Ice - Astrid 3BA bodyslides Texture Patch
+  modId 125941 file 528586  NiOverrideClean-1.0.1
+  modId 168741 file 740938  Immersive Armors - Script Free and Skypatched
+  modId 27962 file 739551  Skyrim Unbound Reborn
+  modId 157144 file 656920  Thalmor Agents Use Disguse in Ratway
+  modId 156008 file 651895  Dragon War - Rebalanced
+  modId 32349 file 368385  Actor Limit Fix (Anniversary Edition)
+  modId 59350 file 246095  Use Telekinesis on Traps - po3's Papyrus Extender Version
+  modId 156058 file 691827  Hit to Switch - OIF
+  modId 177677 file 743464  Unsearched Corpses Indicator
+  modId 177824 file 743555  Now You See Me-Vampire Werewolf Indicator
+  modId 177592 file 742682  Witness Indicator
+  modId 177819 file 743871  Complete Detection Indicator
+  modId 177587 file 743531  Status Indicator Framework
+  modId 57339 file 742831  Faster HDT-SMP
+  modId 178413 file 745792  Sure Of Stealing NPC Crash Fix

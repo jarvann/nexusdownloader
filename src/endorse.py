@@ -2,6 +2,13 @@ import requests
 import logging
 from datetime import timedelta
 
+# Import unified logging
+try:
+    from utils.unified_logging import get_logger
+    _unified_available = True
+except ImportError:
+    _unified_available = False
+
 # For backward compatibility, try new config system first, then fall back to old
 try:
     from config.config_manager import ConfigManager
@@ -33,13 +40,26 @@ LOGGER = None
 # Initialize module logger
 _module_logger = logging.getLogger(__name__)
 
+# Add this global variable to hold the logger instance
+LOGGER = None
+
 def set_endorse_logger(logger):
     global LOGGER
     LOGGER = logger
 
+def get_endorse_logger():
+    """Get the endorse logger, preferring unified logging if available."""
+    global LOGGER
+    if LOGGER is None:
+        if _unified_available:
+            LOGGER = get_logger('download')  # Endorsement is part of download operations
+        else:
+            LOGGER = _module_logger
+    return LOGGER
+
 def endorse_mod(game_domain, mod_id, file_id):
     """Endorse a mod on NexusMods."""
-    logger = LOGGER or _module_logger
+    logger = get_endorse_logger()
     logger.info(f"Starting endorsement for mod {mod_id} in game {game_domain}")
     
     header = {
