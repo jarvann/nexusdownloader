@@ -325,6 +325,7 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
             if (row and row.get("download_id") and archive
                     and row.get("dl_local_path") == archive
                     and row.get("dl_md5")          # finalized: must carry a real md5
+                    and row.get("dl_mod_id") and row.get("dl_file_id")  # full nexus identity
                     and row["download_id"] not in claimed_dl):
                 claimed_dl.add(row["download_id"])
                 written.add(row["download_id"])
