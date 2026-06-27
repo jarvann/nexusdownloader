@@ -99,13 +99,12 @@ def _ensure_download(st: "ls.LocalState", archive: str, mod_data: Optional[dict]
                      archive_sizes: Dict[str, int], written: set,
                      existing_ids: Dict[str, str]) -> str:
     s = (mod_data or {}).get("source") or {}
-    # Stable id: a previously-recorded id for this file wins (so re-runs don't flip
-    # it and trip the local_path UNIQUE), then Vortex's archiveId, then a
-    # deterministic gen from modId-fileId.
-    dl_id = existing_ids.get(archive) or vortex_ids.get(archive)
-    if not dl_id:
-        dl_id = (_gen_id(f"{s['modId']}-{s['fileId']}")
-                 if s.get("modId") and s.get("fileId") else _gen_id(archive))
+    # One download == one archive file, exactly like Vortex's per-file archiveId.
+    # Key the id off the ARCHIVE (unique on disk, 1:1 with the staging folder) --
+    # NOT off (modId,fileId), which collapses when two files of one mod match the
+    # same collection entry (the "duplicate mods" bug). A previously-recorded id
+    # for this exact archive wins (stable across re-runs), then Vortex's archiveId.
+    dl_id = existing_ids.get(archive) or vortex_ids.get(archive) or _gen_id(archive)
     if dl_id not in written:
         size = archive_sizes.get(archive) or 0
         st.upsert_download(
@@ -285,14 +284,30 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
         rev_id, rev_no = _parse_revision(os.path.basename(os.path.dirname(collection_path)))
         cid = _collection_id(collection)
         st.upsert_collection(cid or 0, info.get("domainName", "") or "", coll_name, rev_id, rev_no)
-        existing_ids = st.download_ids_by_path()   # keep ids stable across re-runs
+
+        # Clean rebuild: the mod/download mapping is a DETERMINISTIC projection of
+        # the current disk (folders + archives), so wipe it and rebuild rather than
+        # upsert over stale/mis-matched rows from earlier passes. Endorsements are
+        # preserved (re-applied after) since they're not re-derivable from disk.
+        endorsements = st.endorsed_pairs()
+        st.clear_mods_and_downloads()
+
+        existing_ids = {}                          # fresh: archive-keyed ids only
         written, matched, orphan = set(), 0, 0
+        claimed_files = set()                      # (modId, fileId) -> one folder only
         for folder in staging_folders:
             archive = folder_to_archive.get(folder)
             mod_data = dl_id = None
             if archive:
-                cands = mods_by_modid.get(_modid_of(archive) or "", [])
+                # Don't let a second folder of the same mod grab a collection entry
+                # already claimed -- it must resolve to its OWN file (or none).
+                cands = [m for m in mods_by_modid.get(_modid_of(archive) or "", [])
+                         if ((m.get("source") or {}).get("modId"),
+                             (m.get("source") or {}).get("fileId")) not in claimed_files]
                 mod_data = _match_collection_mod(cands, archive, archive_sizes.get(archive))
+                if mod_data:
+                    s = mod_data.get("source") or {}
+                    claimed_files.add((s.get("modId"), s.get("fileId")))
                 dl_id = _ensure_download(st, archive, mod_data, cid, vortex_dl_ids,
                                          archive_sizes, written, existing_ids)
                 matched += 1
@@ -301,6 +316,10 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
             st.upsert_mod(folder, dl_id, variant=coll_name,
                           installer_choices=(mod_data or {}).get("choices"),
                           state="installed")
+
+        # Re-apply preserved endorsements onto the rebuilt download rows.
+        for (mid, fid), ts in endorsements.items():
+            st.mark_endorsed(mid, fid, ts)
         st.flush()
         log(f"mods recorded: {len(staging_folders)} (matched: {matched}, orphan: {orphan})")
         return {"mods": len(staging_folders), "matched": matched, "orphan": orphan}

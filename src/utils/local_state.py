@@ -493,6 +493,22 @@ class LocalState:
             "UPDATE downloads SET endorsed_at=? WHERE mod_id=? AND file_id=?",
             (when_ms if when_ms is not None else int(time.time() * 1000), mod_id, file_id))
 
+    def endorsed_pairs(self) -> Dict[Tuple[int, int], int]:
+        """{(mod_id, file_id): endorsed_at} for every endorsed download -- used to
+        preserve endorsements across a clean mapping rebuild."""
+        with self._connect() as c:
+            return {(r["mod_id"], r["file_id"]): r["endorsed_at"] for r in c.execute(
+                "SELECT mod_id, file_id, endorsed_at FROM downloads "
+                "WHERE endorsed_at IS NOT NULL AND mod_id IS NOT NULL AND file_id IS NOT NULL"
+            ).fetchall()}
+
+    def clear_mods_and_downloads(self) -> None:
+        """Wipe the mod + download mapping so it can be rebuilt deterministically
+        from disk. (mod_files/plugins/rules are keyed by folder and refreshed by
+        their own passes; collections/logs are untouched.)"""
+        self._enqueue("DELETE FROM mods", ())
+        self._enqueue("DELETE FROM downloads", ())
+
     def endorsed_ids(self, game: Optional[str] = None) -> set:
         """Set of ``(mod_id, file_id)`` already endorsed -- used to skip them on a
         re-endorse pass. Optionally scoped to a game."""
