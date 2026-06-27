@@ -509,6 +509,13 @@ class LocalState:
         self._enqueue("DELETE FROM mods", ())
         self._enqueue("DELETE FROM downloads", ())
 
+    def prune_orphan_downloads(self) -> None:
+        """Drop download rows no longer referenced by any mod -- e.g. stale rows
+        left behind after a folder was re-pointed to its correct archive."""
+        self._enqueue(
+            "DELETE FROM downloads WHERE id NOT IN "
+            "(SELECT download_id FROM mods WHERE download_id IS NOT NULL)", ())
+
     def endorsed_ids(self, game: Optional[str] = None) -> set:
         """Set of ``(mod_id, file_id)`` already endorsed -- used to skip them on a
         re-endorse pass. Optionally scoped to a game."""

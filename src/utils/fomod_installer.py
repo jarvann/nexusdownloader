@@ -1658,6 +1658,59 @@ class ParallelFomodInstaller(FomodInstaller):
                 
             return self._thread_temp_dirs[thread_id]
             
+    def _ledger(self):
+        """Lazily open the staging ledger (process-wide shared writer). Cached;
+        None if unavailable so recording degrades to a no-op."""
+        cache = getattr(self, "_ledger_cache", "unset")
+        if cache != "unset":
+            return cache
+        try:
+            from utils import local_state
+            from utils.vortex_sync import _gen_id
+            self._gen_id = _gen_id
+            self._ledger_cache = local_state.get_ledger(local_state.db_path_for(self.staging_path))
+        except Exception as e:
+            self.logger.debug(f"ledger unavailable for install recording: {e}")
+            self._ledger_cache = None
+        return self._ledger_cache
+
+    def _record_install(self, mod_data, archive_path, result):
+        """Write the authoritative archive->folder->identity pairing to the ledger
+        AT INSTALL TIME (this thread chose the archive for this mod, so it knows
+        the truth -- exactly like Vortex sets the mod's archiveId on install).
+        The download id is keyed off the archive (1:1, unique), so two files of one
+        mod can never collapse. Best-effort: never fails the install."""
+        led = self._ledger()
+        if not led:
+            return
+        try:
+            s = mod_data.get("source") or {}
+            archive = archive_path.name
+            # The folder the files ACTUALLY landed in (robust to naming differences).
+            folder = None
+            if result.installed_files:
+                try:
+                    folder = Path(result.installed_files[0]).relative_to(self.staging_path).parts[0]
+                except (ValueError, IndexError):
+                    folder = None
+            if not folder:
+                folder = self._get_vortex_folder_name(mod_data.get("name", ""), archive_path, mod_data)
+            dl_id = self._gen_id(archive)
+            try:
+                size = s.get("fileSize") or archive_path.stat().st_size
+            except OSError:
+                size = s.get("fileSize") or 0
+            led.upsert_download(dl_id, archive, s.get("modId"), s.get("fileId"),
+                                s.get("md5", "") or "", size, size,
+                                s.get("logicalFilename") or mod_data.get("name", "") or "",
+                                None, state="installed",
+                                game=mod_data.get("domainName") or "", source="nexus")
+            led.upsert_mod(folder, dl_id, installer_choices=mod_data.get("choices"),
+                           file_count=len(result.installed_files),
+                           install_time=int(time.time()), state="installed")
+        except Exception as e:
+            self.logger.debug(f"install-record skipped for {mod_data.get('name')}: {e}")
+
     def _cleanup_thread_temp_dirs(self):
         """Clean up all thread temporary directories."""
         with self._temp_dir_lock:
@@ -1762,7 +1815,14 @@ class ParallelFomodInstaller(FomodInstaller):
                             f"{mod_name}: empty install (attempt {attempt + 1}/3) -- "
                             f"likely extract/copy race, retrying after settle")
                         time.sleep(0.75 * (attempt + 1))
-            
+
+                    # Record the install into the ledger NOW, while we hold the
+                    # authoritative pairing: THIS archive (identity from mod_data)
+                    # went into THIS folder. The system knows the truth at the
+                    # moment it acts -- nothing downstream has to re-derive it.
+                    if result.status == InstallResult.SUCCESS:
+                        self._record_install(mod_data, archive_path, result)
+
             # Update progress and notify
             with self._progress_lock:
                 self._completed_count += 1

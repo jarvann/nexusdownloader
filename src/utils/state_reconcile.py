@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple
 
 from utils import local_state as ls
-from utils.vortex_sync import index_by_modid, _gen_id
+from utils.vortex_sync import _gen_id, _MODID_RE
 
 ARCHIVE_RE = re.compile(r"\.(7z|zip|rar)$", re.IGNORECASE)
 _INVALID = re.compile(r'[<>:"/\\|?*]')
@@ -69,9 +69,22 @@ def _read_vortex_download_ids() -> Dict[str, str]:
         return {}
 
 
-def _modid_of(archive_name: str) -> Optional[str]:
-    ids = index_by_modid([archive_name])
-    return next(iter(ids), None)
+def _modid_of(archive_name: str, known: Optional[Dict[str, List[dict]]] = None) -> Optional[str]:
+    """The modId embedded in a Nexus filename (``Name-modId-version-...``).
+
+    A filename has several ``-NN-`` number groups (version, fileId, etc.), so a
+    naive "any number" pick is unreliable (it grabbed '11' from '-73903-2-11-2-').
+    When ``known`` (the collection's modId index) is given, return the candidate
+    that the collection actually knows -- the authoritative disambiguator.
+    Otherwise fall back to the leftmost group, which is the modId in Nexus naming.
+    """
+    cands = _MODID_RE.findall(archive_name)
+    if known:
+        for c in cands:
+            if c in known:
+                return c
+    m = _MODID_RE.search(archive_name)
+    return m.group(1) if m else None
 
 
 def _match_collection_mod(cands: List[dict], archive: str,
@@ -285,23 +298,39 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
         cid = _collection_id(collection)
         st.upsert_collection(cid or 0, info.get("domainName", "") or "", coll_name, rev_id, rev_no)
 
-        # Clean rebuild: the mod/download mapping is a DETERMINISTIC projection of
-        # the current disk (folders + archives), so wipe it and rebuild rather than
-        # upsert over stale/mis-matched rows from earlier passes. Endorsements are
-        # preserved (re-applied after) since they're not re-derivable from disk.
-        endorsements = st.endorsed_pairs()
-        st.clear_mods_and_downloads()
+        # USE THE DATABASE. The installer records each folder's archive->identity at
+        # install time, so trust what the ledger already knows: a folder whose
+        # recorded download points at the archive actually on disk for it is
+        # authoritative -- leave it untouched. Only folders the DB doesn't know (or
+        # recorded against a different/now-missing archive) are (re)derived. This
+        # makes the ledger the source of truth and self-heals stale/collapsed rows
+        # (e.g. two folders that an older pass pointed at one archive).
+        existing = {m["folder"]: m for m in st.all_mods_with_download()}
+        existing_ids = st.download_ids_by_path()   # local_path -> id (stable ids)
+        written, kept, derived, orphan = set(), 0, 0, 0
+        claimed_dl = set()       # download ids already in use (enforce 1:1)
+        claimed_files = set()    # collection (modId, fileId) already claimed
 
-        existing_ids = {}                          # fresh: archive-keyed ids only
-        written, matched, orphan = set(), 0, 0
-        claimed_files = set()                      # (modId, fileId) -> one folder only
+        to_derive = []
         for folder in staging_folders:
             archive = folder_to_archive.get(folder)
+            row = existing.get(folder)
+            if (row and row.get("download_id") and archive
+                    and row.get("dl_local_path") == archive
+                    and row["download_id"] not in claimed_dl):
+                claimed_dl.add(row["download_id"])
+                written.add(row["download_id"])
+                claimed_files.add((row.get("dl_mod_id"), row.get("dl_file_id")))
+                kept += 1
+            else:
+                to_derive.append((folder, archive))
+
+        for folder, archive in to_derive:
             mod_data = dl_id = None
             if archive:
                 # Don't let a second folder of the same mod grab a collection entry
                 # already claimed -- it must resolve to its OWN file (or none).
-                cands = [m for m in mods_by_modid.get(_modid_of(archive) or "", [])
+                cands = [m for m in mods_by_modid.get(_modid_of(archive, mods_by_modid) or "", [])
                          if ((m.get("source") or {}).get("modId"),
                              (m.get("source") or {}).get("fileId")) not in claimed_files]
                 mod_data = _match_collection_mod(cands, archive, archive_sizes.get(archive))
@@ -310,19 +339,18 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
                     claimed_files.add((s.get("modId"), s.get("fileId")))
                 dl_id = _ensure_download(st, archive, mod_data, cid, vortex_dl_ids,
                                          archive_sizes, written, existing_ids)
-                matched += 1
+                derived += 1
             else:
                 orphan += 1
             st.upsert_mod(folder, dl_id, variant=coll_name,
                           installer_choices=(mod_data or {}).get("choices"),
                           state="installed")
 
-        # Re-apply preserved endorsements onto the rebuilt download rows.
-        for (mid, fid), ts in endorsements.items():
-            st.mark_endorsed(mid, fid, ts)
+        st.prune_orphan_downloads()   # drop downloads no longer referenced by a mod
         st.flush()
-        log(f"mods recorded: {len(staging_folders)} (matched: {matched}, orphan: {orphan})")
-        return {"mods": len(staging_folders), "matched": matched, "orphan": orphan}
+        log(f"mods: {len(staging_folders)} (trusted: {kept}, re-derived: {derived}, orphan: {orphan})")
+        return {"mods": len(staging_folders), "matched": kept + derived,
+                "trusted": kept, "derived": derived, "orphan": orphan}
     finally:
         st.close()
 
