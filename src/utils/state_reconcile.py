@@ -110,7 +110,7 @@ def _match_collection_mod(cands: List[dict], archive: str,
 def _ensure_download(st: "ls.LocalState", archive: str, mod_data: Optional[dict],
                      collection_id: Optional[int], vortex_ids: Dict[str, str],
                      archive_sizes: Dict[str, int], written: set,
-                     existing_ids: Dict[str, str]) -> str:
+                     existing_ids: Dict[str, str], downloads_dir: Optional[str] = None) -> str:
     s = (mod_data or {}).get("source") or {}
     # One download == one archive file, exactly like Vortex's per-file archiveId.
     # Key the id off the ARCHIVE (unique on disk, 1:1 with the staging folder) --
@@ -120,8 +120,15 @@ def _ensure_download(st: "ls.LocalState", archive: str, mod_data: Optional[dict]
     dl_id = existing_ids.get(archive) or vortex_ids.get(archive) or _gen_id(archive)
     if dl_id not in written:
         size = archive_sizes.get(archive) or 0
+        md5 = s.get("md5", "") or ""
+        if not md5 and downloads_dir:
+            # No collection identity for this archive -> hash the real file so the
+            # download has a fileMD5. Vortex treats an md5-less download as "not
+            # finalized"; giving it the true hash makes it finalized in Vortex's
+            # eyes (the same value Repair would compute).
+            md5 = ls.hash_file(os.path.join(downloads_dir, archive)) or ""
         st.upsert_download(
-            dl_id, archive, s.get("modId"), s.get("fileId"), s.get("md5", "") or "",
+            dl_id, archive, s.get("modId"), s.get("fileId"), md5,
             size, size, s.get("logicalFilename") or (mod_data or {}).get("name", "") or "",
             collection_id)
         written.add(dl_id)
@@ -317,6 +324,7 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
             row = existing.get(folder)
             if (row and row.get("download_id") and archive
                     and row.get("dl_local_path") == archive
+                    and row.get("dl_md5")          # finalized: must carry a real md5
                     and row["download_id"] not in claimed_dl):
                 claimed_dl.add(row["download_id"])
                 written.add(row["download_id"])
@@ -338,7 +346,7 @@ def reconcile_mods(staging_dir: str, downloads_dir: str, collection_path: str, *
                     s = mod_data.get("source") or {}
                     claimed_files.add((s.get("modId"), s.get("fileId")))
                 dl_id = _ensure_download(st, archive, mod_data, cid, vortex_dl_ids,
-                                         archive_sizes, written, existing_ids)
+                                         archive_sizes, written, existing_ids, downloads_dir)
                 derived += 1
             else:
                 orphan += 1
