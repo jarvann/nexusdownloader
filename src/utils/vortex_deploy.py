@@ -39,6 +39,10 @@ MANIFEST_NAME = "vortex.deployment.json"
 STAGING_MARKER = "__vortex_staging_folder"
 DEPLOY_METHOD = "hardlink_activator"
 MANIFEST_VERSION = 1
+# Vortex drops this marker in every directory it creates during deploy, and on
+# purge only removes empty dirs that contain it (so it never deletes a dir the
+# user/game owns). We mirror that so a Vortex-side purge cleans our dirs too.
+MANAGED_TAG = "__folder_managed_by_vortex"
 
 
 def _to_backslash(rel: str) -> str:
@@ -465,6 +469,9 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             print(f"WARNING: {len(failures)} of {total} files could not be linked "
                   f"(first few: {shown})")
 
+    if link:
+        _tag_managed_dirs(target_data_dir, entries)
+
     # Unlink files dropped since the last deployment (only when actually linking).
     # Safe-remove: keep a file the user replaced by hand (no longer our hardlink).
     removed = 0
@@ -656,13 +663,37 @@ def purge_by_inode(staging_dir: str, target_data_dir: str,
     return removed
 
 
+def _tag_managed_dirs(target_dir: str, entries: Iterable[Dict[str, Any]]) -> None:
+    """Drop the ``__folder_managed_by_vortex`` marker in every directory we deploy
+    into (and its ancestors), so a later Vortex purge can clean them."""
+    dirs = set()
+    for e in entries:
+        d = os.path.dirname(e["relPath"].replace("\\", os.sep))
+        while d:
+            dirs.add(d)
+            d = os.path.dirname(d)
+    for d in dirs:
+        tag = os.path.join(target_dir, d, MANAGED_TAG)
+        try:
+            if os.path.isdir(os.path.dirname(tag)) and not os.path.lexists(tag):
+                with open(tag, "w", encoding="utf-8") as fh:
+                    fh.write("")
+        except OSError:
+            pass
+
+
 def _prune_empty_dirs(root: str) -> None:
-    """Remove now-empty directories left behind by a purge (bottom-up)."""
+    """Remove directories left behind by a purge (bottom-up). A dir holding only
+    our managed-tag marker counts as empty: remove the tag, then the dir."""
     for dirpath, _dirs, _files in os.walk(root, topdown=False):
         if os.path.abspath(dirpath) == os.path.abspath(root):
             continue
         try:
-            if not os.listdir(dirpath):
+            contents = os.listdir(dirpath)
+            if contents == [MANAGED_TAG]:
+                os.remove(os.path.join(dirpath, MANAGED_TAG))
+                contents = []
+            if not contents:
                 os.rmdir(dirpath)
         except OSError:
             pass
