@@ -406,6 +406,121 @@ def mark_deployed_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "no
     return vortex_db.write_records(db_path, records, backup=True, node=node)
 
 
+def mark_needs_deploy_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "node"):
+    """Set ``needToDeploy`` so Vortex knows the Data folder no longer matches
+    staging (used after a purge). Requires Vortex closed."""
+    from utils import vortex_db
+    need_key = f"persistent###deployment###needToDeploy###{game_id}"
+    return vortex_db.write_records(db_path, {need_key: json.dumps(True)},
+                                   backup=True, node=node)
+
+
+@dataclass
+class PurgeResult:
+    removed: int          # deployed files unlinked from the game folder
+    skipped: int          # files left in place (not our hardlink, or missing source)
+    manifest_path: str
+    remaining: int        # manifest entries left after the purge
+
+
+def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
+          only_folders: Optional[Iterable[str]] = None, force: bool = False,
+          prune_empty_dirs: bool = True,
+          progress: Optional[Callable[[int, int, str], None]] = None) -> PurgeResult:
+    """Un-deploy: remove the files this deployment placed, per ``vortex.deployment.json``.
+
+    The inverse of :func:`deploy`. Reads the manifest and deletes each recorded
+    target from the game folder, then rewrites the manifest without the purged
+    entries (empty when purging everything).
+
+    SAFE BY DEFAULT: a target is removed only when it's still *our* hardlink -- the
+    same inode as the staging source. A file you replaced by hand, or a vanilla
+    file the manifest happens to name, is left alone (counted in ``skipped``).
+    ``force=True`` removes manifest targets regardless (Vortex's own behavior).
+
+    ``only_folders`` purges just those mods' files (partial un-deploy); otherwise
+    everything in the manifest is purged.
+    """
+    entries = read_manifest_entries(target_data_dir)
+    only = {f for f in only_folders} if only_folders is not None else None
+
+    targets = [e for e in entries.values()
+               if only is None or e.get("source") in only]
+    total = len(targets)
+    removed = skipped = 0
+    purged_keys = set()
+    for i, e in enumerate(targets):
+        rel = e["relPath"]
+        sub = rel.replace("\\", os.sep)
+        target = os.path.join(target_data_dir, sub)
+        source = e.get("source", "")
+        src = os.path.join(staging_dir, source, sub)
+        if not os.path.lexists(target):
+            purged_keys.add(rel.lower())     # already gone -> drop from manifest
+        elif not force and os.path.exists(src):
+            try:
+                same = os.path.samefile(src, target)
+            except OSError:
+                same = False
+            if not same:
+                skipped += 1                  # user replaced it -> leave it
+                continue
+            _force_remove(target)
+            removed += 1
+            purged_keys.add(rel.lower())
+        else:
+            _force_remove(target)
+            removed += 1
+            purged_keys.add(rel.lower())
+        if progress is not None and (i % 200 == 0 or i == total - 1):
+            progress(i + 1, total, rel)
+
+    remaining = {k: v for k, v in entries.items() if k not in purged_keys}
+    if prune_empty_dirs:
+        _prune_empty_dirs(target_data_dir)
+
+    # Rewrite the manifest with whatever's left (preserve its header fields).
+    manifest_path = os.path.join(target_data_dir, MANIFEST_NAME)
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError):
+            manifest = {}
+        manifest["files"] = sorted(remaining.values(), key=lambda x: x["relPath"].lower())
+        tmp = manifest_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+        os.replace(tmp, manifest_path)
+
+    return PurgeResult(removed, skipped, manifest_path, len(remaining))
+
+
+def _prune_empty_dirs(root: str) -> None:
+    """Remove now-empty directories left behind by a purge (bottom-up)."""
+    for dirpath, _dirs, _files in os.walk(root, topdown=False):
+        if os.path.abspath(dirpath) == os.path.abspath(root):
+            continue
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+        except OSError:
+            pass
+
+
+def purge_collection(db_path: str, staging_dir: str, target_data_dir: str,
+                     game_id: str = GAME_ID, *, node: str = "node",
+                     only_folders: Optional[Iterable[str]] = None, force: bool = False,
+                     progress: Optional[Callable[[int, int, str], None]] = None
+                     ) -> Tuple[PurgeResult, Any]:
+    """High-level purge: un-deploy files, then flag ``needToDeploy`` in the DB so
+    Vortex knows the Data folder no longer matches staging (requires Vortex closed)."""
+    result = purge(staging_dir, target_data_dir, game_id,
+                   only_folders=only_folders, force=force, progress=progress)
+    db_write = mark_needs_deploy_in_db(db_path, game_id, node=node)
+    return result, db_write
+
+
 def order_folders_for_deploy(staging_dir: str, collection: Optional[Dict[str, Any]],
                              folder_by_modid: Optional[Dict[str, list]] = None
                              ) -> list:
