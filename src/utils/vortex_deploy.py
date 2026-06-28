@@ -281,6 +281,7 @@ class DeployResult:
     linked: int
     skipped_conflicts: int = 0   # changed-folder files left to an existing higher
                                  # -priority winner (incremental mode only)
+    removed_stale: int = 0       # files unlinked because they're no longer deployed
 
 
 def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str],
@@ -316,13 +317,22 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             f"or {STAGING_MARKER} marker found). Open Vortex for this game once.")
 
     skipped_conflicts = 0
+    # Files in the LAST deployment that are gone now -- Vortex's finalize() unlinks
+    # these (a removed mod, or a file dropped from a mod, must leave the game folder
+    # instead of orphaning a hardlink). {relPath_lower: entry}.
+    stale: Dict[str, Dict[str, Any]] = {}
     if only_folders is not None:
         # Incremental: walk only the changed folders, merge into the live manifest.
-        changed = list(only_folders)
-        staged = _walk_staged(staging_dir, changed, workers=workers)
+        changed = set(only_folders)
+        staged = _walk_staged(staging_dir, list(changed), workers=workers)
         new_entries, _ = resolve_deployment(staged)
         existing = read_manifest_entries(target_data_dir)
-        merged = dict(existing)
+        new_keys = {e["relPath"].lower() for e in new_entries}
+        # A path the changed folder used to own but no longer provides -> stale.
+        for k, v in existing.items():
+            if v.get("source") in changed and k not in new_keys:
+                stale[k] = v
+        merged = {k: v for k, v in existing.items() if k not in stale}
         links = []
         for e in new_entries:
             key = e["relPath"].lower()
@@ -336,8 +346,11 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         links.sort(key=lambda fl: fl[1].lower())
     else:
         folders = list(enabled_folders)
+        prev = read_manifest_entries(target_data_dir)
         staged = _walk_staged(staging_dir, folders, workers=workers)
         entries, links = resolve_deployment(staged)
+        new_keys = {e["relPath"].lower() for e in entries}
+        stale = {k: v for k, v in prev.items() if k not in new_keys}
 
     linked = 0
     if link:
@@ -377,6 +390,24 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             print(f"WARNING: {len(failures)} of {total} files could not be linked "
                   f"(first few: {shown})")
 
+    # Unlink files dropped since the last deployment (only when actually linking).
+    # Safe-remove: keep a file the user replaced by hand (no longer our hardlink).
+    removed = 0
+    if link and stale:
+        for k, e in stale.items():
+            sub = e["relPath"].replace("\\", os.sep)
+            target = os.path.join(target_data_dir, sub)
+            if not os.path.lexists(target):
+                continue
+            src = os.path.join(staging_dir, e.get("source", ""), sub)
+            try:
+                if os.path.exists(src) and not os.path.samefile(src, target):
+                    continue   # user-modified -> leave it
+            except OSError:
+                pass
+            _force_remove(target)
+            removed += 1
+
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
                               entries, deployment_time_ms=deployment_time_ms)
     manifest_path = os.path.join(target_data_dir, MANIFEST_NAME)
@@ -386,7 +417,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
     os.replace(tmp, manifest_path)
 
     return DeployResult(len(entries), manifest_path, instance_id, linked,
-                        skipped_conflicts=skipped_conflicts)
+                        skipped_conflicts=skipped_conflicts, removed_stale=removed)
 
 
 def mark_deployed_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "node"):
