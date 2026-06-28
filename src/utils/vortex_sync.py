@@ -236,7 +236,7 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
                                         install_time=install_time_iso,
                                         mod_type=(folder_types or {}).get(folder, ""))
             add("mod", base, leaves)
-            base, leaves = vr.build_profile_modstate(profile_id, folder)
+            base, leaves = vr.build_profile_modstate(profile_id, folder, install_ms)
             add("profile_modstate", base, leaves)
             plan.mod_count += 1
             plan.profile_enables += 1
@@ -254,7 +254,7 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
             # stub -- so refreshMods sees parity and never re-stubs it.
             base, leaves = vr.build_orphan_mod(folder, install_time=install_time_iso)
             plan.records.update(vr.to_absolute(base, leaves))
-            base, leaves = vr.build_profile_modstate(profile_id, folder)
+            base, leaves = vr.build_profile_modstate(profile_id, folder, install_ms)
             add("profile_modstate", base, leaves)
             plan.orphan_count += 1
             plan.profile_enables += 1
@@ -340,7 +340,7 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
     base, leaves = vr.build_collection_download(
         info, coll_archive, coll_dl_id, collection_id=collection_id, slug=slug,
         revision_id=revision_id, revision_number=revision_number,
-        folder=collection_folder)
+        folder=collection_folder, file_time=install_ms)
     plan.records.update(vr.to_absolute(base, leaves))   # download record (no member schema)
     plan.new_downloads += 1
 
@@ -349,7 +349,7 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
                                            install_completed_ms=install_ms,
                                            install_time=install_time_iso)
     add("collection", base, leaves)
-    base, leaves = vr.build_profile_modstate(profile_id, collection_folder)
+    base, leaves = vr.build_profile_modstate(profile_id, collection_folder, install_ms)
     add("profile_modstate", base, leaves)
     recorded.add(collection_folder)
     base, leaves = vr.build_collection_revision(info, collection.get("mods", []),

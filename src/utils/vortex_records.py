@@ -32,6 +32,19 @@ def _flatten(tree: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
     return out
 
 
+def _ref_tag(source: Dict[str, Any]) -> str:
+    """The reference tag that links a member mod to its collection rule. Falls back
+    to a deterministic modId-fileId tag when the collection entry has no ``tag`` --
+    Vortex substitutes a shortid() so an empty tag can't false-match another empty
+    slot. Both the mod record and the rule derive it from the same source, so they
+    still match each other."""
+    tag = source.get("tag", "")
+    if tag:
+        return tag
+    mid, fid = source.get("modId"), source.get("fileId")
+    return f"nxd-{mid}-{fid}" if mid and fid else ""
+
+
 def build_download(source: Dict[str, Any], mod_name: str,
                    archive_name: str, dl_id: str, *,
                    folder: str = "", collection_id: Any = None) -> Tuple[str, Dict[str, Any]]:
@@ -99,10 +112,10 @@ def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
         "fileMD5": source.get("md5", ""), "fileName": archive_name,
         "fileSize": source.get("fileSize", 0),
         "logicalFileName": source.get("logicalFilename") or mod.get("name", ""),
-        "name": folder, "customFileName": mod.get("name", ""),
+        "name": folder,
         "version": str(mod.get("version", "")),
         "modVersion": str(mod.get("version", "")),
-        "referenceTag": source.get("tag", ""),     # links to a collection rule
+        "referenceTag": _ref_tag(source),          # links to a collection rule
         "author": mod.get("author", ""),
         "installedAsDependency": installed_as_dependency,
         "isPrimary": False,
@@ -116,6 +129,12 @@ def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
         attributes["category"] = cat
     elif isinstance(cat, str) and cat.isdigit():
         attributes["category"] = int(cat)
+    # Vortex only sets customFileName when the mod's display name actually differs
+    # from the file's logical name (else it leaves it unset and shows the logical
+    # name). Always-setting it forced a display override.
+    cust = mod.get("name", "")
+    if cust and cust.lower() != str(attributes["logicalFileName"]).lower():
+        attributes["customFileName"] = cust
     if variant:
         attributes["variant"] = variant
     if install_time:
@@ -138,10 +157,11 @@ def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
     return base, _flatten(tree)
 
 
-def build_profile_modstate(profile_id: str, folder: str) -> Tuple[str, Dict[str, Any]]:
+def build_profile_modstate(profile_id: str, folder: str,
+                           enabled_time: int = 0) -> Tuple[str, Dict[str, Any]]:
     """Build a ``persistent.profiles.<id>.modState.<folder>`` enable entry."""
     base = f"persistent{P}profiles{P}{profile_id}{P}modState{P}{folder}"
-    return base, _flatten({"enabled": True, "enabledTime": 0})
+    return base, _flatten({"enabled": True, "enabledTime": enabled_time})
 
 
 def build_orphan_mod(folder: str, install_time: str = "") -> Tuple[str, Dict[str, Any]]:
@@ -169,7 +189,8 @@ def build_orphan_mod(folder: str, install_time: str = "") -> Tuple[str, Dict[str
 def build_collection_download(info: Dict[str, Any], archive_name: str, dl_id: str, *,
                              collection_id: Any, slug: str, revision_id: int,
                              revision_number: int, size: int = 0,
-                             folder: str = "", file_md5: str = "") -> Tuple[str, Dict[str, Any]]:
+                             folder: str = "", file_md5: str = "",
+                             file_time: int = 0) -> Tuple[str, Dict[str, Any]]:
     """Build the ``persistent.downloads.files.<id>`` record for the collection
     archive itself (the ``.7z``).
 
@@ -186,6 +207,7 @@ def build_collection_download(info: Dict[str, Any], archive_name: str, dl_id: st
     tree = {
         "id": dl_id, "chunks": [], "pausable": False,
         "state": "finished", "source": "nexus", "fileMD5": file_md5,
+        "fileTime": file_time,
         "game": [GAME_ID, NEXUS_DOMAIN], "localPath": archive_name,
         "size": size, "received": size,
         "modInfo": {
@@ -230,7 +252,7 @@ def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[s
             "gameId": GAME_ID, "fileSize": s.get("fileSize", 0),
             "versionMatch": f">={mod.get('version', '0')}+{s.get('updatePolicy', 'prefer')}",
             "logicalFileName": s.get("logicalFilename") or mod.get("name", ""),
-            "tag": s.get("tag", ""), "md5Hint": s.get("md5", ""),
+            "tag": _ref_tag(s), "md5Hint": s.get("md5", ""),
             "repo": {
                 "repository": "nexus", "gameId": NEXUS_DOMAIN,
                 "modId": str(s.get("modId", "")), "fileId": str(s.get("fileId", "")),
