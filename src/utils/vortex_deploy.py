@@ -496,6 +496,46 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
     return PurgeResult(removed, skipped, manifest_path, len(remaining))
 
 
+def purge_by_inode(staging_dir: str, target_data_dir: str,
+                   progress: Optional[Callable[[int, int, str], None]] = None) -> int:
+    """Vortex-style deep purge (mirrors hardlink_activator ``purgeLinks``).
+
+    Independent of the manifest: collect the inodes of every hard-linked file under
+    staging, then walk the game folder and remove any file that shares one of those
+    inodes (i.e. is a hard link INTO staging). Catches orphaned links a stale
+    manifest no longer lists -- e.g. files left behind by an older deploy. Hardlinks
+    only exist within one volume, so an inode match here is unambiguous.
+
+    Returns the number of files removed. Requires st_ino/st_nlink (native Windows /
+    Linux; not 9p mounts).
+    """
+    inodes = set()
+    for dirpath, _dirs, files in os.walk(staging_dir):
+        for fn in files:
+            try:
+                st = os.stat(os.path.join(dirpath, fn))
+                if st.st_nlink > 1:
+                    inodes.add((st.st_dev, st.st_ino))
+            except OSError:
+                pass
+    if not inodes:
+        return 0
+    removed = 0
+    for dirpath, _dirs, files in os.walk(target_data_dir):
+        for fn in files:
+            full = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if st.st_nlink > 1 and (st.st_dev, st.st_ino) in inodes:
+                _force_remove(full)
+                removed += 1
+                if progress is not None and removed % 1000 == 0:
+                    progress(removed, len(inodes), fn)
+    return removed
+
+
 def _prune_empty_dirs(root: str) -> None:
     """Remove now-empty directories left behind by a purge (bottom-up)."""
     for dirpath, _dirs, _files in os.walk(root, topdown=False):

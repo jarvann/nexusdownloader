@@ -33,6 +33,9 @@ def main() -> int:
     ap.add_argument("--only", nargs="*", help="purge only these staging folders")
     ap.add_argument("--force", action="store_true",
                     help="remove manifest targets even if no longer our hardlink")
+    ap.add_argument("--deep", action="store_true",
+                    help="Vortex-style inode sweep: also remove ANY game-folder file "
+                         "hardlinked into staging, even if not in the manifest")
     ap.add_argument("--apply", action="store_true", help="actually remove (default: dry-run)")
     ap.add_argument("--no-db", action="store_true",
                     help="skip flagging needToDeploy in Vortex's DB")
@@ -78,6 +81,11 @@ def main() -> int:
                                          progress=_prog)
     print(f"\nremoved {res.removed}, skipped {res.skipped} (kept user-modified), "
           f"{res.remaining} still tracked.")
+
+    if args.deep:
+        print("\ndeep inode sweep (Vortex purgeLinks)...")
+        swept = vd.purge_by_inode(args.staging, args.game_data, progress=_prog)
+        print(f"  swept {swept} orphaned hardlink(s) not in the manifest.")
     return 0
 
 
