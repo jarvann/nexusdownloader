@@ -127,6 +127,20 @@ CREATE INDEX IF NOT EXISTS ix_mf_folder ON mod_files(folder);
 CREATE INDEX IF NOT EXISTS ix_mf_name   ON mod_files(name);
 CREATE INDEX IF NOT EXISTS ix_mf_md5    ON mod_files(md5);
 
+-- Files placed directly in the GAME ROOT (next to SkyrimSE.exe) rather than Data
+-- -- SKSE loader, ENB dlls, etc. Tracked so they can be reported/cleaned; they
+-- live outside Vortex's deployment, so Vortex won't manage or purge them.
+CREATE TABLE IF NOT EXISTS root_files (
+    id        INTEGER PRIMARY KEY,
+    folder    TEXT,
+    rel_dest  TEXT,
+    dest_path TEXT,
+    game_root TEXT,
+    created   INTEGER,
+    UNIQUE(dest_path)
+);
+CREATE INDEX IF NOT EXISTS ix_rf_folder ON root_files(folder);
+
 CREATE TABLE IF NOT EXISTS plugins (
     name          TEXT PRIMARY KEY,
     mod_folder    TEXT,
@@ -627,6 +641,19 @@ class LocalState:
         with self._connect() as c:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM mod_files WHERE name=?", (name.lower(),)).fetchall()]
+
+    # -- root_files ----------------------------------------------------------- #
+    def record_root_file(self, folder: str, rel_dest: str, dest_path: str,
+                         game_root: str) -> None:
+        """Record a file placed in the game root (not Data) by the installer."""
+        self._enqueue(
+            "INSERT OR REPLACE INTO root_files(folder,rel_dest,dest_path,game_root,created) "
+            "VALUES(?,?,?,?,?)",
+            (folder, rel_dest, dest_path, game_root, int(time.time())))
+
+    def all_root_files(self) -> List[Dict[str, Any]]:
+        with self._connect() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM root_files").fetchall()]
 
     # -- plugins -------------------------------------------------------------- #
     def upsert_plugin(self, name: str, mod_folder: str, flag: str, is_master: bool,

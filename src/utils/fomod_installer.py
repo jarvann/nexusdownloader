@@ -6,6 +6,7 @@ based on collection.json instructions, mimicking Vortex behavior.
 """
 
 import os
+import fnmatch
 import shutil
 import subprocess
 import tempfile
@@ -15,7 +16,7 @@ import threading
 import concurrent.futures
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any, Callable
+from typing import Dict, List, Optional, Union, Any, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -75,11 +76,26 @@ class InstallationResult:
     warnings: List[str] = field(default_factory=list)
 
 
+# Files that deploy to the GAME ROOT (next to SkyrimSE.exe), never into Data.
+# Script-extender loaders/dlls, ENB binaries, and common dll injectors/wrappers.
+# A loose .exe/.dll sitting *beside* a Data folder is always a root file in Skyrim
+# archives; these exact names/globs also catch the no-Data-folder case (ENB).
+_ROOT_FILE_NAMES = {
+    "skse64_loader.exe", "skse_loader.exe", "sksevr_loader.exe",
+    "skse_steam_loader.dll",
+    "d3d11.dll", "d3d9.dll", "d3dcompiler_46e.dll", "d3dcompiler_42.dll",
+    "dxgi.dll", "enbhost.exe",
+    "dinput8.dll", "winmm.dll", "version.dll", "binkw64.dll", "xinput1_3.dll",
+}
+_ROOT_FILE_GLOBS = ("skse64_*.dll", "sksevr_*.dll")
+_ROOT_FOLDER_NAME = "root"   # an explicit "Root/" folder maps onto the game root
+
+
 class FomodInstaller:
     """Handles FOMOD-based mod installation."""
-    
+
     def __init__(self, staging_path: Union[str, Path], logger: Optional[logging.Logger] = None,
-                 temp_root: Optional[str] = None):
+                 temp_root: Optional[str] = None, game_root: Optional[str] = None):
         """Initialize FOMOD installer.
 
         ``temp_root`` overrides where extraction scratch dirs are created. Blank/None
@@ -87,6 +103,11 @@ class FomodInstaller:
         small RAM disk (avoids "No space left on device" during extraction).
         """
         self.staging_path = Path(staging_path)
+        # Game install root (the folder holding SkyrimSE.exe). Root-level files
+        # (SKSE loader, ENB dlls) are placed here directly instead of into Data.
+        # When unknown, root files are detected and skipped with a warning rather
+        # than misplaced into Data.
+        self.game_root = Path(game_root) if game_root else None
         # Use the provided logger or get the unified install logger
         if logger is None:
             self.logger = get_logger('install')
@@ -531,6 +552,86 @@ class FomodInstaller:
         self.logger.warning(f"No clear mod root found, using extraction path: {extract_path}")
         return extract_path
     
+    def _collect_root_files(self, extract_root: Path, mod_root: Path) -> List[Tuple[Path, str]]:
+        """Identify files that belong in the GAME ROOT, not Data.
+
+        Returns ``(src_path, rel_dest)`` where ``rel_dest`` is relative to the game
+        root. Three sources, matching how Skyrim archives package root content:
+
+        * an explicit ``Root/`` folder (its tree maps onto the game root);
+        * loose ``.exe``/``.dll`` sitting beside a ``Data`` folder (always root files
+          in Skyrim -- Data never holds loose executables at its top);
+        * known root-only names anywhere at the top level (catches ENB / SKSE even
+          when the archive has no Data folder).
+        """
+        # The archive level that corresponds to the game root: the parent of a
+        # "Data" mod root, else the mod root itself.
+        container = mod_root.parent if mod_root.name.lower() == "data" else mod_root
+        has_data_sibling = mod_root.name.lower() == "data"
+        found: Dict[Path, str] = {}
+        if not container.is_dir():
+            return []
+
+        def _matches_known(name: str) -> bool:
+            low = name.lower()
+            if low in _ROOT_FILE_NAMES:
+                return True
+            return any(fnmatch.fnmatch(low, g) for g in _ROOT_FILE_GLOBS)
+
+        for child in container.iterdir():
+            if child.is_dir() and child.name.lower() == _ROOT_FOLDER_NAME:
+                for f in child.rglob("*"):
+                    if f.is_file():
+                        found[f] = str(f.relative_to(child))
+            elif child.is_file():
+                if (has_data_sibling and child.suffix.lower() in (".exe", ".dll")) \
+                        or _matches_known(child.name):
+                    found[child] = child.name
+        return list(found.items())
+
+    def _place_root_files(self, root_files: List[Tuple[Path, str]], mod_name: str,
+                          folder_name: str) -> List[Path]:
+        """Copy detected root files into the game root; record them in the ledger.
+
+        Returns the placed destination paths. If the game root is unknown we do NOT
+        guess -- the files are skipped with a warning so they never land in Data.
+        """
+        if not root_files:
+            return []
+        if not self.game_root or not self.game_root.is_dir():
+            names = ", ".join(sorted(d for _s, d in root_files))
+            self.logger.warning(
+                f"{mod_name}: {len(root_files)} game-root file(s) detected ({names}) "
+                f"but the game root is unknown -- skipping them (install manually). "
+                f"Set the game folder so they can be auto-placed.")
+            return []
+        placed: List[Path] = []
+        for src, rel_dest in root_files:
+            dst = self.game_root / rel_dest
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if self._copy_long(src, dst):
+                    placed.append(dst)
+                    self._record_root_file(folder_name, rel_dest, dst)
+            except OSError as e:
+                self.logger.warning(f"{mod_name}: failed to place root file {rel_dest}: {e}")
+        if placed:
+            self.logger.info(
+                f"{mod_name}: placed {len(placed)} file(s) into the game root "
+                f"({self.game_root}) instead of Data: "
+                + ", ".join(p.name for p in placed))
+        return placed
+
+    def _record_root_file(self, folder_name: str, rel_dest: str, dst: Path) -> None:
+        """Record a game-root placement in the ledger (best-effort)."""
+        try:
+            led = self._ledger()
+            if led is not None:
+                led.record_root_file(folder_name, rel_dest, str(dst),
+                                     str(self.game_root))
+        except Exception as e:
+            self.logger.debug(f"ledger record_root_file skipped: {e}")
+
     def _copy_long(self, src: Path, dst: Path) -> bool:
         """Copy ``src`` -> ``dst`` using the Windows extended-length (``\\\\?\\``)
         prefix so files whose full path exceeds MAX_PATH (260 chars) still install
@@ -607,6 +708,20 @@ class FomodInstaller:
             installed_files = []
             root_path = self._find_mod_root(temp_extract)
 
+            # Route game-root files (SKSE loader, ENB dlls) to the game folder, not
+            # Data. Exclude their sources from the staging copy so they don't ALSO
+            # land in Data. ``root_excludes`` holds temp paths under root_path that
+            # must be skipped (root files packaged inside the chosen mod root).
+            root_files = self._collect_root_files(temp_extract, root_path)
+            root_src_set = {s.resolve() for s, _d in root_files}
+            root_excludes = set()
+            for s in root_src_set:
+                try:
+                    s.relative_to(root_path.resolve())
+                    root_excludes.add(s)
+                except ValueError:
+                    pass  # lives outside root_path -> never copied to staging anyway
+
             # Cross-volume + robocopy available: copy the whole tree multi-threaded
             # in one shot, then drop the few skip-pattern files. (Hardlink/copy
             # modes use the per-file path below; robocopy falls back to it too if
@@ -617,7 +732,10 @@ class FomodInstaller:
                 for item in mod_install_path.rglob("*"):
                     if item.is_file():
                         rel_path = item.relative_to(mod_install_path)
-                        if self._should_skip_file(rel_path):
+                        # Drop skip-pattern files AND any root file robocopy carried
+                        # into staging (it belongs in the game root, placed below).
+                        if self._should_skip_file(rel_path) or \
+                                (root_excludes and (root_path / rel_path).resolve() in root_excludes):
                             try:
                                 item.unlink()
                             except OSError:
@@ -628,12 +746,19 @@ class FomodInstaller:
             if not placed_by_robocopy:
                 for item in root_path.rglob("*"):
                     if item.is_file():
+                        if root_excludes and item.resolve() in root_excludes:
+                            continue   # goes to the game root, not Data
                         # Skip FOMOD files and metadata
                         rel_path = item.relative_to(root_path)
                         if not self._should_skip_file(rel_path):
                             dest_path = mod_install_path / rel_path
                             if self._copy_long(item, dest_path):
                                 installed_files.append(dest_path)
+
+            # Place the detected root files into the game folder (counts toward a
+            # successful install so a loader-only mod isn't flagged empty).
+            installed_files.extend(
+                self._place_root_files(root_files, mod_name, folder_name))
             
             # Clean up temp extraction immediately after copying
             if temp_extract and temp_extract.exists():
@@ -1593,9 +1718,9 @@ class ParallelFomodInstaller(FomodInstaller):
 
     def __init__(self, staging_path: Union[str, Path], logger: Optional[logging.Logger] = None,
                  max_workers: int = 4, config: Optional[Dict[str, Any]] = None,
-                 temp_root: Optional[str] = None):
+                 temp_root: Optional[str] = None, game_root: Optional[str] = None):
         """Initialize parallel FOMOD installer."""
-        super().__init__(staging_path, logger, temp_root)
+        super().__init__(staging_path, logger, temp_root, game_root)
 
         # Threading configuration
         self.max_workers = max_workers
@@ -2007,15 +2132,17 @@ class ParallelFomodInstaller(FomodInstaller):
 
 def create_fomod_installer(staging_path: Union[str, Path],
                           logger: Optional[logging.Logger] = None,
-                          temp_root: Optional[str] = None) -> FomodInstaller:
+                          temp_root: Optional[str] = None,
+                          game_root: Optional[str] = None) -> FomodInstaller:
     """Create a FOMOD installer instance."""
-    return FomodInstaller(staging_path, logger, temp_root)
+    return FomodInstaller(staging_path, logger, temp_root, game_root)
 
 
 def create_parallel_fomod_installer(staging_path: Union[str, Path],
                                    logger: Optional[logging.Logger] = None,
                                    max_workers: int = 4,
                                    config: Optional[Dict[str, Any]] = None,
-                                   temp_root: Optional[str] = None) -> ParallelFomodInstaller:
+                                   temp_root: Optional[str] = None,
+                                   game_root: Optional[str] = None) -> ParallelFomodInstaller:
     """Create a parallel FOMOD installer instance."""
-    return ParallelFomodInstaller(staging_path, logger, max_workers, config, temp_root)
+    return ParallelFomodInstaller(staging_path, logger, max_workers, config, temp_root, game_root)

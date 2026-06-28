@@ -67,7 +67,8 @@ class InstallWorkerThread(QThread):
     installation_finished = Signal(list)  # List of InstallationResult
     
     def __init__(self, collection_path: str, downloads_path: str, staging_path: str,
-                 use_parallel: bool = True, max_workers: int = 4, temp_root: str = ""):
+                 use_parallel: bool = True, max_workers: int = 4, temp_root: str = "",
+                 game_root: str = ""):
         super().__init__()
         self.collection_path = collection_path
         self.downloads_path = downloads_path
@@ -76,6 +77,7 @@ class InstallWorkerThread(QThread):
         self.use_parallel = use_parallel
         self.max_workers = max_workers
         self.temp_root = temp_root
+        self.game_root = game_root or ""
         self._installer = None   # live ref so concurrency can be changed mid-run
     
     def cancel(self):
@@ -141,7 +143,7 @@ class InstallWorkerThread(QThread):
                 }
                 self.log_message.emit("DEBUG", "Creating parallel installer")
                 # Pass None as logger so installer creates its own file logger
-                with create_parallel_fomod_installer(self.staging_path, None, self.max_workers, config, self.temp_root or None) as installer:
+                with create_parallel_fomod_installer(self.staging_path, None, self.max_workers, config, self.temp_root or None, self.game_root or None) as installer:
                     self._installer = installer   # expose for live concurrency changes
                     # Set up callbacks for real-time progress updates
                     self.log_message.emit("DEBUG", "Setting up callbacks")
@@ -173,7 +175,7 @@ class InstallWorkerThread(QThread):
                 self.log_message.emit("DEBUG", "Creating sequential installer")
                 self.log_message.emit("INFO", f"Scanning staging folder for existing installations...")
                 # Pass None as logger so installer creates its own file logger
-                with create_fomod_installer(self.staging_path, None, self.temp_root or None) as installer:
+                with create_fomod_installer(self.staging_path, None, self.temp_root or None, self.game_root or None) as installer:
                     # Run sequential installation (includes pre-scan)
                     results = installer.install_collection(collection_data, self.downloads_path)
                     
@@ -798,6 +800,22 @@ class InstallTab(QWidget):
             self.log_message("DEBUG", f"Could not read install_temp_dir from config: {e}")
             return ""
 
+    def _resolve_game_root(self, game_id: str = "skyrimse") -> str:
+        """Best-effort game install root (folder holding SkyrimSE.exe) from Vortex's
+        discovery, for routing root files (SKSE/ENB). Blank if it can't be read
+        (Vortex open, no node, etc.) -- the installer then skips root files safely."""
+        try:
+            from utils import vortex_db
+            db = vortex_db.find_state_db()
+            if not db:
+                return ""
+            for g in vortex_db.read_vortex_games(db):
+                if g.get("game") == game_id and g.get("install"):
+                    return g["install"]
+        except Exception as e:
+            self.log_message("DEBUG", f"Could not resolve game root: {e}")
+        return ""
+
     # ----- One-click pipeline ------------------------------------------------ #
     def run_pipeline(self):
         """Run the whole flow (Install -> Baseline -> Link -> Deploy) in order."""
@@ -942,13 +960,21 @@ class InstallTab(QWidget):
         if temp_root:
             self.log_message("INFO", f"Using override install temp dir: {temp_root}")
 
+        game_root = self._resolve_game_root()
+        if game_root:
+            self.log_message("INFO", f"Game root for root-file placement: {game_root}")
+        else:
+            self.log_message("WARNING", "Game root unknown -- root files (SKSE/ENB) "
+                             "will be skipped rather than misplaced into Data.")
+
         self.install_thread = InstallWorkerThread(
             install_collection_path,
             self.downloads_path,
             self.game_path,
             use_parallel,
             max_workers,
-            temp_root
+            temp_root,
+            game_root
         )
         
         # Connect signals
