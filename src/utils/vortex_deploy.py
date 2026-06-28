@@ -177,7 +177,7 @@ def _hardlink(src: str, dst: str) -> None:
     except OSError:
         pass
     if os.path.lexists(dst):
-        _force_remove(dst)
+        _backup_or_remove(dst)
     try:
         os.link(src, dst)
     except OSError:
@@ -189,6 +189,42 @@ def _hardlink(src: str, dst: str) -> None:
             # dst still there and read-only -> clear the attribute and overwrite.
             _force_remove(dst)
             shutil.copy2(src, dst)
+
+
+BACKUP_SUFFIX = ".vortex_backup"
+
+
+def _backup_or_remove(dst: str) -> None:
+    """Make room at ``dst`` for a link. A *real* file (a standalone vanilla/loose
+    game file, nlink==1) is renamed to ``<dst>.vortex_backup`` so a later purge can
+    restore it -- matching Vortex's deployFile. A prior deploy's hardlink (nlink>1)
+    is just removed. An existing backup is never clobbered."""
+    bak = dst + BACKUP_SUFFIX
+    try:
+        st = os.lstat(dst)
+        is_real_file = stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+    except OSError:
+        is_real_file = False
+    if is_real_file and not os.path.lexists(bak):
+        try:
+            os.replace(dst, bak)
+            return
+        except OSError:
+            pass
+    _force_remove(dst)
+
+
+def _restore_backup(target: str) -> bool:
+    """If ``<target>.vortex_backup`` exists, move it back into place. Returns True
+    if a backup was restored. Called on purge so vanilla files come back."""
+    bak = target + BACKUP_SUFFIX
+    if os.path.lexists(bak):
+        try:
+            os.replace(bak, target)
+            return True
+        except OSError:
+            pass
+    return False
 
 
 def _force_remove(path: str) -> None:
@@ -406,6 +442,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             except OSError:
                 pass
             _force_remove(target)
+            _restore_backup(target)   # bring back any vanilla file we shadowed
             removed += 1
 
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
@@ -497,10 +534,12 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
                 skipped += 1                  # user replaced it -> leave it
                 continue
             _force_remove(target)
+            _restore_backup(target)
             removed += 1
             purged_keys.add(rel.lower())
         else:
             _force_remove(target)
+            _restore_backup(target)
             removed += 1
             purged_keys.add(rel.lower())
         if progress is not None and (i % 200 == 0 or i == total - 1):
@@ -561,6 +600,7 @@ def purge_by_inode(staging_dir: str, target_data_dir: str,
                 continue
             if st.st_nlink > 1 and (st.st_dev, st.st_ino) in inodes:
                 _force_remove(full)
+                _restore_backup(full)
                 removed += 1
                 if progress is not None and removed % 1000 == 0:
                     progress(removed, len(inodes), fn)
