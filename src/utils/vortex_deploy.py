@@ -250,24 +250,57 @@ def _walk_staged(staging_dir: str, folders: Iterable[str],
     return [t for folder in folders for t in _walk_one(staging_dir, folder)]
 
 
+def read_manifest_entries(target_data_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Read an existing manifest's file entries, keyed by lower-cased relPath.
+
+    Returns ``{}`` when no (or an unreadable) manifest exists. Used by the
+    incremental deploy to keep every already-tracked file instead of rebuilding
+    the whole manifest from a full staging walk.
+    """
+    manifest = os.path.join(target_data_dir, MANIFEST_NAME)
+    if not os.path.isfile(manifest):
+        return {}
+    try:
+        with open(manifest, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for e in data.get("files", []):
+        rel = e.get("relPath")
+        if rel:
+            out[rel.lower()] = e
+    return out
+
+
 @dataclass
 class DeployResult:
     files: int
     manifest_path: str
     instance_id: str
     linked: int
+    skipped_conflicts: int = 0   # changed-folder files left to an existing higher
+                                 # -priority winner (incremental mode only)
 
 
 def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str],
            game_id: str = GAME_ID, *, instance_id: Optional[str] = None,
            link: bool = True, deployment_time_ms: int = 0,
-           workers: int = 1,
+           workers: int = 1, only_folders: Optional[Iterable[str]] = None,
            progress: Optional[Callable[[int, int, str], None]] = None) -> DeployResult:
     """Hard-link staged files into the game folder and write the deployment manifest.
 
     ``enabled_folders`` must be in **load order** (ascending priority) so that, on
     a file conflict, the higher-priority mod wins -- the manifest always matches
     whatever ends up on disk, so Vortex stays consistent either way.
+
+    ``only_folders`` switches to **incremental** mode: only those folders are
+    walked + linked, and their files are MERGED into the existing manifest (every
+    other already-tracked file is preserved). This turns a one-mod reinstall into
+    a delta instead of a full 684k-file redeploy. A changed file wins unless a
+    DIFFERENT folder already owns that path in the manifest (a real cross-mod
+    conflict) -- those are left to the existing winner and counted, since resolving
+    them correctly needs the full load order (run a full deploy for that).
 
     ``workers > 1`` parallelizes the (latency-bound) file walk and hard-linking
     across a thread pool. Conflict resolution still happens centrally on the
@@ -282,9 +315,29 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             "Could not determine the Vortex instance id (no deployment manifest "
             f"or {STAGING_MARKER} marker found). Open Vortex for this game once.")
 
-    folders = list(enabled_folders)
-    staged = _walk_staged(staging_dir, folders, workers=workers)
-    entries, links = resolve_deployment(staged)
+    skipped_conflicts = 0
+    if only_folders is not None:
+        # Incremental: walk only the changed folders, merge into the live manifest.
+        changed = list(only_folders)
+        staged = _walk_staged(staging_dir, changed, workers=workers)
+        new_entries, _ = resolve_deployment(staged)
+        existing = read_manifest_entries(target_data_dir)
+        merged = dict(existing)
+        links = []
+        for e in new_entries:
+            key = e["relPath"].lower()
+            cur = merged.get(key)
+            if cur is None or cur.get("source") == e["source"]:
+                merged[key] = e
+                links.append((e["source"], e["relPath"]))
+            else:
+                skipped_conflicts += 1
+        entries = sorted(merged.values(), key=lambda x: x["relPath"].lower())
+        links.sort(key=lambda fl: fl[1].lower())
+    else:
+        folders = list(enabled_folders)
+        staged = _walk_staged(staging_dir, folders, workers=workers)
+        entries, links = resolve_deployment(staged)
 
     linked = 0
     if link:
@@ -332,7 +385,8 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         json.dump(manifest, fh, indent=2)
     os.replace(tmp, manifest_path)
 
-    return DeployResult(len(entries), manifest_path, instance_id, linked)
+    return DeployResult(len(entries), manifest_path, instance_id, linked,
+                        skipped_conflicts=skipped_conflicts)
 
 
 def mark_deployed_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "node"):
@@ -378,7 +432,7 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                       enabled_folders: Optional[Iterable[str]] = None,
                       game_id: str = GAME_ID, *, collection: Optional[Dict[str, Any]] = None,
                       node: str = "node", deployment_time_ms: int = 0,
-                      workers: int = 1,
+                      workers: int = 1, only_folders: Optional[Iterable[str]] = None,
                       progress: Optional[Callable[[int, int, str], None]] = None
                       ) -> Tuple[DeployResult, Any]:
     """High-level: hard-link + write manifest, then mark the deployment in the DB.
@@ -386,6 +440,9 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     Deploy order (which decides file-conflict winners) comes from the collection's
     modRules when ``collection`` is supplied; otherwise from an explicit
     ``enabled_folders`` list, else sorted folder order.
+
+    ``only_folders`` runs an incremental deploy (see :func:`deploy`) -- just those
+    folders are linked + merged into the live manifest, instead of a full redeploy.
     """
     if enabled_folders is None:
         enabled_folders = order_folders_for_deploy(staging_dir, collection)
@@ -403,7 +460,7 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
                     instance_id=instance_id,
                     deployment_time_ms=deployment_time_ms, workers=workers,
-                    progress=progress)
+                    only_folders=only_folders, progress=progress)
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
     return result, db_write
 
@@ -422,6 +479,7 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
                         game_id: str = GAME_ID, *, node: str = "node",
                         deployment_time_ms: int = 0, backup: bool = True,
                         workers: int = 1, eslify: bool = True,
+                        only_folders: Optional[Iterable[str]] = None,
                         progress: Optional[Callable[[int, int, str], None]] = None) -> FinalizeResult:
     """Full post-install pipeline: order mods -> deploy -> sort plugins.
 
@@ -430,6 +488,8 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
     plugins.txt from ``collection.pluginRules`` (masters-first; existing files
     backed up). ``localappdata_dir`` is the game's ``%LOCALAPPDATA%/<Game>`` dir.
 
+    ``only_folders`` runs an incremental deploy (delta-merge into the live
+    manifest) instead of a full redeploy -- for reinstalling a handful of mods.
     ``workers > 1`` parallelizes the deploy's file walk + hard-linking.
     """
     from utils import vortex_loadorder as lo
@@ -438,7 +498,7 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
     result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
                                   collection=collection, node=node,
                                   deployment_time_ms=deployment_time_ms, workers=workers,
-                                  progress=progress)
+                                  only_folders=only_folders, progress=progress)
 
     # Auto-flag eligible plugins as light (ESL) -- our equivalent of Vortex's
     # "mark could-be-light as light". Without it the full-plugin count blows past
