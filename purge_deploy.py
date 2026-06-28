@@ -36,6 +36,8 @@ def main() -> int:
     ap.add_argument("--deep", action="store_true",
                     help="Vortex-style inode sweep: also remove ANY game-folder file "
                          "hardlinked into staging, even if not in the manifest")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="parallel unlink threads (default 16; unlink is I/O-bound)")
     ap.add_argument("--apply", action="store_true", help="actually remove (default: dry-run)")
     ap.add_argument("--no-db", action="store_true",
                     help="skip flagging needToDeploy in Vortex's DB")
@@ -64,7 +66,7 @@ def main() -> int:
 
     if args.no_db:
         res = vd.purge(args.staging, args.game_data, only_folders=only,
-                       force=args.force, progress=_prog)
+                       force=args.force, workers=args.workers, progress=_prog)
     else:
         db = None
         try:
@@ -74,11 +76,11 @@ def main() -> int:
             print(f"  (could not find Vortex DB: {e}; skipping DB flag)")
         if not db:
             res = vd.purge(args.staging, args.game_data, only_folders=only,
-                           force=args.force, progress=_prog)
+                           force=args.force, workers=args.workers, progress=_prog)
         else:
             res, _ = vd.purge_collection(db, args.staging, args.game_data,
                                          only_folders=only, force=args.force,
-                                         progress=_prog)
+                                         workers=args.workers, progress=_prog)
     print(f"\nremoved {res.removed}, skipped {res.skipped} (kept user-modified), "
           f"{res.remaining} still tracked.")
 

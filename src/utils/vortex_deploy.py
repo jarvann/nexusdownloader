@@ -286,6 +286,42 @@ def _walk_staged(staging_dir: str, folders: Iterable[str],
     return [t for folder in folders for t in _walk_one(staging_dir, folder)]
 
 
+MSGPACK_BACKUP = "vortex.deployment.msgpack"
+
+
+def _atomic_write(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def save_manifest(staging_dir: str, target_data_dir: str,
+                  manifest: Dict[str, Any]) -> str:
+    """Write the manifest to BOTH locations Vortex reads (activationStore):
+
+    * primary ``vortex.deployment.json`` in the game/Data folder, and
+    * the staging-folder copy Vortex falls back to (``loadActivation`` reads
+      ``<staging>/vortex.deployment.json`` before the binary backup).
+
+    A stale ``vortex.deployment.msgpack`` left by a real Vortex deploy is removed
+    so Vortex can't fall back to outdated binary state (we can't write msgpack, but
+    two consistent JSON copies are enough redundancy). Returns the primary path.
+    """
+    data = json.dumps(manifest, indent=2)
+    primary = os.path.join(target_data_dir, MANIFEST_NAME)
+    _atomic_write(primary, data)
+    if staging_dir and os.path.isdir(staging_dir):
+        try:
+            _atomic_write(os.path.join(staging_dir, MANIFEST_NAME), data)
+            stale = os.path.join(staging_dir, MSGPACK_BACKUP)
+            if os.path.lexists(stale):
+                os.remove(stale)
+        except OSError:
+            pass
+    return primary
+
+
 def read_manifest_entries(target_data_dir: str) -> Dict[str, Dict[str, Any]]:
     """Read an existing manifest's file entries, keyed by lower-cased relPath.
 
@@ -447,11 +483,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
 
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
                               entries, deployment_time_ms=deployment_time_ms)
-    manifest_path = os.path.join(target_data_dir, MANIFEST_NAME)
-    tmp = manifest_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2)
-    os.replace(tmp, manifest_path)
+    manifest_path = save_manifest(staging_dir, target_data_dir, manifest)
 
     return DeployResult(len(entries), manifest_path, instance_id, linked,
                         skipped_conflicts=skipped_conflicts, removed_stale=removed)
@@ -493,7 +525,7 @@ class PurgeResult:
 
 def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
           only_folders: Optional[Iterable[str]] = None, force: bool = False,
-          prune_empty_dirs: bool = True,
+          prune_empty_dirs: bool = True, workers: int = 1,
           progress: Optional[Callable[[int, int, str], None]] = None) -> PurgeResult:
     """Un-deploy: remove the files this deployment placed, per ``vortex.deployment.json``.
 
@@ -507,7 +539,8 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
     ``force=True`` removes manifest targets regardless (Vortex's own behavior).
 
     ``only_folders`` purges just those mods' files (partial un-deploy); otherwise
-    everything in the manifest is purged.
+    everything in the manifest is purged. ``workers > 1`` removes files across a
+    thread pool (unlink is latency-bound, so this scales well over many files).
     """
     entries = read_manifest_entries(target_data_dir)
     only = {f for f in only_folders} if only_folders is not None else None
@@ -515,41 +548,56 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
     targets = [e for e in entries.values()
                if only is None or e.get("source") in only]
     total = len(targets)
-    removed = skipped = 0
+
+    from threading import Lock
+    lock = Lock()
+    counters = {"removed": 0, "skipped": 0, "done": 0}
     purged_keys = set()
-    for i, e in enumerate(targets):
+
+    def _purge_one(e):
         rel = e["relPath"]
         sub = rel.replace("\\", os.sep)
         target = os.path.join(target_data_dir, sub)
-        source = e.get("source", "")
-        src = os.path.join(staging_dir, source, sub)
-        if not os.path.lexists(target):
-            purged_keys.add(rel.lower())     # already gone -> drop from manifest
-        elif not force and os.path.exists(src):
-            try:
-                same = os.path.samefile(src, target)
-            except OSError:
-                same = False
-            if not same:
-                skipped += 1                  # user replaced it -> leave it
-                continue
-            _force_remove(target)
-            _restore_backup(target)
-            removed += 1
-            purged_keys.add(rel.lower())
-        else:
-            _force_remove(target)
-            _restore_backup(target)
-            removed += 1
-            purged_keys.add(rel.lower())
-        if progress is not None and (i % 200 == 0 or i == total - 1):
-            progress(i + 1, total, rel)
+        src = os.path.join(staging_dir, e.get("source", ""), sub)
+        status = "gone"
+        if os.path.lexists(target):
+            if not force and os.path.exists(src):
+                try:
+                    same = os.path.samefile(src, target)
+                except OSError:
+                    same = False
+                if not same:
+                    status = "skipped"          # user replaced it -> leave it
+            if status != "skipped":
+                _force_remove(target)
+                _restore_backup(target)
+                status = "removed"
+        with lock:
+            if status == "skipped":
+                counters["skipped"] += 1
+            else:
+                purged_keys.add(rel.lower())
+                if status == "removed":
+                    counters["removed"] += 1
+            counters["done"] += 1
+            if progress is not None and (counters["done"] % 200 == 0 or counters["done"] == total):
+                progress(counters["done"], total, rel)
+
+    if workers and workers > 1 and total > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_purge_one, targets))
+    else:
+        for e in targets:
+            _purge_one(e)
+    removed, skipped = counters["removed"], counters["skipped"]
 
     remaining = {k: v for k, v in entries.items() if k not in purged_keys}
     if prune_empty_dirs:
         _prune_empty_dirs(target_data_dir)
 
-    # Rewrite the manifest with whatever's left (preserve its header fields).
+    # Rewrite the manifest (BOTH game-folder + staging copies) with what's left,
+    # preserving its header fields, so Vortex reads consistent state either side.
     manifest_path = os.path.join(target_data_dir, MANIFEST_NAME)
     if os.path.isfile(manifest_path):
         try:
@@ -558,10 +606,7 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
         except (OSError, ValueError):
             manifest = {}
         manifest["files"] = sorted(remaining.values(), key=lambda x: x["relPath"].lower())
-        tmp = manifest_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, indent=2)
-        os.replace(tmp, manifest_path)
+        manifest_path = save_manifest(staging_dir, target_data_dir, manifest)
 
     return PurgeResult(removed, skipped, manifest_path, len(remaining))
 
@@ -622,12 +667,14 @@ def _prune_empty_dirs(root: str) -> None:
 def purge_collection(db_path: str, staging_dir: str, target_data_dir: str,
                      game_id: str = GAME_ID, *, node: str = "node",
                      only_folders: Optional[Iterable[str]] = None, force: bool = False,
+                     workers: int = 1,
                      progress: Optional[Callable[[int, int, str], None]] = None
                      ) -> Tuple[PurgeResult, Any]:
     """High-level purge: un-deploy files, then flag ``needToDeploy`` in the DB so
     Vortex knows the Data folder no longer matches staging (requires Vortex closed)."""
     result = purge(staging_dir, target_data_dir, game_id,
-                   only_folders=only_folders, force=force, progress=progress)
+                   only_folders=only_folders, force=force, workers=workers,
+                   progress=progress)
     db_write = mark_needs_deploy_in_db(db_path, game_id, node=node)
     return result, db_write
 
