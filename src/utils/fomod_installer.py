@@ -479,13 +479,18 @@ class FomodInstaller:
         2. Single subdirectory containing mod content
         3. Data folder containing mod content
         """
-        # Common Skyrim mod file patterns
+        # Gamebryo "stop patterns" -- the top-level Data folders/markers Vortex's
+        # installer uses to recognize a mod root (gameSupport.ts gamebryoPatterns).
+        # Source/meta.ini were ours, not Vortex's, and could anchor the root a level
+        # too deep, so they're dropped.
         mod_indicators = [
             "*.esp", "*.esm", "*.esl",  # Plugin files
             "*.bsa", "*.ba2",           # Archive files
-            "meshes", "textures", "scripts", "sound", "music", "video",  # Data folders
-            "CalienteTools", "SKSE", "Interface", "Source",  # Tool folders
-            "meta.ini", "fomod"         # Meta files
+            "distantlod", "textures", "meshes", "music", "shaders", "video",
+            "interface", "fonts", "scripts", "facegen", "menus", "lodsettings",
+            "lsdata", "sound", "strings", "trees", "asi", "tools", "calientetools",
+            "skse",                     # Data/SKSE/Plugins is valid mod content
+            "fomod",
         ]
         
         def has_mod_content(path: Path) -> bool:
@@ -1089,28 +1094,19 @@ class FomodInstaller:
                 self.logger.debug(f"FOMOD: Added single file: '{path.relative_to(extract_path)}'")
     
     def _should_skip_file(self, file_path: Path) -> bool:
-        """Check if a file should be skipped during installation."""
-        skip_patterns = [
-            'fomod/',
-            'readme',
-            'changelog',
-            'license',
-            '.txt',
-            '.md',
-            '.pdf',
-            'thumbs.db',
-            '.ds_store'
-        ]
-        
-        # Convert to lowercase for case-insensitive comparison
-        file_path_str = str(file_path).lower().replace('\\', '/')
-        
-        for pattern in skip_patterns:
-            pattern_lower = pattern.lower()
-            if pattern_lower in file_path_str:
-                self.logger.debug(f"FOMOD: Skipping file '{file_path}' - matches skip pattern '{pattern}'")
-                return True
-        
+        """Files to leave OUT of staging. Matches Vortex's basic installer, which
+        copies everything EXCEPT installer metadata and OS junk -- it does NOT drop
+        readmes/docs (Skyrim just ignores them; dropping them risked the old
+        unanchored substring bug, e.g. 'license' killing ``license_plate.dds`` or
+        '.txt' matching anywhere in the path)."""
+        parts = [p.lower() for p in file_path.parts]
+        name = file_path.name.lower()
+        # The FOMOD config folder is installer metadata, not mod content.
+        if "fomod" in parts:
+            return True
+        # OS / filesystem junk.
+        if name in ("thumbs.db", "desktop.ini", ".ds_store"):
+            return True
         return False
     
     def validate_downloads_complete(self, collection_data: Dict[str, Any], 
