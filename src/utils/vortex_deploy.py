@@ -297,7 +297,8 @@ def _atomic_write(path: str, text: str) -> None:
 
 
 def save_manifest(staging_dir: str, target_data_dir: str,
-                  manifest: Dict[str, Any]) -> str:
+                  manifest: Dict[str, Any],
+                  manifest_name: str = MANIFEST_NAME) -> str:
     """Write the manifest to BOTH locations Vortex reads (activationStore):
 
     * primary ``vortex.deployment.json`` in the game/Data folder, and
@@ -309,11 +310,11 @@ def save_manifest(staging_dir: str, target_data_dir: str,
     two consistent JSON copies are enough redundancy). Returns the primary path.
     """
     data = json.dumps(manifest, indent=2)
-    primary = os.path.join(target_data_dir, MANIFEST_NAME)
+    primary = os.path.join(target_data_dir, manifest_name)
     _atomic_write(primary, data)
     if staging_dir and os.path.isdir(staging_dir):
         try:
-            _atomic_write(os.path.join(staging_dir, MANIFEST_NAME), data)
+            _atomic_write(os.path.join(staging_dir, manifest_name), data)
             stale = os.path.join(staging_dir, MSGPACK_BACKUP)
             if os.path.lexists(stale):
                 os.remove(stale)
@@ -322,14 +323,15 @@ def save_manifest(staging_dir: str, target_data_dir: str,
     return primary
 
 
-def read_manifest_entries(target_data_dir: str) -> Dict[str, Dict[str, Any]]:
+def read_manifest_entries(target_data_dir: str,
+                          manifest_name: str = MANIFEST_NAME) -> Dict[str, Dict[str, Any]]:
     """Read an existing manifest's file entries, keyed by lower-cased relPath.
 
     Returns ``{}`` when no (or an unreadable) manifest exists. Used by the
     incremental deploy to keep every already-tracked file instead of rebuilding
     the whole manifest from a full staging walk.
     """
-    manifest = os.path.join(target_data_dir, MANIFEST_NAME)
+    manifest = os.path.join(target_data_dir, manifest_name)
     if not os.path.isfile(manifest):
         return {}
     try:
@@ -360,6 +362,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
            game_id: str = GAME_ID, *, instance_id: Optional[str] = None,
            link: bool = True, deployment_time_ms: int = 0,
            workers: int = 1, only_folders: Optional[Iterable[str]] = None,
+           manifest_name: str = MANIFEST_NAME,
            progress: Optional[Callable[[int, int, str], None]] = None) -> DeployResult:
     """Hard-link staged files into the game folder and write the deployment manifest.
 
@@ -398,7 +401,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         changed = set(only_folders)
         staged = _walk_staged(staging_dir, list(changed), workers=workers)
         new_entries, _ = resolve_deployment(staged)
-        existing = read_manifest_entries(target_data_dir)
+        existing = read_manifest_entries(target_data_dir, manifest_name)
         new_keys = {e["relPath"].lower() for e in new_entries}
         # A path the changed folder used to own but no longer provides -> stale.
         for k, v in existing.items():
@@ -418,7 +421,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         links.sort(key=lambda fl: fl[1].lower())
     else:
         folders = list(enabled_folders)
-        prev = read_manifest_entries(target_data_dir)
+        prev = read_manifest_entries(target_data_dir, manifest_name)
         staged = _walk_staged(staging_dir, folders, workers=workers)
         entries, links = resolve_deployment(staged)
         new_keys = {e["relPath"].lower() for e in entries}
@@ -483,7 +486,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
 
     manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
                               entries, deployment_time_ms=deployment_time_ms)
-    manifest_path = save_manifest(staging_dir, target_data_dir, manifest)
+    manifest_path = save_manifest(staging_dir, target_data_dir, manifest, manifest_name)
 
     return DeployResult(len(entries), manifest_path, instance_id, linked,
                         skipped_conflicts=skipped_conflicts, removed_stale=removed)
@@ -526,6 +529,7 @@ class PurgeResult:
 def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
           only_folders: Optional[Iterable[str]] = None, force: bool = False,
           prune_empty_dirs: bool = True, workers: int = 1,
+          manifest_name: str = MANIFEST_NAME,
           progress: Optional[Callable[[int, int, str], None]] = None) -> PurgeResult:
     """Un-deploy: remove the files this deployment placed, per ``vortex.deployment.json``.
 
@@ -542,7 +546,7 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
     everything in the manifest is purged. ``workers > 1`` removes files across a
     thread pool (unlink is latency-bound, so this scales well over many files).
     """
-    entries = read_manifest_entries(target_data_dir)
+    entries = read_manifest_entries(target_data_dir, manifest_name)
     only = {f for f in only_folders} if only_folders is not None else None
 
     targets = [e for e in entries.values()
@@ -598,7 +602,7 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
 
     # Rewrite the manifest (BOTH game-folder + staging copies) with what's left,
     # preserving its header fields, so Vortex reads consistent state either side.
-    manifest_path = os.path.join(target_data_dir, MANIFEST_NAME)
+    manifest_path = os.path.join(target_data_dir, manifest_name)
     if os.path.isfile(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8") as fh:
@@ -606,7 +610,7 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
         except (OSError, ValueError):
             manifest = {}
         manifest["files"] = sorted(remaining.values(), key=lambda x: x["relPath"].lower())
-        manifest_path = save_manifest(staging_dir, target_data_dir, manifest)
+        manifest_path = save_manifest(staging_dir, target_data_dir, manifest, manifest_name)
 
     return PurgeResult(removed, skipped, manifest_path, len(remaining))
 
