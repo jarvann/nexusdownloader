@@ -83,6 +83,9 @@ class InstallationResult:
 _ROOT_FILE_NAMES = {
     "skse64_loader.exe", "skse_loader.exe", "sksevr_loader.exe",
     "skse_steam_loader.dll",
+    # SSE Engine Fixes "Part 2" pre-load shims -- must sit beside SkyrimSE.exe or
+    # Engine Fixes refuses to load ("did not pre-load").
+    "d3dx9_42.dll", "tbbmalloc.dll", "tbbmalloc_proxy.dll",
     "d3d11.dll", "d3d9.dll", "d3dcompiler_46e.dll", "d3dcompiler_42.dll",
     "dxgi.dll", "enbhost.exe",
     "dinput8.dll", "winmm.dll", "version.dll", "binkw64.dll", "xinput1_3.dll",
