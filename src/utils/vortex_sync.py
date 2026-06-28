@@ -148,6 +148,9 @@ class SyncPlan:
     modrule_count: int = 0      # per-mod before/after conflict rules written
     dropped_cycle_rules: int = 0  # rules dropped as self-loops / cycle-breakers
     violations: List[str] = field(default_factory=list)     # schema problems
+    # (modId,fileId) -> the folder we installed it under. Lets run() spot Vortex's
+    # leftover native stub for the same file under a DIFFERENT folder and delete it.
+    member_folders: Dict[Tuple[int, int], str] = field(default_factory=dict)
 
     @property
     def total_keys(self) -> int:
@@ -235,6 +238,8 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
             add("profile_modstate", base, leaves)
             plan.mod_count += 1
             plan.profile_enables += 1
+            if mid and fid:
+                plan.member_folders[(int(mid), int(fid))] = folder
             archive_id_by_folder[folder] = dl_id
             if md5:
                 folder_by_md5[md5.lower()] = folder
@@ -382,6 +387,61 @@ def find_replaceable_collections(mods_data: Dict[str, object], collection_id: in
     return prefixes
 
 
+def _folder_is_fileless(staging_dir: str, folder: str) -> bool:
+    """True if ``folder`` backs no real files (missing, or an empty dir tree).
+
+    The safety gate for stub deletion: we only ever drop a Vortex mod record whose
+    staging folder holds nothing, so a real install is never removed by accident.
+    """
+    path = os.path.join(staging_dir, folder)
+    if not os.path.isdir(path):
+        return True
+    for _root, _dirs, files in os.walk(path):
+        if files:
+            return False
+    return True
+
+
+def find_duplicate_stubs(mods_data: Dict[str, object],
+                         member_folders: Dict[Tuple[int, int], str],
+                         staging_dir: str, profile_id: str,
+                         game: str = GAME_ID) -> List[str]:
+    """Prefixes to delete for Vortex's leftover "Never Installed" twin stubs.
+
+    Our projection is pure (it never reads Vortex's side), so when Vortex already
+    had a native mod entry for a file under a DIFFERENT folder than the one we
+    installed it under, both survive -- ours (Enabled, a member) plus Vortex's
+    ghost (Unspecified, "Never Installed"). For each native entry whose
+    (modId,fileId) matches one we just projected as a member but under a different,
+    file-less folder, return the prefixes (mod record + its profile modState) to
+    remove. The file-less gate guarantees we never delete a folder with real files.
+    """
+    by_folder: Dict[str, Dict[str, object]] = {}
+    for k, v in mods_data.items():
+        parts = k.split("###")
+        if len(parts) < 5:
+            continue
+        by_folder.setdefault(parts[3], {})[".".join(parts[4:])] = v
+
+    prefixes: List[str] = []
+    for folder, leaves in by_folder.items():
+        mid, fid = leaves.get("attributes.modId"), leaves.get("attributes.fileId")
+        if mid is None or fid is None:
+            continue
+        try:
+            key = (int(mid), int(fid))
+        except (TypeError, ValueError):
+            continue
+        ours = member_folders.get(key)
+        if not ours or ours == folder:
+            continue  # not one of ours, or it IS our folder (a clean overwrite)
+        if not _folder_is_fileless(staging_dir, folder):
+            continue  # a real install lives here -- leave it alone
+        prefixes.append(f"persistent###mods###{game}###{folder}")
+        prefixes.append(f"persistent###profiles###{profile_id}###modState###{folder}")
+    return prefixes
+
+
 @dataclass
 class SyncResult:
     applied: bool
@@ -391,6 +451,7 @@ class SyncResult:
     backup_path: str = ""
     message: str = ""
     replaced_collections: int = 0   # old collection revisions removed
+    removed_stubs: int = 0          # Vortex's leftover "Never Installed" twin stubs
 
 
 def _sample_live_records(read_prefix, db_path) -> Dict[str, Dict[str, Any]]:
@@ -473,17 +534,26 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
         return SyncResult(False, plan, risk,
                           message=f"aborted: {risk.message} (use force=True to override)")
 
-    # Replace old revisions of the same collection (delete in the same batch).
+    # Read Vortex's current mods once, for both cleanup passes below.
     delete_prefixes: List[str] = []
+    removed_stubs = 0
     if replace:
         mods_data = vortex_db.read_prefix(db_path, f"persistent###mods###{GAME_ID}###", node=node)
+        # 1. Old revisions of the same collection (a 198 -> 232 update).
         delete_prefixes = find_replaceable_collections(
             mods_data, collection_id, collection_folder, profile_id)
+        # 2. Vortex's leftover "Never Installed" twin stubs for files we installed
+        #    under a different folder (the <Unspecified> ghosts). File-less only.
+        stub_prefixes = find_duplicate_stubs(
+            mods_data, plan.member_folders, staging_dir, profile_id)
+        delete_prefixes.extend(stub_prefixes)
+        removed_stubs = len(stub_prefixes) // 2
 
     res = vortex_db.write_records(db_path, plan.records, backup=True, node=node,
                                   delete_prefixes=delete_prefixes)
     return SyncResult(True, plan, risk, res.keys_written, res.backup_path, "applied",
-                      replaced_collections=len(delete_prefixes) // 2)
+                      replaced_collections=len(delete_prefixes) // 2 - removed_stubs,
+                      removed_stubs=removed_stubs)
 
 
 def sync_collection(collection_path: str, downloads_dir: str, staging_dir: str, *,
