@@ -160,7 +160,8 @@ class SyncPlan:
 def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
                profile_id: str, collection_folder: str, collection_id: int, slug: str,
                revision_id: int, revision_number: int,
-               install_time_iso: str = "", install_ms: int = 0) -> SyncPlan:
+               install_time_iso: str = "", install_ms: int = 0,
+               folder_types: Optional[Dict[str, str]] = None) -> SyncPlan:
     """Build + validate every record for the sync (pure; reads only ``ledger_mods``).
 
     ``ledger_mods`` is the authoritative state from :mod:`utils.local_state`
@@ -232,7 +233,8 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
             s = mod_data.get("source", {})
             base, leaves = vr.build_mod(s, mod_data, folder, dl_id, archive,
                                         variant=coll_name, installed_as_dependency=True,
-                                        install_time=install_time_iso)
+                                        install_time=install_time_iso,
+                                        mod_type=(folder_types or {}).get(folder, ""))
             add("mod", base, leaves)
             base, leaves = vr.build_profile_modstate(profile_id, folder)
             add("profile_modstate", base, leaves)
@@ -520,10 +522,18 @@ def run(db_path: str, collection_path: str, downloads_dir: str, staging_dir: str
     risk = assess_risk(target_version,
                        _sample_live_records(vortex_db.read_prefix, db_path))
 
+    # Classify each staged mod's modtype so the record's `type` field routes root
+    # mods (skse/dinput/engine-injector) to the game root -- in our deploy AND if
+    # Vortex ever deploys. Done here (run has staging_dir) to keep build_plan pure.
+    from utils import deploy_engine
+    folder_types = {m["folder"]: deploy_engine.classify_folder(staging_dir, m["folder"]).type_id
+                    for m in ledger_mods}
+
     plan = build_plan(collection, ledger_mods=ledger_mods, profile_id=profile_id,
                       collection_folder=collection_folder, collection_id=collection_id,
                       slug=slug, revision_id=revision_id, revision_number=revision_number,
-                      install_time_iso=install_time_iso, install_ms=install_ms)
+                      install_time_iso=install_time_iso, install_ms=install_ms,
+                      folder_types=folder_types)
 
     if not apply:
         return SyncResult(False, plan, risk, message="dry-run")

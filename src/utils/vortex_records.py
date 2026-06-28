@@ -87,7 +87,7 @@ def build_download(source: Dict[str, Any], mod_name: str,
 def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
               archive_id: str, archive_name: str, *,
               variant: str = "", installed_as_dependency: bool = False,
-              install_time: str = "") -> Tuple[str, Dict[str, Any]]:
+              install_time: str = "", mod_type: str = "") -> Tuple[str, Dict[str, Any]]:
     """Build a ``persistent.mods.skyrimse.<folder>`` installed-mod record.
 
     ``variant`` (the collection's display name) and ``installed_as_dependency``
@@ -129,7 +129,9 @@ def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
     if mod.get("choices"):
         attributes["installerChoices"] = mod["choices"]
     tree = {
-        "id": folder, "installationPath": folder, "state": "installed", "type": "",
+        # ``type`` is the modtype id (""=Data; skse/dinput/engine-injector deploy to
+        # the game root). Setting it means Vortex itself routes the mod correctly.
+        "id": folder, "installationPath": folder, "state": "installed", "type": mod_type,
         "archiveId": archive_id, "fileOverrides": [], "attributes": attributes,
     }
     base = f"persistent{P}mods{P}{GAME_ID}{P}{folder}"
