@@ -50,7 +50,9 @@ def test_emit_status_format(capsys):
 
 def test_successful_download_writes_file(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path, [FakeResp([b"abc", b"def"], 6)])
-    assert download.download_file("skyrimspecialedition", "skyrimse", 1, 2, 1) is True
+    # download_file now returns the written file path (for ledger recording).
+    result = download.download_file("skyrimspecialedition", "skyrimse", 1, 2, 1)
+    assert result and str(result).endswith("test-1-0.7z")
     out = tmp_path / "skyrimse" / "test-1-0.7z"
     assert out.exists() and out.read_bytes() == b"abcdef"
 
@@ -65,7 +67,7 @@ def test_retries_on_incomplete_then_succeeds(monkeypatch, tmp_path):
     # re-point get_download_url tracking after _setup overrode it
     monkeypatch.setattr(download, "get_download_url",
                         lambda *a, **k: calls.append(1) or "http://example/test-1-0.7z")
-    assert download.download_file("skyrimspecialedition", "skyrimse", 1, 2, 1) is True
+    assert download.download_file("skyrimspecialedition", "skyrimse", 1, 2, 1)
     assert len(calls) >= 2  # URL re-fetched on the retry
 
 
