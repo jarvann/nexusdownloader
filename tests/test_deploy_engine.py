@@ -70,3 +70,19 @@ def test_stale_loader_removed_on_redeploy(tmp_path):
     de.deploy_all(str(staging), str(data), str(game), ["RegMod", "SKSE"], instance_id="i")
     assert not (game / "skse64_1_6_640.dll").exists()
     assert (game / "skse64_loader.exe").exists()
+
+
+def test_deploy_collection_routes_via_engine(tmp_path, monkeypatch):
+    """The high-level deploy_collection must modtype-route (default->Data, skse->root)."""
+    import utils.vortex_deploy as vdmod
+    import utils.vortex_db as vdb
+    staging, game, data = _seed(tmp_path)
+    monkeypatch.setattr(vdb, "read_app_instance_id", lambda *a, **k: "inst-1")
+    monkeypatch.setattr(vdmod, "mark_deployed_in_db", lambda *a, **k: None)
+    result, _ = vdmod.deploy_collection(
+        "fakedb", str(staging), str(data),
+        enabled_folders=["RegMod", "SKSE"], game_root=str(game), node="node")
+    assert (game / "skse64_loader.exe").exists()        # routed to game root
+    assert (data / "MyMod.esp").exists()                # routed to Data
+    assert (data / "SKSE" / "Plugins" / "p.dll").exists()
+    assert result.files > 0                              # aggregated across types

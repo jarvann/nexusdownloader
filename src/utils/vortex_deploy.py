@@ -705,24 +705,46 @@ def order_folders_for_deploy(staging_dir: str, collection: Optional[Dict[str, An
     return lo.order_mods(folders, collection.get("modRules", []), resolve)
 
 
+def _aggregate(results: Dict[str, DeployResult], primary_path: str) -> DeployResult:
+    """Collapse per-modtype DeployResults into one (for callers expecting a single
+    result). Counts sum; manifest_path is the default type's."""
+    files = sum(r.files for r in results.values())
+    linked = sum(r.linked for r in results.values())
+    stale = sum(r.removed_stale for r in results.values())
+    conflicts = sum(r.skipped_conflicts for r in results.values())
+    inst = next((r.instance_id for r in results.values()), "")
+    path = results[""].manifest_path if "" in results else primary_path
+    return DeployResult(files, path, inst, linked,
+                        skipped_conflicts=conflicts, removed_stale=stale)
+
+
 def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                       enabled_folders: Optional[Iterable[str]] = None,
                       game_id: str = GAME_ID, *, collection: Optional[Dict[str, Any]] = None,
+                      game_root: Optional[str] = None,
                       node: str = "node", deployment_time_ms: int = 0,
                       workers: int = 1, only_folders: Optional[Iterable[str]] = None,
                       progress: Optional[Callable[[int, int, str], None]] = None
                       ) -> Tuple[DeployResult, Any]:
-    """High-level: hard-link + write manifest, then mark the deployment in the DB.
+    """High-level: hard-link + write manifest(s), then mark the deployment in the DB.
 
     Deploy order (which decides file-conflict winners) comes from the collection's
     modRules when ``collection`` is supplied; otherwise from an explicit
     ``enabled_folders`` list, else sorted folder order.
 
-    ``only_folders`` runs an incremental deploy (see :func:`deploy`) -- just those
-    folders are linked + merged into the live manifest, instead of a full redeploy.
+    Modtype-aware: each mod is routed to its type's target (default -> Data; skse/
+    dinput/engine-injector -> the game root). ``game_root`` defaults to the parent
+    of ``target_data_dir`` (``<game_root>/Data`` is the Data folder). An all-default
+    collection behaves exactly like the old single-Data deploy.
+
+    ``only_folders`` runs an incremental deploy -- just those folders, merged into
+    the live per-type manifests.
     """
+    from utils import deploy_engine
     if enabled_folders is None:
         enabled_folders = order_folders_for_deploy(staging_dir, collection)
+    if game_root is None:
+        game_root = os.path.dirname(os.path.normpath(target_data_dir))
     # Use Vortex's authoritative app.instanceId for the manifest so Vortex accepts
     # our deployment as its own instead of purging + re-linking everything.
     from utils import vortex_db
@@ -734,10 +756,12 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     # Stamp the staging marker so Vortex stops warning "Mod Staging Folder
     # invalid" (our staging is built by us, not Vortex, so it lacks the tag).
     write_staging_tag(staging_dir, instance_id, game_id)
-    result = deploy(staging_dir, target_data_dir, enabled_folders, game_id,
-                    instance_id=instance_id,
-                    deployment_time_ms=deployment_time_ms, workers=workers,
-                    only_folders=only_folders, progress=progress)
+    results = deploy_engine.deploy_all(
+        staging_dir, target_data_dir, game_root, enabled_folders,
+        instance_id=instance_id, game_id=game_id,
+        deployment_time_ms=deployment_time_ms, workers=workers,
+        only_folders=only_folders, progress=progress)
+    result = _aggregate(results, os.path.join(target_data_dir, MANIFEST_NAME))
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
     return result, db_write
 
