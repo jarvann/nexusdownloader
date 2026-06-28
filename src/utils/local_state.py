@@ -596,7 +596,8 @@ class LocalState:
             return [dict(r) for r in c.execute(
                 "SELECT m.*, d.mod_id AS dl_mod_id, d.file_id AS dl_file_id, "
                 "d.md5 AS dl_md5, d.local_path AS dl_local_path, "
-                "d.file_size AS dl_file_size, d.logical_file_name AS dl_logical "
+                "d.file_size AS dl_file_size, d.logical_file_name AS dl_logical, "
+                "d.downloaded_at AS dl_downloaded_at "
                 "FROM mods m LEFT JOIN downloads d ON m.download_id=d.id").fetchall()]
 
     # -- mod_files ------------------------------------------------------------ #

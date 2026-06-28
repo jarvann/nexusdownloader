@@ -207,8 +207,14 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
         # Only for real nexus identities -- orphans (user/manual mods) get a bare
         # mod record with no download, so skip building one with a null modId.
         if dl_id and mid and fid and dl_id not in written_downloads:
+            # Vortex's "Downloaded Time" reads fileTime (ms). Our ledger stores
+            # downloaded_at in seconds; without it Vortex shows epoch 0 ("56 years
+            # ago"). Fall back to the install timestamp for pre-column rows.
+            dl_at = row.get("dl_downloaded_at")
+            file_time_ms = int(dl_at) * 1000 if dl_at else install_ms
             dsrc = {"type": "nexus", "modId": mid, "fileId": fid, "md5": md5,
                     "fileSize": row.get("dl_file_size") or 0,
+                    "fileTime": file_time_ms,
                     "logicalFilename": row.get("dl_logical") or ""}
             name = (mod_data or {}).get("name", "") or row.get("dl_logical") or ""
             base, leaves = vr.build_download(dsrc, name, archive, dl_id,
