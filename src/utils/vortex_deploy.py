@@ -395,6 +395,18 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
             "Could not determine the Vortex instance id (no deployment manifest "
             f"or {STAGING_MARKER} marker found). Open Vortex for this game once.")
 
+    # Hard links need staging + target on the SAME volume (Vortex gates deploy on
+    # this). Cross-volume falls back to copies (nlink==1) -- slower, and Vortex
+    # won't recognize them as its links. Warn once up front rather than silently.
+    if link:
+        try:
+            if os.path.isdir(target_data_dir) and \
+                    os.stat(staging_dir).st_dev != os.stat(target_data_dir).st_dev:
+                print(f"WARNING: staging and {target_data_dir} are on different "
+                      f"volumes; files will be COPIED, not hard-linked.")
+        except OSError:
+            pass
+
     skipped_conflicts = 0
     # Files in the LAST deployment that are gone now -- Vortex's finalize() unlinks
     # these (a removed mod, or a file dropped from a mod, must leave the game folder
