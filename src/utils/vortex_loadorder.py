@@ -29,7 +29,7 @@ import os
 import re
 import shutil
 import struct
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # Skyrim SE base masters in canonical load order. Always loaded, never listed in
 # plugins.txt (they still appear, in this order, at the top of loadorder.txt).
@@ -219,7 +219,8 @@ def render_loadorder(ordered_all: Sequence[str]) -> str:
 
 
 def render_plugins_txt(ordered_active: Sequence[str],
-                       enabled: Dict[str, bool], *, strict: bool = False) -> str:
+                       enabled: Dict[str, bool], *, strict: bool = False,
+                       force_enable: Optional[Set[str]] = None) -> str:
     """``plugins.txt``: non-vanilla plugins, lowercase, ``*`` prefix when enabled.
 
     ``strict`` (set when the collection ships an explicit plugin list): plugins
@@ -227,15 +228,25 @@ def render_plugins_txt(ordered_active: Sequence[str],
     ship optional/alternate ESPs the collection deliberately leaves off; auto-
     enabling every ESP on disk pushed the active count past Skyrim's hard caps
     (254 full / 4096 light). Without a list we keep the old default-on behavior.
+
+    ``force_enable`` (lower-cased names) is ALWAYS activated regardless of strict
+    mode. We pass the deployed masters here: Vortex never strict-disables a master
+    (a lone-plugin mod is auto-enabled on install, and the collection parser only
+    overrides plugins it explicitly lists), so blanket-disabling an unlisted master
+    here was leaving dependents with a missing master ("plugin X depends on Y that
+    is not enabled"). Masters are few, so forcing them on can't blow the 254 cap.
     """
+    force_enable = force_enable or set()
     lines = [
         "# This file is used by Skyrim to keep track of your downloaded content.",
         "# Please do not modify this file.",
     ]
     for p in ordered_active:
+        low = p.lower()
         default = not strict          # unlisted plugins: off in strict mode
-        mark = "*" if enabled.get(p.lower(), default) else ""
-        lines.append(f"{mark}{p.lower()}")
+        on = (low in force_enable) or enabled.get(low, default)
+        mark = "*" if on else ""
+        lines.append(f"{mark}{low}")
     return "\n".join(lines) + "\n"
 
 
@@ -264,7 +275,8 @@ def enabled_map(collection: dict) -> Dict[str, bool]:
     out: Dict[str, bool] = {}
     for p in collection.get("plugins") or []:
         if p.get("name"):
-            out[p["name"].lower()] = bool(p.get("enabled", True))
+            # Vortex treats a missing/falsy `enabled` as disabled (`&& p.enabled`).
+            out[p["name"].lower()] = bool(p.get("enabled", False))
     return out
 
 
@@ -299,7 +311,8 @@ def compose_load_order(scanned: Sequence[str], data_dir: str,
 
 def write_load_order(localappdata_dir: str, full_order: Sequence[str],
                      active_order: Sequence[str], enabled: Dict[str, bool], *,
-                     backup: bool = True, strict: bool = False) -> Tuple[str, str]:
+                     backup: bool = True, strict: bool = False,
+                     force_enable: Optional[Set[str]] = None) -> Tuple[str, str]:
     """Write ``loadorder.txt`` + ``plugins.txt`` (backing up any existing pair).
 
     Returns the two written paths. ``localappdata_dir`` is the game's
@@ -315,7 +328,8 @@ def write_load_order(localappdata_dir: str, full_order: Sequence[str],
     with open(lo_path, "w", encoding="utf-8", newline="\r\n") as fh:
         fh.write(render_loadorder(full_order))
     with open(pl_path, "w", encoding="utf-8", newline="\r\n") as fh:
-        fh.write(render_plugins_txt(active_order, enabled, strict=strict))
+        fh.write(render_plugins_txt(active_order, enabled, strict=strict,
+                                    force_enable=force_enable))
     return lo_path, pl_path
 
 
@@ -331,9 +345,15 @@ def sort_plugins(collection: dict, game_data_dir: str, localappdata_dir: str, *,
     # Strict activation only when the collection actually ships a plugin list,
     # so we don't accidentally disable everything for list-less collections.
     strict = bool(enabled)
+    # Deployed masters are always kept active (Vortex never strict-disables a
+    # master); excludes vanilla/CC, which aren't listed in plugins.txt at all.
+    masters = {p.lower() for p in active
+               if is_master_block(p, os.path.join(game_data_dir, p))
+               and not is_vanilla_master(p)}
     lo_path, pl_path = write_load_order(localappdata_dir, full, active, enabled,
-                                        backup=backup, strict=strict)
-    # Count what's actually activated (strict drops unlisted plugins).
+                                        backup=backup, strict=strict,
+                                        force_enable=masters)
+    # Count what's actually activated (strict drops unlisted plugins, keeps masters).
     active_count = sum(1 for p in active
-                       if enabled.get(p.lower(), not strict))
+                       if p.lower() in masters or enabled.get(p.lower(), not strict))
     return lo_path, pl_path, active_count
