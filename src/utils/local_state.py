@@ -523,6 +523,17 @@ class LocalState:
         self._enqueue("DELETE FROM mods", ())
         self._enqueue("DELETE FROM downloads", ())
 
+    def reset_install_state(self) -> None:
+        """Reset to a clean 'downloaded, not installed' baseline.
+
+        Wipes everything that describes an INSTALL/DEPLOY (mods, their files,
+        plugins, rules, root files) while PRESERVING the downloads table,
+        collections, endorsements (downloads.endorsed_at), and logs -- so the
+        expensive download work and endorsement history survive a re-install.
+        """
+        for table in ("mods", "mod_files", "plugins", "mod_rules", "root_files"):
+            self._enqueue(f"DELETE FROM {table}", ())
+
     def prune_orphan_downloads(self) -> None:
         """Drop download rows no longer referenced by any mod -- e.g. stale rows
         left behind after a folder was re-pointed to its correct archive."""
