@@ -921,7 +921,26 @@ class FomodInstaller:
                     status=InstallResult.FAILED,
                     error_message=error_msg
                 )
-            
+
+            # Phantom-install guard + diagnostics (parity with _install_simple).
+            # A mod can report success with N copied files yet leave NO staging
+            # folder on disk. Log the resolved destination and real on-disk count,
+            # and fail loudly (so the retry re-attempts) instead of claiming a
+            # phantom success.
+            on_disk = (sum(1 for p in mod_install_path.rglob("*") if p.is_file())
+                       if mod_install_path.exists() else 0)
+            self.logger.info(
+                f"INSTALL-VERIFY {mod_name}: claimed={len(installed_files)} "
+                f"on_disk={on_disk} dest={mod_install_path} "
+                f"abs={os.path.abspath(mod_install_path)} staging={self.staging_path}")
+            if on_disk == 0:
+                error_msg = (f"FOMOD installation completed but no files were installed "
+                             f"for {mod_name} (phantom: {len(installed_files)} copied, 0 "
+                             f"on disk at {mod_install_path})")
+                self.logger.error(error_msg)
+                return InstallationResult(mod_name=mod_name, status=InstallResult.FAILED,
+                                          error_message=error_msg)
+
             return InstallationResult(
                 mod_name=mod_name,
                 status=InstallResult.SUCCESS,
