@@ -77,3 +77,26 @@ def test_mod_record_links_to_its_download():
     _, leaves = vr.build_mod(SAMPLE_NEXUS_MOD["source"], SAMPLE_NEXUS_MOD,
                              FOLDER, "DL_ID_42", ARCHIVE)
     assert leaves["archiveId"] == "DL_ID_42"
+
+
+def test_normalize_version_coerces_to_semver():
+    # zero-padded segment (the bikini-armor 1.01 case) -> 1.1.0
+    assert vr.normalize_version("1.01") == "1.1.0"
+    # leading v stripped, missing segments padded
+    assert vr.normalize_version("v2") == "2.0.0"
+    assert vr.normalize_version("1.0") == "1.0.0"
+    assert vr.normalize_version("3.4.5") == "3.4.5"
+    # empty / None -> default
+    assert vr.normalize_version("", default="0.0.0") == "0.0.0"
+    assert vr.normalize_version(None) == ""
+    # no digits at all -> returned trimmed, unmangled
+    assert vr.normalize_version("  unknown ") == "unknown"
+
+
+def test_record_and_rule_versions_agree_for_a_versioned_mod():
+    mod = dict(SAMPLE_NEXUS_MOD, version="1.01")
+    _, leaves = vr.build_mod(mod["source"], mod, FOLDER, "DL", ARCHIVE)
+    rule = vr.build_collection_rule(mod, ARCHIVE)
+    # both sides normalize identically -> no record/rule disagreement
+    assert leaves["attributes.version"] == "1.1.0"
+    assert ">=1.1.0+" in rule["reference"]["versionMatch"]

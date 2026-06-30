@@ -15,9 +15,42 @@ the ``###``-joined, JSON-encoded key/value pairs the DB stores.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Tuple
 
 from utils.vortex_schema import P, GAME_ID, NEXUS_DOMAIN
+
+
+# Pull the first numeric core (major[.minor[.patch]]) out of a raw version string,
+# tolerating a leading v/V and zero-padded segments ("1.01" -> 1.1.0).
+_VERSION_CORE_RE = re.compile(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?")
+
+
+def normalize_version(raw: Any, default: str = "") -> str:
+    """Coerce a raw version into a Vortex/semver-parseable ``x.y.z`` string.
+
+    Mirrors how Vortex coerces versions (``semver.coerce``): strip a leading
+    ``v``, pad missing minor/patch with ``0``, and parse zero-padded segments as
+    integers (so ``"1.01"`` -> ``"1.1.0"``, matching the bikini-armor case).
+    Falls back to ``default`` when empty, and returns the trimmed raw string
+    unchanged when it contains no digits at all (don't mangle exotic versions).
+    """
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        return default
+    s = s.lstrip("vV")
+    m = _VERSION_CORE_RE.search(s)
+    if not m:
+        return s
+    major, minor, patch = (int(g) if g is not None else 0 for g in m.groups())
+    return f"{major}.{minor}.{patch}"
+
+
+def mod_version(mod: Dict[str, Any], default: str = "") -> str:
+    """Normalized version for a collection.json mod entry (single source of truth)."""
+    return normalize_version(mod.get("version"), default)
 
 
 def _flatten(tree: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -113,8 +146,8 @@ def build_mod(source: Dict[str, Any], mod: Dict[str, Any], folder: str,
         "fileSize": source.get("fileSize", 0),
         "logicalFileName": source.get("logicalFilename") or mod.get("name", ""),
         "name": folder,
-        "version": str(mod.get("version", "")),
-        "modVersion": str(mod.get("version", "")),
+        "version": mod_version(mod),
+        "modVersion": mod_version(mod),
         "referenceTag": _ref_tag(source),          # links to a collection rule
         "author": mod.get("author", ""),
         "installedAsDependency": installed_as_dependency,
@@ -250,7 +283,7 @@ def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[s
         "reference": {
             "description": mod.get("name", ""), "fileMD5": s.get("md5", ""),
             "gameId": GAME_ID, "fileSize": s.get("fileSize", 0),
-            "versionMatch": f">={mod.get('version', '0')}+{s.get('updatePolicy', 'prefer')}",
+            "versionMatch": f">={mod_version(mod, '0.0.0')}+{s.get('updatePolicy', 'prefer')}",
             "logicalFileName": s.get("logicalFilename") or mod.get("name", ""),
             "tag": _ref_tag(s), "md5Hint": s.get("md5", ""),
             "repo": {
@@ -263,7 +296,7 @@ def build_collection_rule(mod: Dict[str, Any], archive_name: str = "") -> Dict[s
             "author": mod.get("author", ""),
             "type": (mod.get("details") or {}).get("type", ""),
             "category": (mod.get("details") or {}).get("category", ""),
-            "version": str(mod.get("version", "")), "name": mod.get("name", ""),
+            "version": mod_version(mod), "name": mod.get("name", ""),
             "phase": mod.get("phase", 0), "fileName": archive_name,
         },
     }
