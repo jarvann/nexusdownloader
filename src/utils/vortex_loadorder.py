@@ -161,6 +161,37 @@ def read_record_flags(path: str) -> int:
     return struct.unpack("<I", head[8:12])[0]
 
 
+def read_masters(path: str) -> List[str]:
+    """Return the master files a plugin depends on (its MAST subrecords).
+
+    Parses the TES4 header record: a 24-byte Skyrim record header followed by
+    ``dataSize`` bytes of subrecords, each ``type[4] size[2] data[size]``. Master
+    filenames live in ``MAST`` subrecords as null-terminated strings. Returns an
+    empty list if the file isn't a plugin or can't be read -- this is best-effort
+    diagnostics, not a hard parser.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+            if len(head) < 24 or head[:4] != b"TES4":
+                return []
+            data_size = struct.unpack("<I", head[4:8])[0]
+            body = fh.read(data_size)
+    except OSError:
+        return []
+    masters: List[str] = []
+    i = 0
+    while i + 6 <= len(body):
+        sig = body[i:i + 4]
+        size = struct.unpack("<H", body[i + 4:i + 6])[0]
+        start = i + 6
+        chunk = body[start:start + size]
+        if sig == b"MAST":
+            masters.append(chunk.split(b"\x00", 1)[0].decode("cp1252", "replace"))
+        i = start + size
+    return masters
+
+
 def is_master_block(name: str, path: Optional[str] = None) -> bool:
     """True if the plugin loads in the master block (.esm/.esl, or ESM/ESL flag)."""
     ext = name.lower().rsplit(".", 1)[-1]
