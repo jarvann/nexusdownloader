@@ -111,3 +111,87 @@ def test_folder_source_expands_to_files(tmp_path):
     ops, _ = fe.resolve_install(cfg, choices, pkg)
     dests = sorted(o.destination for o in ops)
     assert "beta/beta1.esp" in dests and "beta/beta2.esp" in dests
+
+
+# --- fileDependency gating (the stray-patch / phantom-master fix) ----------- #
+FILEDEP_CONFIG = """<?xml version="1.0"?>
+<config>
+  <moduleName>Patch Mod</moduleName>
+  <installSteps order="Explicit">
+    <installStep name="Main">
+      <optionalFileGroups order="Explicit">
+        <group name="Options" type="SelectAny">
+          <plugins order="Explicit">
+            <plugin name="Core">
+              <files><file source="core.esp" destination="core.esp"/></files>
+            </plugin>
+            <plugin name="ReadmeAlways">
+              <files><file source="readme.txt" destination="readme.txt" alwaysInstall="true"/></files>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+  <conditionalFileInstalls>
+    <patterns>
+      <pattern>
+        <dependencies operator="And">
+          <fileDependency file="WACCF.esp" state="Active"/>
+        </dependencies>
+        <files><file source="waccf_patch.esp" destination="waccf_patch.esp"/></files>
+      </pattern>
+    </patterns>
+  </conditionalFileInstalls>
+</config>
+"""
+
+
+def _make_filedep_package(tmp_path):
+    (tmp_path / "fomod").mkdir()
+    (tmp_path / "fomod" / "ModuleConfig.xml").write_text(FILEDEP_CONFIG)
+    for f in ["core.esp", "readme.txt", "waccf_patch.esp"]:
+        (tmp_path / f).write_text("x")
+    return tmp_path
+
+
+def _core_choice():
+    return {"type": "fomod", "options": [
+        {"name": "Main", "groups": [{"name": "Options", "choices": [{"name": "Core", "idx": 0}]}]}]}
+
+
+def test_filedep_patch_skipped_when_master_absent(tmp_path):
+    pkg = _make_filedep_package(tmp_path)
+    cfg = fe.parse_moduleconfig(fe.find_moduleconfig(pkg))
+    # WACCF is NOT in the active set -> the conditional patch must NOT install
+    ops, report = fe.resolve_install(cfg, _core_choice(), pkg, active_plugins={"core.esp"})
+    dests = {o.destination for o in ops}
+    assert "waccf_patch.esp" not in dests
+    assert report.conditional_patterns_applied == 0
+
+
+def test_filedep_patch_installs_when_master_present(tmp_path):
+    pkg = _make_filedep_package(tmp_path)
+    cfg = fe.parse_moduleconfig(fe.find_moduleconfig(pkg))
+    # WACCF IS active (collection includes it) -> patch installs
+    ops, report = fe.resolve_install(cfg, _core_choice(), pkg,
+                                     active_plugins={"core.esp", "waccf.esp"})
+    dests = {o.destination for o in ops}
+    assert "waccf_patch.esp" in dests
+    assert report.conditional_patterns_applied == 1
+
+
+def test_filedep_default_no_active_set_is_conservative(tmp_path):
+    pkg = _make_filedep_package(tmp_path)
+    cfg = fe.parse_moduleconfig(fe.find_moduleconfig(pkg))
+    # No active_plugins passed -> only vanilla counts active -> patch NOT installed
+    ops, _ = fe.resolve_install(cfg, _core_choice(), pkg)
+    assert "waccf_patch.esp" not in {o.destination for o in ops}
+
+
+def test_always_install_file_from_unselected_plugin(tmp_path):
+    pkg = _make_filedep_package(tmp_path)
+    cfg = fe.parse_moduleconfig(fe.find_moduleconfig(pkg))
+    # ReadmeAlways is NOT chosen, but its file is alwaysInstall -> still installed
+    ops, _ = fe.resolve_install(cfg, _core_choice(), pkg, active_plugins={"core.esp"})
+    assert "readme.txt" in {o.destination for o in ops}

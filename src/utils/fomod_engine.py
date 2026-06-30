@@ -83,9 +83,22 @@ class InstallStep:
 
 
 @dataclass
+class Dependency:
+    """A parsed <dependencies> tree: flag/file/game conditions joined by And/Or.
+
+    Unlike the old flag-only parser, this keeps fileDependency so a pattern gated
+    on 'plugin X is active' is actually evaluated -- dropping it made such patterns
+    install unconditionally (the stray-patch / phantom-master bug)."""
+    operator: str = "and"                                   # "and" | "or"
+    flags: List[Tuple[str, str]] = field(default_factory=list)   # (flag, value)
+    files: List[Tuple[str, str]] = field(default_factory=list)   # (plugin_lower, state)
+    children: List["Dependency"] = field(default_factory=list)
+
+
+@dataclass
 class ConditionalInstall:
-    """A <pattern> inside <conditionalFileInstalls>: install files if flags match."""
-    required_flags: Dict[str, str]
+    """A <pattern> inside <conditionalFileInstalls>: install files if deps match."""
+    dependency: Optional["Dependency"] = None
     files: List[FileItem] = field(default_factory=list)
 
 
@@ -155,23 +168,55 @@ def _parse_files(files_elem) -> List[FileItem]:
     return items
 
 
-def _parse_flag_deps(dependencies_elem) -> Dict[str, str]:
-    """Collect flagDependency name->value pairs from a <dependencies> tree.
-
-    fileDependency / gameDependency are ignored (we can't reliably know the full
-    load-order state at install time); flag dependencies are self-contained
-    within the FOMOD and are evaluated exactly.
-    """
-    flags: Dict[str, str] = {}
+def _parse_dependencies(dependencies_elem) -> Optional[Dependency]:
+    """Parse a <dependencies> tree into a :class:`Dependency` (flag + file + game
+    conditions, And/Or, nestable). Returns None for a missing/empty element."""
     if dependencies_elem is None:
-        return flags
+        return None
+    dep = Dependency(operator=(dependencies_elem.get("operator", "And") or "And").lower())
     for child in dependencies_elem:
         kind = _localname(child.tag)
         if kind == "flagDependency":
-            flags[child.get("flag", "")] = child.get("value", "")
-        elif kind == "dependencies":  # nested
-            flags.update(_parse_flag_deps(child))
-    return flags
+            dep.flags.append((child.get("flag", ""), child.get("value", "")))
+        elif kind == "fileDependency":
+            # FOMOD file state: Active | Inactive | Missing (default Active).
+            dep.files.append((child.get("file", "").strip().lower(),
+                              (child.get("state", "Active") or "Active")))
+        elif kind == "dependencies":
+            nested = _parse_dependencies(child)
+            if nested is not None:
+                dep.children.append(nested)
+        # gameDependency / other: ignored as a condition (treated as satisfied)
+    return dep
+
+
+def _eval_dependency(dep: Optional[Dependency], flags: Dict[str, str],
+                     active_plugins: frozenset) -> bool:
+    """Evaluate a parsed dependency tree.
+
+    ``flags`` are the condition flags set by chosen plugins; ``active_plugins`` is
+    the lowercased set of plugins that will be active (the collection's declared
+    plugin list + vanilla masters). A fileDependency 'Active' is satisfied iff the
+    plugin is in that set -- so a patch gated on a mod the collection doesn't
+    include is correctly NOT installed.
+    """
+    if dep is None:
+        return True
+    results: List[bool] = []
+    for name, val in dep.flags:
+        results.append(flags.get(name) == val)
+    for plugin, state in dep.files:
+        present = plugin in active_plugins
+        s = state.lower()
+        if s in ("missing", "inactive"):
+            results.append(not present)
+        else:                                  # "active" (default)
+            results.append(present)
+    for child in dep.children:
+        results.append(_eval_dependency(child, flags, active_plugins))
+    if not results:                            # no evaluable conditions -> vacuously true
+        return True
+    return any(results) if dep.operator == "or" else all(results)
 
 
 def parse_moduleconfig(xml_data) -> FomodConfig:
@@ -225,7 +270,7 @@ def parse_moduleconfig(xml_data) -> FomodConfig:
             for pattern in _findall(patterns, "pattern"):
                 deps = _find(pattern, "dependencies")
                 config.conditional_installs.append(ConditionalInstall(
-                    required_flags=_parse_flag_deps(deps),
+                    dependency=_parse_dependencies(deps),
                     files=_parse_files(_find(pattern, "files")),
                 ))
 
@@ -354,9 +399,24 @@ def _resolve_file_item(item: FileItem, package_root: Path,
     return ops
 
 
+def _active_set(active_plugins) -> frozenset:
+    """Lowercased active-plugin set for fileDependency evaluation: the caller's
+    set (collection's declared plugins) unioned with the vanilla masters, which
+    are always present. None -> just the vanilla masters."""
+    try:
+        from utils.vortex_loadorder import SKYRIMSE_VANILLA
+        base = set(SKYRIMSE_VANILLA)
+    except Exception:
+        base = set()
+    if active_plugins:
+        base |= {p.strip().lower() for p in active_plugins if p}
+    return frozenset(base)
+
+
 def resolve_install(config: FomodConfig,
                     choices_data: Dict,
-                    package_root) -> Tuple[List[FileOperation], ResolveReport]:
+                    package_root,
+                    active_plugins=None) -> Tuple[List[FileOperation], ResolveReport]:
     """Resolve the full set of files to install for a FOMOD given collection choices.
 
     Args:
@@ -364,6 +424,11 @@ def resolve_install(config: FomodConfig,
         choices_data: the mod's ``choices`` block from the collection.
         package_root: directory containing the ``fomod`` folder (source paths are
             relative to this).
+        active_plugins: names of the plugins that will be active (the collection's
+            declared ``plugins`` list). Used to evaluate fileDependency conditions
+            so conditional patches only install when their required plugins are
+            actually part of the build. None -> only vanilla masters count as
+            active (conservative: patches gated on non-vanilla mods won't install).
 
     Returns:
         (file_operations, report). ``file_operations`` is ordered by priority so a
@@ -371,6 +436,7 @@ def resolve_install(config: FomodConfig,
     """
     package_root = Path(package_root)
     report = ResolveReport()
+    active = _active_set(active_plugins)
 
     # Case-insensitive index of everything in the package
     lower_index: Dict[str, Path] = {}
@@ -381,8 +447,14 @@ def resolve_install(config: FomodConfig,
     selected_items: List[FileItem] = []
     flags: Dict[str, str] = {}
 
-    # 1. Always-installed required files
+    # 1. Always-installed files: requiredInstallFiles, plus any alwaysInstall file
+    #    on ANY plugin (Vortex installs those regardless of whether the plugin is
+    #    selected).
     selected_items.extend(config.required_files)
+    for step in config.install_steps:
+        for group in step.groups:
+            for plugin in group.plugins:
+                selected_items.extend(f for f in plugin.files if f.always_install)
 
     # 2. Chosen plugins. Vortex matches the chosen option by NAME
     #    (preChoice.name == option.Name) within name-matched steps/groups -- NOT by
@@ -407,9 +479,9 @@ def resolve_install(config: FomodConfig,
 
     report.flags_set = dict(flags)
 
-    # 3. Conditional installs whose flag dependencies are satisfied
+    # 3. Conditional installs whose dependency tree (flags + file deps) is satisfied
     for cond in config.conditional_installs:
-        if all(flags.get(k) == v for k, v in cond.required_flags.items()):
+        if _eval_dependency(cond.dependency, flags, active):
             selected_items.extend(cond.files)
             report.conditional_patterns_applied += 1
 
