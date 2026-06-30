@@ -80,15 +80,18 @@ class InstallationResult:
 
 
 def _collection_active_plugins(collection_data: Dict[str, Any]) -> set:
-    """Lowercased names of the plugins the collection will activate. Feeds the
-    FOMOD engine's fileDependency evaluation so conditional patches only install
-    when the plugin they depend on is part of the build."""
-    out = set()
-    for p in (collection_data or {}).get("plugins", []):
-        n = (p.get("name") or "").strip().lower()
-        if n:
-            out.add(n)
-    return out
+    """The plugins active for this collection install (declared plugins + the
+    game's base masters), lowercased. Feeds the FOMOD engine's fileDependency
+    evaluation so conditional patches install only when their required plugin is
+    part of the build. Game-generic via game_meta (Nexus domain from the
+    collection), so this is not Skyrim-specific."""
+    try:
+        from utils import game_meta
+        return game_meta.active_plugin_set(collection_data)
+    except Exception:
+        # Fall back to declared plugins only if game_meta is unavailable.
+        return {(p.get("name") or "").strip().lower()
+                for p in (collection_data or {}).get("plugins", []) if p.get("name")}
 
 
 class FomodInstaller:

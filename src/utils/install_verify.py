@@ -397,10 +397,11 @@ def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.Loc
 
     rows = {r.get("folder"): r for r in ledger.all_mods_with_download()}
     coll_by_ids = {(mid, fid): mod for mid, fid, _s, mod in iter_nexus_mods(collection)}
-    # The collection's declared plugins drive FOMOD fileDependency evaluation, so
-    # the simulation matches what the installer (with the same set) produces.
-    active_plugins = {p.get("name", "").lower() for p in collection.get("plugins", [])
-                      if p.get("name")}
+    # The active plugin set (collection plugins + the game's base masters) drives
+    # FOMOD fileDependency evaluation, so the simulation matches what the installer
+    # (with the same set) produces. Game-generic via game_meta.
+    from utils import game_meta
+    active_plugins = game_meta.active_plugin_set(collection)
 
     # Build the work list: installed collection mods (optionally filtered).
     def _in_scope(folder: str) -> bool:
