@@ -327,22 +327,35 @@ def save_manifest(staging_dir: str, target_data_dir: str,
     return primary
 
 
+def _load_manifest(target_data_dir: str, manifest_name: str = MANIFEST_NAME,
+                   staging_dir: str = "") -> Dict[str, Any]:
+    """Load the full manifest dict, preferring the game-folder copy and falling
+    back to the staging copy (so a Vortex-purged Data state, where Vortex removed
+    its own manifest, still exposes the staging copy). ``{}`` if neither exists."""
+    for d in (target_data_dir, staging_dir):
+        if not d:
+            continue
+        path = os.path.join(d, manifest_name)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                continue
+    return {}
+
+
 def read_manifest_entries(target_data_dir: str,
-                          manifest_name: str = MANIFEST_NAME) -> Dict[str, Dict[str, Any]]:
+                          manifest_name: str = MANIFEST_NAME,
+                          staging_dir: str = "") -> Dict[str, Dict[str, Any]]:
     """Read an existing manifest's file entries, keyed by lower-cased relPath.
 
-    Returns ``{}`` when no (or an unreadable) manifest exists. Used by the
-    incremental deploy to keep every already-tracked file instead of rebuilding
-    the whole manifest from a full staging walk.
+    Returns ``{}`` when no (or an unreadable) manifest exists. Prefers the
+    game-folder copy, falling back to the staging copy. Used by the incremental
+    deploy to keep every already-tracked file instead of rebuilding from a full
+    staging walk, and by purge to know what to un-deploy.
     """
-    manifest = os.path.join(target_data_dir, manifest_name)
-    if not os.path.isfile(manifest):
-        return {}
-    try:
-        with open(manifest, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
+    data = _load_manifest(target_data_dir, manifest_name, staging_dir)
     out: Dict[str, Dict[str, Any]] = {}
     for e in data.get("files", []):
         rel = e.get("relPath")
@@ -565,7 +578,7 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
     everything in the manifest is purged. ``workers > 1`` removes files across a
     thread pool (unlink is latency-bound, so this scales well over many files).
     """
-    entries = read_manifest_entries(target_data_dir, manifest_name)
+    entries = read_manifest_entries(target_data_dir, manifest_name, staging_dir)
     only = {f for f in only_folders} if only_folders is not None else None
 
     targets = [e for e in entries.values()
@@ -619,15 +632,14 @@ def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
     if prune_empty_dirs:
         _prune_empty_dirs(target_data_dir)
 
-    # Rewrite the manifest (BOTH game-folder + staging copies) with what's left,
-    # preserving its header fields, so Vortex reads consistent state either side.
+    # Rewrite the manifest in BOTH the game-folder and staging copies with what's
+    # left (empty when purging everything), preserving its header fields, so Vortex
+    # reads consistent state from either side. Source the header from whichever copy
+    # still exists -- if Vortex already purged and removed its Data manifest, the
+    # staging copy keeps us from leaving a stale tracking file behind.
+    manifest = _load_manifest(target_data_dir, manifest_name, staging_dir)
     manifest_path = os.path.join(target_data_dir, manifest_name)
-    if os.path.isfile(manifest_path):
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as fh:
-                manifest = json.load(fh)
-        except (OSError, ValueError):
-            manifest = {}
+    if manifest:
         manifest["files"] = sorted(remaining.values(), key=lambda x: x["relPath"].lower())
         manifest_path = save_manifest(staging_dir, target_data_dir, manifest, manifest_name)
 
