@@ -94,6 +94,54 @@ class DeployWorkerThread(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class MaintenanceWorkerThread(QThread):
+    """Runs a maintenance op (purge / reset / verify) off the UI thread."""
+
+    progress = Signal(int, int, str)
+    status = Signal(str)
+    done = Signal(str)        # summary line
+    failed = Signal(str)
+
+    def __init__(self, mode, staging, game_data, downloads="", purge_deploy=False):
+        super().__init__()
+        self.mode = mode
+        self.staging = staging
+        self.game_data = game_data
+        self.downloads = downloads
+        self.purge_deploy = purge_deploy
+
+    def run(self):
+        try:
+            prog = lambda d, t, n: self.progress.emit(d, t, n)
+            if self.mode == "purge":
+                from utils import maintenance as mnt
+                res = mnt.purge_deployment(self.staging, self.game_data, progress=prog)
+                self.done.emit(
+                    f"Purged {res.removed} deployed file(s); kept {res.skipped} "
+                    f"user-modified. Manifest updated in Data + staging. "
+                    f"Staging mods left intact.")
+            elif self.mode == "reset":
+                from utils import maintenance as mnt
+                plan = mnt.plan_reset(self.staging, game_data=self.game_data,
+                                      purge_deploy=self.purge_deploy)
+                res = mnt.run_reset(plan, log=lambda m: self.status.emit(m), progress=prog)
+                self.done.emit(
+                    f"Reset complete: purged {res.purged}, deleted {res.deleted} staging "
+                    f"folder(s), ledger reset. Now 'downloaded, waiting to install'.")
+            elif self.mode == "verify":
+                from utils import install_verify as iv
+                rep = iv.verify(self.staging, downloads=self.downloads)
+                c = {s: len(rep.of(s)) for s in (iv.ERROR, iv.WARN, iv.INFO)}
+                self.done.emit(
+                    f"Verify: {c[iv.ERROR]} errors, {c[iv.WARN]} warnings, {c[iv.INFO]} info "
+                    f"-> {'OK' if rep.ok else 'PROBLEMS FOUND'}. (Run the CLI with --json "
+                    f"for the full list.)")
+            else:
+                self.failed.emit(f"unknown maintenance mode: {self.mode}")
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class DeployTab(QWidget):
     """Deploy the staged collection into the game, then launch it."""
 
@@ -102,9 +150,11 @@ class DeployTab(QWidget):
         self.collection_path = ""
         self.staging_path = ""
         self.game_data_dir = ""
+        self.downloads_dir = ""
         self.localappdata_dir = _default_localappdata()
         self.skse_path = ""
         self._thread = None
+        self._maint_thread = None
         self._setup_ui()
         # Subscribe to the shared path store so picking a game/collection in the
         # Install tab wires up Deploy automatically (Data folder, SKSE included).
@@ -120,8 +170,8 @@ class DeployTab(QWidget):
         s = self._session
         changed = False
         for src, dst in (("collection", "collection_path"), ("staging", "staging_path"),
-                         ("game_data", "game_data_dir"), ("localappdata", "localappdata_dir"),
-                         ("skse", "skse_path")):
+                         ("game_data", "game_data_dir"), ("downloads", "downloads_dir"),
+                         ("localappdata", "localappdata_dir"), ("skse", "skse_path")):
             val = getattr(s, src, "")
             if val and getattr(self, dst, "") != val:
                 setattr(self, dst, val)
@@ -186,6 +236,32 @@ class DeployTab(QWidget):
                                      "local NTFS drive; little effect over WSL /mnt)")
         btns.addWidget(self.workers_spin)
         layout.addLayout(btns)
+
+        # --- Maintenance: purge / verify / reset ----------------------------- #
+        maint = QGroupBox("Maintenance")
+        mrow = QHBoxLayout(maint)
+        self.purge_btn = QPushButton("Purge Deployment")
+        self.purge_btn.setToolTip("Un-deploy from the game folder (remove our hardlinks) and "
+                                  "update vortex.deployment.json in both Data and staging. "
+                                  "Leaves staging mods intact. Vortex must be CLOSED.")
+        self.purge_btn.clicked.connect(self.purge_deployment)
+        mrow.addWidget(self.purge_btn)
+
+        self.verify_btn = QPushButton("Verify Installation")
+        self.verify_btn.setToolTip("Check that what's on disk matches the collection "
+                                   "(archives, staging, plugins, content). Read-only.")
+        self.verify_btn.clicked.connect(self.verify_installation)
+        mrow.addWidget(self.verify_btn)
+
+        mrow.addStretch()
+        self.reset_btn = QPushButton("Reset Install (nuke staging + DB)")
+        self.reset_btn.setStyleSheet("QPushButton { color: #b00; }")
+        self.reset_btn.setToolTip("DESTRUCTIVE: delete staging mod folders and reset the ledger "
+                                  "to 'downloaded, waiting to install'. Keeps your downloads "
+                                  "and the collection. Vortex must be CLOSED.")
+        self.reset_btn.clicked.connect(self.reset_install)
+        mrow.addWidget(self.reset_btn)
+        layout.addWidget(maint)
 
         self.panel = PhasePanel("Deploy Progress")
         layout.addWidget(self.panel, 1)   # progress panel absorbs vertical stretch
@@ -335,3 +411,79 @@ class DeployTab(QWidget):
             self.panel.log("INFO", f"Launched: {skse}")
         except Exception as e:
             QMessageBox.critical(self, "Launch failed", str(e))
+
+    # --- maintenance ------------------------------------------------------ #
+    def _maint_buttons(self, enabled: bool):
+        for b in (self.purge_btn, self.verify_btn, self.reset_btn, self.deploy_btn):
+            b.setEnabled(enabled)
+
+    def _start_maint(self, mode, starting_msg, purge_deploy=False):
+        self._maint_buttons(False)
+        self.panel.reset()
+        self.panel.start(starting_msg)
+        self._maint_thread = MaintenanceWorkerThread(
+            mode, self.staging_path, self.game_data_dir,
+            downloads=self.downloads_dir, purge_deploy=purge_deploy)
+        self._maint_thread.progress.connect(
+            lambda d, t, n: self.panel.set_progress(d, t, n))
+        self._maint_thread.status.connect(
+            lambda m: self.panel.set_progress(self.panel.bar.value(),
+                                              max(self.panel.bar.maximum(), 1), m))
+        self._maint_thread.done.connect(self._on_maint_done)
+        self._maint_thread.failed.connect(self._on_maint_failed)
+        self._maint_thread.start()
+
+    def _on_maint_done(self, msg):
+        self._maint_buttons(True)
+        self.panel.finish(msg, ok=True)
+        self.panel.log("INFO", msg)
+
+    def _on_maint_failed(self, msg):
+        self._maint_buttons(True)
+        self.panel.finish(msg, ok=False)
+        QMessageBox.critical(self, "Maintenance failed", msg)
+
+    def purge_deployment(self):
+        if not (self.staging_path and self.game_data_dir):
+            QMessageBox.warning(self, "Purge", "Need the staging and game Data paths set.")
+            return
+        if QMessageBox.question(
+                self, "Purge Deployment",
+                "Un-deploy from the game folder (remove our hardlinks) and update "
+                "vortex.deployment.json in both Data and staging?\n\n"
+                "Your staging mods and downloads are left intact.\n"
+                "Make sure Vortex is CLOSED.") != QMessageBox.StandardButton.Yes:
+            return
+        self._start_maint("purge", "Purging deployment…")
+
+    def verify_installation(self):
+        if not self.staging_path:
+            QMessageBox.warning(self, "Verify", "Need the staging path set.")
+            return
+        self._start_maint("verify", "Verifying installation…")
+
+    def reset_install(self):
+        if not self.staging_path:
+            QMessageBox.warning(self, "Reset", "Need the staging path set.")
+            return
+        also_purge = False
+        if self.game_data_dir:
+            ans = QMessageBox.question(
+                self, "Reset Install — also purge deployment?",
+                "Also un-deploy from the game folder first (remove deployed hardlinks)?\n\n"
+                "Yes = purge game folder + wipe staging.  No = wipe staging only.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel)
+            if ans == QMessageBox.StandardButton.Cancel:
+                return
+            also_purge = ans == QMessageBox.StandardButton.Yes
+        if QMessageBox.warning(
+                self, "Reset Install — confirm",
+                "DESTRUCTIVE: this deletes the staging mod folders and resets the ledger "
+                "to 'downloaded, waiting to install'.\n\n"
+                "PRESERVED: your downloads, endorsements, and the collection.\n"
+                "Vortex must be CLOSED.\n\nProceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        self._start_maint("reset", "Resetting install…", purge_deploy=also_purge)
