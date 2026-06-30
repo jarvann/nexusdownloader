@@ -25,6 +25,9 @@ class GameMeta:
     plugins_subdir: str = ""                 # %LOCALAPPDATA%\<this> holds plugins.txt
     # Loaders/injectors that mark a "root" mod for this game (deploy routing).
     root_loaders: Set[str] = field(default_factory=frozenset)
+    # Core game masters in their fixed load order (original case), placed first in
+    # loadorder.txt. CC content from cc_file loads after these.
+    master_order: tuple = ()
 
 
 # Vanilla/DLC master sets (lowercased). These are the plugins always active for a
@@ -59,26 +62,34 @@ _REGISTRY: Dict[str, GameMeta] = {
     "skyrimspecialedition": GameMeta(
         "skyrimspecialedition", _SKYRIMSE_MASTERS, "Skyrim.ccc",
         "Skyrim Special Edition",
-        {"skse64_loader.exe", "skse_loader.exe", "dinput8.dll"}),
+        {"skse64_loader.exe", "skse_loader.exe", "dinput8.dll"},
+        ("Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm")),
     "skyrim": GameMeta(
         "skyrim", _SKYRIM_LE_MASTERS, "", "Skyrim",
-        {"skse_loader.exe", "dinput8.dll"}),
+        {"skse_loader.exe", "dinput8.dll"},
+        ("Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm")),
     "skyrimvr": GameMeta(
         "skyrimvr", _SKYRIMSE_MASTERS, "", "Skyrim VR",
-        {"sksevr_loader.exe", "dinput8.dll"}),
+        {"sksevr_loader.exe", "dinput8.dll"},
+        ("Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm",
+         "SkyrimVR.esm")),
     "fallout4": GameMeta(
         "fallout4", _FALLOUT4_MASTERS, "Fallout4.ccc", "Fallout4",
-        {"f4se_loader.exe", "dinput8.dll"}),
+        {"f4se_loader.exe", "dinput8.dll"},
+        ("Fallout4.esm", "DLCRobot.esm", "DLCworkshop01.esm", "DLCCoast.esm",
+         "DLCworkshop02.esm", "DLCworkshop03.esm", "DLCNukaWorld.esm")),
     "falloutnv": GameMeta(
         "falloutnv", _FALLOUTNV_MASTERS, "", "FalloutNV",
-        {"nvse_loader.exe", "dinput8.dll"}),
+        {"nvse_loader.exe", "dinput8.dll"}, ("FalloutNV.esm",)),
     "oblivion": GameMeta(
         "oblivion", _OBLIVION_MASTERS, "", "Oblivion",
-        {"obse_loader.exe", "dinput8.dll"}),
+        {"obse_loader.exe", "dinput8.dll"}, ("Oblivion.esm",)),
     "starfield": GameMeta(
         "starfield", _STARFIELD_MASTERS, "Starfield.ccc", "Starfield",
-        {"sfse_loader.exe", "dinput8.dll"}),
-    "morrowind": GameMeta("morrowind", _MORROWIND_MASTERS, "", "Morrowind", set()),
+        {"sfse_loader.exe", "dinput8.dll"},
+        ("Starfield.esm", "BlueprintShips-Starfield.esm", "Constellation.esm", "OldMars.esm")),
+    "morrowind": GameMeta("morrowind", _MORROWIND_MASTERS, "", "Morrowind", set(),
+                          ("Morrowind.esm", "Tribunal.esm", "Bloodmoon.esm")),
 }
 
 _DEFAULT = GameMeta("", frozenset(), "", "", {"dinput8.dll"})

@@ -311,13 +311,16 @@ def enabled_map(collection: dict) -> Dict[str, bool]:
     return out
 
 
-def read_ccc(game_data_dir: str) -> List[str]:
-    """Read the game's ``Skyrim.ccc`` (Creation Club load list, one plugin per line)
-    from the game install root (the parent of Data). Lower-cased, in file order.
+def read_ccc(game_data_dir: str, cc_file: str = "Skyrim.ccc") -> List[str]:
+    """Read the game's Creation Club load list (one plugin per line) from the game
+    install root (parent of Data). Lower-cased, in file order. ``cc_file`` is the
+    game's CC filename (Skyrim.ccc / Fallout4.ccc / Starfield.ccc); empty -> no CC.
     Returns ``[]`` if absent -- Vortex uses this exact list to know which plugins
     are native CC content (excluded from plugins.txt); a regex can't catch them all.
     """
-    ccc = os.path.join(os.path.dirname(os.path.normpath(game_data_dir)), "Skyrim.ccc")
+    if not cc_file:
+        return []
+    ccc = os.path.join(os.path.dirname(os.path.normpath(game_data_dir)), cc_file)
     try:
         with open(ccc, "r", encoding="utf-8", errors="ignore") as fh:
             return [ln.strip().lower() for ln in fh if ln.strip()]
@@ -327,22 +330,26 @@ def read_ccc(game_data_dir: str) -> List[str]:
 
 def compose_load_order(scanned: Sequence[str], data_dir: str,
                        plugin_after: Optional[Dict[str, List[str]]] = None,
-                       vanilla: Optional[Iterable[str]] = None
+                       vanilla: Optional[Iterable[str]] = None,
+                       base_order: Optional[Sequence[str]] = None
                        ) -> Tuple[List[str], List[str]]:
     """Build ``(full_order, active_order)`` from scanned Data-folder plugins.
 
-    ``full_order`` (-> loadorder.txt) is: canonical vanilla masters, then CC
-    content, then everything else ordered masters-first + collection rules.
-    ``active_order`` (-> plugins.txt) is just the non-vanilla/non-CC plugins, in
-    the same relative order. ``vanilla`` overrides the base-game/CC set (callers
-    augment SKYRIMSE_VANILLA with the real Skyrim.ccc contents)."""
-    vanilla_names = set(SKYRIMSE_VANILLA if vanilla is None else vanilla)
+    ``full_order`` (-> loadorder.txt) is: canonical core masters (``base_order``,
+    fixed), then CC content, then everything else ordered masters-first +
+    collection rules. ``active_order`` (-> plugins.txt) is just the non-vanilla/
+    non-CC plugins, in the same relative order. ``vanilla`` is the full base+CC set
+    (callers augment the game's core masters with the real .ccc contents);
+    ``base_order`` is the game's core masters in fixed order (defaults to Skyrim SE).
+    """
+    base_order = list(SKYRIMSE_VANILLA_ORDER if base_order is None else base_order)
+    base_set = {n.lower() for n in base_order}
+    vanilla_names = set(base_set if vanilla is None else vanilla)
     present = {n.lower(): n for n in scanned}
-    vanilla_list = [present[v] for v in SKYRIMSE_VANILLA if v in present]
+    vanilla_list = [present[v] for v in base_set if v in present]
     vanilla_list += [n for n in scanned
-                     if is_vanilla_master(n, vanilla_names) and n.lower() not in SKYRIMSE_VANILLA]
+                     if is_vanilla_master(n, vanilla_names) and n.lower() not in base_set]
     vanilla_set = {n.lower() for n in vanilla_list}
-    vanilla = vanilla_list   # back-compat name used below
 
     others = [n for n in scanned if n.lower() not in vanilla_set]
 
@@ -350,10 +357,9 @@ def compose_load_order(scanned: Sequence[str], data_dir: str,
         return is_master_block(name, os.path.join(data_dir, name))
 
     active = order_plugins(others, master_here, plugin_after)
-    # canonical vanilla first (core in fixed order, CC sorted), then ordered rest
-    core = [present[v.lower()] for v in SKYRIMSE_VANILLA_ORDER if v.lower() in present]
-    cc = sorted((n for n in vanilla if n.lower() not in SKYRIMSE_VANILLA),
-                key=str.lower)
+    # canonical core masters first (fixed order), then CC (sorted), then ordered rest
+    core = [present[v.lower()] for v in base_order if v.lower() in present]
+    cc = sorted((n for n in vanilla_list if n.lower() not in base_set), key=str.lower)
     full = core + cc + active
     return full, active
 
@@ -389,11 +395,16 @@ def sort_plugins(collection: dict, game_data_dir: str, localappdata_dir: str, *,
     Returns ``(loadorder_path, plugins_path, active_count)``.
     """
     scanned = scan_plugins(game_data_dir)
-    # Native CC content comes from the real Skyrim.ccc, augmenting the hardcoded
-    # vanilla list (a regex misses CC plugins that don't fit the cc???sse### shape).
-    vanilla = set(SKYRIMSE_VANILLA) | set(read_ccc(game_data_dir))
+    # Game-generic via game_meta (Nexus domain from the collection): core master
+    # order + CC filename. Native CC content comes from the real .ccc, augmenting
+    # the core masters (a regex misses CC plugins outside the cc???sse### shape).
+    from utils import game_meta
+    meta = game_meta.get(game_meta.collection_domain(collection))
+    base_order = list(meta.master_order) or list(SKYRIMSE_VANILLA_ORDER)
+    cc_file = meta.cc_file or "Skyrim.ccc"
+    vanilla = {n.lower() for n in base_order} | set(read_ccc(game_data_dir, cc_file))
     full, active = compose_load_order(scanned, game_data_dir, after_map(collection),
-                                      vanilla=vanilla)
+                                      vanilla=vanilla, base_order=base_order)
     enabled = enabled_map(collection)
     # Strict activation only when the collection actually ships a plugin list,
     # so we don't accidentally disable everything for list-less collections.
