@@ -1,24 +1,33 @@
 """
-FOMOD engine: parse a mod's ``fomod/ModuleConfig.xml`` and resolve which files
-to install given the choices recorded in a Nexus collection.
+FOMOD engine: parse a mod's ``fomod/ModuleConfig.xml`` and resolve which files to
+install given the choices recorded in a Nexus collection.
 
-This replaces the old heuristic folder-name matching with a real implementation
-of the FOMOD installer model:
+This is a faithful port of Vortex's actual FOMOD installer (the open-source C#
+``fomod-installer`` it compiles into ``@nexusmods/fomod-installer-native``;
+reference source at ~/personal/fomod-installer-cs/src/InstallScripting/XmlScript).
+The algorithm, not a heuristic:
 
-* Parse install steps -> option groups -> plugins, each with its file list and
-  the condition flags it sets.
-* Map the collection's recorded selections (group name + 0-based plugin ``idx``)
-  onto the parsed plugins. The collection stores exactly which plugins the
-  collection author chose, so we don't need to evaluate the interactive UI.
-* Resolve the concrete set of files to install: always-installed required files,
-  the files of every chosen plugin, and any conditional file installs whose flag
-  dependencies are satisfied by the chosen plugins. Folder sources are expanded
-  to individual files and source paths are matched case-insensitively against the
-  extracted archive (FOMOD paths are Windows-style and case-insensitive).
+* Parse install steps -> option groups -> options, each option with its files,
+  the condition flags it sets, and an option-type resolver (Required / Optional /
+  Recommended / NotUsable / CouldBeUsable), plus step visibility conditions,
+  required files, and conditionalFileInstalls patterns.
+* Run the headless preset flow Vortex uses for collection installs: process
+  visible steps IN ORDER, preselect options from the collection's recorded
+  choices (and Required / SelectAll / SelectExactlyOne-default rules), letting the
+  flags set by selected options drive later steps' visibility, option types, and
+  conditional installs.
+* Build the file set exactly as Vortex does: required files (phase -1e9), selected
+  options' files (phase 0) plus alwaysInstall / installIfUsable files of unselected
+  options, then conditionalFileInstalls whose condition holds (phase +1e9); resolve
+  same-destination conflicts by higher effective priority, ties by source path.
 
-The engine is intentionally free of installer side effects: it returns a list of
-:class:`FileOperation` (absolute source path -> destination relative path, with a
-priority for overwrite ordering). The caller performs the actual copy.
+The engine is GAME-AGNOSTIC. Like Vortex's ``PluginCondition`` (which only calls
+``IsActive(path)``), a ``fileDependency`` is evaluated against an ``active_plugins``
+set the CALLER supplies (the collection's declared plugins + the game's active
+masters). The engine contains no Skyrim-specific knowledge.
+
+It is free of installer side effects: it returns a list of :class:`FileOperation`
+(absolute source path -> destination relative path). The caller performs the copy.
 """
 
 from __future__ import annotations
@@ -26,21 +35,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 def _norm(s: Optional[str]) -> str:
-    """Normalize a FOMOD step/group/option name for lenient matching: lowercase,
-    strip everything but letters/digits. Makes 'Version', '[ESL] Foo - Bar', and
-    'Foo Bar' comparable so a collection's recorded choice still maps onto the
-    real ModuleConfig when prefixes/punctuation/spacing differ (the native Vortex
-    FOMOD engine is similarly lenient and skips what truly can't match)."""
+    """Normalize a name for lenient matching: lowercase, strip non-alphanumerics.
+    Vortex matches step/group/option names with exact string equality; we match
+    exact first and fall back to this so a collection choice still maps when the
+    recorded name differs only by prefix/punctuation/spacing."""
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
-# ModuleConfig.xml comes from third-party mod archives, so parse it with the
-# hardened defusedxml parser (protects against XXE / billion-laughs). Fall back
-# to the stdlib parser if defusedxml isn't installed, following the project's
-# defensive-import convention.
+
+# ModuleConfig.xml comes from third-party archives -> harden with defusedxml.
 try:
     import defusedxml.ElementTree as ET
 except ImportError:  # pragma: no cover - defusedxml is a listed dependency
@@ -48,11 +54,10 @@ except ImportError:  # pragma: no cover - defusedxml is a listed dependency
 
 
 # --------------------------------------------------------------------------- #
-# Parsed model
+# Parsed model (mirrors the C# XmlScript model)
 # --------------------------------------------------------------------------- #
 @dataclass
 class FileItem:
-    """A <file> or <folder> entry from ModuleConfig.xml."""
     source: str
     destination: str
     priority: int = 0
@@ -62,43 +67,72 @@ class FileItem:
 
 
 @dataclass
-class Plugin:
-    """A single selectable option within a group."""
-    name: str
+class Dependency:
+    """A parsed <dependencies> tree: flag/file/version conditions joined And/Or."""
+    operator: str = "and"                                       # "and" | "or"
+    flags: List[Tuple[str, str]] = field(default_factory=list)        # (flag, value)
+    files: List[Tuple[str, str]] = field(default_factory=list)        # (plugin_lower, state)
+    children: List["Dependency"] = field(default_factory=list)
+    # version deps are parsed but treated as satisfied (we evaluate them as the
+    # common case: the user meets the min game/app/extender version).
+
+
+@dataclass
+class TypePattern:
+    type: str
+    dependency: Optional[Dependency]
+
+
+@dataclass
+class OptionTypeResolver:
+    """Static type, or a conditional resolver (first matching pattern, else default)."""
+    static_type: Optional[str] = None
+    default_type: str = "Optional"
+    patterns: List[TypePattern] = field(default_factory=list)
+
+    def resolve(self, flags: Dict[str, str], active: Set[str]) -> str:
+        if self.static_type is not None:
+            return self.static_type
+        for pat in self.patterns:
+            if _eval_dependency(pat.dependency, flags, active):
+                return pat.type
+        return self.default_type
+
+
+@dataclass
+class Option:
+    """A selectable option ('plugin' in FOMOD terms). Identity-based selection."""
+    name: str = ""
     files: List[FileItem] = field(default_factory=list)
     set_flags: Dict[str, str] = field(default_factory=dict)
+    type_resolver: OptionTypeResolver = field(default_factory=OptionTypeResolver)
+
+
+# Back-compat alias: older code/tests referenced ``Plugin``.
+Plugin = Option
 
 
 @dataclass
 class Group:
     name: str
-    group_type: str  # SelectExactlyOne, SelectAtMostOne, SelectAny, SelectAll, SelectAtLeastOne
-    plugins: List[Plugin] = field(default_factory=list)
+    group_type: str  # SelectAtLeastOne|SelectAtMostOne|SelectExactlyOne|SelectAll|SelectAny
+    plugins: List[Option] = field(default_factory=list)   # named 'plugins' for back-compat
+
+    @property
+    def options(self) -> List[Option]:
+        return self.plugins
 
 
 @dataclass
 class InstallStep:
     name: str
     groups: List[Group] = field(default_factory=list)
-
-
-@dataclass
-class Dependency:
-    """A parsed <dependencies> tree: flag/file/game conditions joined by And/Or.
-
-    Unlike the old flag-only parser, this keeps fileDependency so a pattern gated
-    on 'plugin X is active' is actually evaluated -- dropping it made such patterns
-    install unconditionally (the stray-patch / phantom-master bug)."""
-    operator: str = "and"                                   # "and" | "or"
-    flags: List[Tuple[str, str]] = field(default_factory=list)   # (flag, value)
-    files: List[Tuple[str, str]] = field(default_factory=list)   # (plugin_lower, state)
-    children: List["Dependency"] = field(default_factory=list)
+    visibility: Optional[Dependency] = None
 
 
 @dataclass
 class ConditionalInstall:
-    """A <pattern> inside <conditionalFileInstalls>: install files if deps match."""
-    dependency: Optional["Dependency"] = None
+    dependency: Optional[Dependency] = None
     files: List[FileItem] = field(default_factory=list)
 
 
@@ -108,37 +142,46 @@ class FomodConfig:
     install_steps: List[InstallStep] = field(default_factory=list)
     required_files: List[FileItem] = field(default_factory=list)
     conditional_installs: List[ConditionalInstall] = field(default_factory=list)
+    mod_prerequisites: Optional[Dependency] = None
 
 
 @dataclass
 class FileOperation:
-    """A concrete copy operation produced by the resolver."""
     abs_source: str       # absolute path to the file inside the extracted archive
     destination: str      # path relative to the mod's data root (forward slashes)
-    priority: int = 0
+    priority: int = 0     # effective priority (file priority + phase offset)
 
 
 # --------------------------------------------------------------------------- #
 # XML parsing
 # --------------------------------------------------------------------------- #
 def _localname(tag: str) -> str:
-    """Strip any XML namespace from a tag name."""
     return tag.rsplit('}', 1)[-1]
 
 
 def _find(elem, name):
-    for child in elem:
+    for child in elem if elem is not None else []:
         if _localname(child.tag) == name:
             return child
     return None
 
 
 def _findall(elem, name):
-    return [c for c in elem if _localname(c.tag) == name]
+    return [c for c in (elem if elem is not None else []) if _localname(c.tag) == name]
+
+
+def _find_any(elem, *names):
+    """First child matching any of ``names`` (handles schema spelling variants).
+    Uses explicit None checks -- an empty element is falsy, so ``a or b`` would
+    wrongly skip a real-but-childless element."""
+    for name in names:
+        found = _find(elem, name)
+        if found is not None:
+            return found
+    return None
 
 
 def _parse_files(files_elem) -> List[FileItem]:
-    """Parse a <files> container of <file>/<folder> entries."""
     items: List[FileItem] = []
     if files_elem is None:
         return items
@@ -151,16 +194,13 @@ def _parse_files(files_elem) -> List[FileItem]:
             continue
         destination = child.get("destination")
         if destination is None:
-            # FOMOD: a missing destination installs to the same relative path
-            destination = source
+            destination = source        # FOMOD: missing dest -> same relative path
         try:
             priority = int(child.get("priority", "0"))
         except ValueError:
             priority = 0
         items.append(FileItem(
-            source=source,
-            destination=destination,
-            priority=priority,
+            source=source, destination=destination, priority=priority,
             is_folder=(kind == "folder"),
             always_install=child.get("alwaysInstall", "false").lower() == "true",
             install_if_usable=child.get("installIfUsable", "false").lower() == "true",
@@ -168,55 +208,73 @@ def _parse_files(files_elem) -> List[FileItem]:
     return items
 
 
-def _parse_dependencies(dependencies_elem) -> Optional[Dependency]:
-    """Parse a <dependencies> tree into a :class:`Dependency` (flag + file + game
-    conditions, And/Or, nestable). Returns None for a missing/empty element."""
-    if dependencies_elem is None:
+# Condition element names vary across schema versions (dependancy/dependency etc.);
+# match leniently on the local name.
+def _parse_dependencies(dep_elem) -> Optional[Dependency]:
+    """Parse a <dependencies>/<dependancies> tree (flag + file + version, And/Or)."""
+    if dep_elem is None:
         return None
-    dep = Dependency(operator=(dependencies_elem.get("operator", "And") or "And").lower())
-    for child in dependencies_elem:
-        kind = _localname(child.tag)
-        if kind == "flagDependency":
+    op = (dep_elem.get("operator", "And") or "And").lower()
+    dep = Dependency(operator=("or" if op == "or" else "and"))
+    for child in dep_elem:
+        kind = _localname(child.tag).lower()
+        if kind in ("flagdependency",):
             dep.flags.append((child.get("flag", ""), child.get("value", "")))
-        elif kind == "fileDependency":
-            # FOMOD file state: Active | Inactive | Missing (default Active).
+        elif kind in ("filedependency", "moduledependency"):
             dep.files.append((child.get("file", "").strip().lower(),
-                              (child.get("state", "Active") or "Active")))
-        elif kind == "dependencies":
+                              child.get("state", "Active") or "Active"))
+        elif kind in ("dependencies", "dependancies"):
             nested = _parse_dependencies(child)
             if nested is not None:
                 dep.children.append(nested)
-        # gameDependency / other: ignored as a condition (treated as satisfied)
+        # *VersionDependency / gameDependency / fommDependency / foseDependency etc.
+        # are parsed-as-satisfied (treated as met); they rarely gate file selection.
     return dep
 
 
-def _eval_dependency(dep: Optional[Dependency], flags: Dict[str, str],
-                     active_plugins: frozenset) -> bool:
-    """Evaluate a parsed dependency tree.
+def _parse_type_resolver(option_elem) -> OptionTypeResolver:
+    """Parse <typeDescriptor> -> static <type> or <dependencyType> patterns."""
+    td = _find(option_elem, "typeDescriptor")
+    if td is None:
+        return OptionTypeResolver(static_type="Optional")
+    static = _find(td, "type")
+    if static is not None:
+        return OptionTypeResolver(static_type=static.get("name", "Optional"))
+    dt = _find_any(td, "dependencyType", "dependancyType")
+    if dt is None:
+        return OptionTypeResolver(static_type="Optional")
+    default = _find(dt, "defaultType")
+    resolver = OptionTypeResolver(
+        static_type=None,
+        default_type=(default.get("name", "Optional") if default is not None else "Optional"))
+    patterns = _find(dt, "patterns")
+    for pat in _findall(patterns, "pattern"):
+        ptype = _find(pat, "type")
+        deps = _find_any(pat, "dependencies", "dependancies")
+        resolver.patterns.append(TypePattern(
+            type=(ptype.get("name", "Optional") if ptype is not None else "Optional"),
+            dependency=_parse_dependencies(deps)))
+    return resolver
 
-    ``flags`` are the condition flags set by chosen plugins; ``active_plugins`` is
-    the lowercased set of plugins that will be active (the collection's declared
-    plugin list + vanilla masters). A fileDependency 'Active' is satisfied iff the
-    plugin is in that set -- so a patch gated on a mod the collection doesn't
-    include is correctly NOT installed.
-    """
-    if dep is None:
-        return True
-    results: List[bool] = []
-    for name, val in dep.flags:
-        results.append(flags.get(name) == val)
-    for plugin, state in dep.files:
-        present = plugin in active_plugins
-        s = state.lower()
-        if s in ("missing", "inactive"):
-            results.append(not present)
-        else:                                  # "active" (default)
-            results.append(present)
-    for child in dep.children:
-        results.append(_eval_dependency(child, flags, active_plugins))
-    if not results:                            # no evaluable conditions -> vacuously true
-        return True
-    return any(results) if dep.operator == "or" else all(results)
+
+def _parse_option(plugin_elem) -> Option:
+    opt = Option(name=plugin_elem.get("name", ""))
+    opt.files = _parse_files(_find(plugin_elem, "files"))
+    cond_flags = _find(plugin_elem, "conditionFlags")
+    if cond_flags is not None:
+        for flag in _findall(cond_flags, "flag"):
+            opt.set_flags[flag.get("name", "")] = (flag.text or "").strip()
+    opt.type_resolver = _parse_type_resolver(plugin_elem)
+    return opt
+
+
+def _parse_group(group_elem) -> Group:
+    group = Group(name=group_elem.get("name", ""),
+                  group_type=group_elem.get("type", "SelectAny"))
+    plugins_container = _find(group_elem, "plugins")
+    for plugin_elem in _findall(plugins_container, "plugin"):
+        group.plugins.append(_parse_option(plugin_elem))
+    return group
 
 
 def parse_moduleconfig(xml_data) -> FomodConfig:
@@ -233,158 +291,135 @@ def parse_moduleconfig(xml_data) -> FomodConfig:
     if name_elem is not None and name_elem.text:
         config.module_name = name_elem.text.strip()
 
-    # Always-installed files
-    req = _find(root, "requiredInstallFiles")
-    config.required_files = _parse_files(req)
+    # Mod prerequisites gate (moduleDependencies / moduleDependancies)
+    prereq = _find_any(root, "moduleDependencies", "moduleDependancies")
+    config.mod_prerequisites = _parse_dependencies(prereq)
 
-    # Install steps -> groups -> plugins
+    config.required_files = _parse_files(_find(root, "requiredInstallFiles"))
+
+    # Install steps. v1/v2 put a single implicit step's groups directly under root
+    # in <optionalFileGroups>; v4+ wrap them in <installSteps><installStep>.
     steps_container = _find(root, "installSteps")
     if steps_container is not None:
         for step_elem in _findall(steps_container, "installStep"):
             step = InstallStep(name=step_elem.get("name", ""))
+            vis = _find(step_elem, "visible")
+            if vis is not None:
+                step.visibility = _parse_dependencies(vis)
             groups_container = _find(step_elem, "optionalFileGroups")
-            if groups_container is not None:
-                for group_elem in _findall(groups_container, "group"):
-                    group = Group(
-                        name=group_elem.get("name", ""),
-                        group_type=group_elem.get("type", ""),
-                    )
-                    plugins_container = _find(group_elem, "plugins")
-                    if plugins_container is not None:
-                        for plugin_elem in _findall(plugins_container, "plugin"):
-                            plugin = Plugin(name=plugin_elem.get("name", ""))
-                            plugin.files = _parse_files(_find(plugin_elem, "files"))
-                            cond_flags = _find(plugin_elem, "conditionFlags")
-                            if cond_flags is not None:
-                                for flag in _findall(cond_flags, "flag"):
-                                    plugin.set_flags[flag.get("name", "")] = (flag.text or "").strip()
-                            group.plugins.append(plugin)
-                    step.groups.append(group)
+            for group_elem in _findall(groups_container, "group"):
+                step.groups.append(_parse_group(group_elem))
+            config.install_steps.append(step)
+    else:
+        groups_container = _find(root, "optionalFileGroups")
+        if groups_container is not None:
+            step = InstallStep(name="")
+            for group_elem in _findall(groups_container, "group"):
+                step.groups.append(_parse_group(group_elem))
             config.install_steps.append(step)
 
     # Conditional file installs
     cond_container = _find(root, "conditionalFileInstalls")
     if cond_container is not None:
         patterns = _find(cond_container, "patterns")
-        if patterns is not None:
-            for pattern in _findall(patterns, "pattern"):
-                deps = _find(pattern, "dependencies")
-                config.conditional_installs.append(ConditionalInstall(
-                    dependency=_parse_dependencies(deps),
-                    files=_parse_files(_find(pattern, "files")),
-                ))
+        for pattern in _findall(patterns, "pattern"):
+            deps = _find_any(pattern, "dependencies", "dependancies")
+            config.conditional_installs.append(ConditionalInstall(
+                dependency=_parse_dependencies(deps),
+                files=_parse_files(_find(pattern, "files"))))
 
     return config
 
 
 # --------------------------------------------------------------------------- #
-# Selection bridge + resolution
+# Condition evaluation (mirrors CompositeCondition / FlagCondition / PluginCondition)
+# --------------------------------------------------------------------------- #
+def _eval_dependency(dep: Optional[Dependency], flags: Dict[str, str],
+                     active: Set[str]) -> bool:
+    """Empty And -> True, empty Or -> False (Vortex CompositeCondition semantics)."""
+    if dep is None:
+        return True
+    results: List[bool] = []
+    for name, val in dep.flags:
+        cur = flags.get(name)
+        if val is None or val == "":
+            results.append(cur is None or cur == "")     # empty value matches absent/empty
+        else:
+            results.append(cur == val)                    # case-sensitive equality
+    for plugin, state in dep.files:
+        present = plugin in active
+        s = (state or "Active").lower()
+        if s == "missing":
+            results.append(not present)
+        elif s == "inactive":
+            results.append(not present)                   # we model active-set membership
+        else:                                             # Active
+            results.append(present)
+    for child in dep.children:
+        results.append(_eval_dependency(child, flags, active))
+    if not results:
+        return dep.operator != "or"                       # And-empty True, Or-empty False
+    return any(results) if dep.operator == "or" else all(results)
+
+
+# --------------------------------------------------------------------------- #
+# Selection bridge (collection preset -> selected options)
 # --------------------------------------------------------------------------- #
 def selections_from_collection(choices_data: Dict) -> List[Tuple[Optional[str], str, int, str]]:
-    """Flatten a collection's ``choices`` block into selection tuples.
-
-    Returns a list of ``(step_name, group_name, idx, choice_name)``. ``step_name``
-    may be None if the collection didn't record it.
-    """
+    """Flatten a collection ``choices`` block -> (step_name, group_name, idx, choice_name)."""
     selections = []
     for option in choices_data.get("options", []):
         step_name = option.get("name")
         for group in option.get("groups", []):
             group_name = group.get("name", "")
             for choice in group.get("choices", []):
-                selections.append((
-                    step_name,
-                    group_name,
-                    int(choice.get("idx", -1)),
-                    choice.get("name", ""),
-                ))
+                selections.append((step_name, group_name,
+                                   int(choice.get("idx", -1)), choice.get("name", "")))
     return selections
 
 
-def _match_group(config: FomodConfig, step_name: Optional[str], group_name: str) -> Optional[Group]:
-    """Find the parsed group matching a collection selection.
-
-    Match on group name (disambiguated by step name), leniently: exact, then
-    normalized, then treating the recorded ``group_name`` as a STEP name, then
-    a normalized substring. Vortex matches step/group by name too; we add the
-    normalization so prefixes/punctuation/spacing differences don't break it.
-    """
-    all_groups = [(step, group) for step in config.install_steps for group in step.groups]
-    gname = group_name.strip().lower()
-    gnorm = _norm(group_name)
-
-    candidates = [(s, g) for s, g in all_groups if g.name.strip().lower() == gname]
-    if not candidates and gnorm:
-        candidates = [(s, g) for s, g in all_groups if _norm(g.name) == gnorm]
-    if not candidates and gnorm:        # recorded "group" may actually be the step
-        candidates = [(s, g) for s, g in all_groups if _norm(s.name) == gnorm]
-    if not candidates and gnorm:        # last resort: normalized substring either way
-        candidates = [(s, g) for s, g in all_groups if _norm(g.name)
-                      and (gnorm in _norm(g.name) or _norm(g.name) in gnorm)]
-    if not candidates:
-        return None
-    if len(candidates) == 1 or not step_name:
-        return candidates[0][1]
-    snorm = _norm(step_name)
-    for s, g in candidates:
-        if _norm(s.name) == snorm:
-            return g
-    return candidates[0][1]
+def _preset_index(choices_data: Dict):
+    """Build lookup: (step_norm, group_norm) -> set(option_name_norm) chosen.
+    Also a group-name-only fallback for when the collection omitted step names."""
+    by_step_group: Dict[Tuple[str, str], Set[str]] = {}
+    by_group: Dict[str, Set[str]] = {}
+    for step_name, group_name, _idx, choice_name in selections_from_collection(choices_data):
+        cn = _norm(choice_name)
+        by_step_group.setdefault((_norm(step_name), _norm(group_name)), set()).add(cn)
+        by_group.setdefault(_norm(group_name), set()).add(cn)
+    return by_step_group, by_group
 
 
-def _plugin_by_name(plugins, name: str):
-    """Lenient option-name match within a plugin list: exact -> normalized ->
-    normalized substring (handles '[ESL] ' prefixes and the like)."""
-    if not name:
-        return None
-    target = name.strip().lower()
-    for p in plugins:
-        if p.name.strip().lower() == target:
-            return p
-    tnorm = _norm(name)
-    if not tnorm:
-        return None
-    for p in plugins:
-        if _norm(p.name) == tnorm:
-            return p
-    contains = [p for p in plugins if _norm(p.name)
-                and (_norm(p.name) in tnorm or tnorm in _norm(p.name))]
-    if contains:
-        return max(contains, key=lambda p: len(_norm(p.name)))
-    return None
-
-
+# --------------------------------------------------------------------------- #
+# Resolution
+# --------------------------------------------------------------------------- #
 @dataclass
 class ResolveReport:
-    """Diagnostics about how a resolution went, for logging."""
     chosen_plugins: List[str] = field(default_factory=list)
     unmatched_selections: List[str] = field(default_factory=list)
     flags_set: Dict[str, str] = field(default_factory=dict)
     conditional_patterns_applied: int = 0
+    prerequisites_failed: bool = False
 
 
 def _resolve_file_item(item: FileItem, package_root: Path,
-                       lower_index: Dict[str, Path]) -> List[FileOperation]:
-    """Turn one <file>/<folder> entry into concrete FileOperations.
+                       lower_index: Dict[str, Path], offset: int) -> List[Tuple[str, str, int]]:
+    """Expand one <file>/<folder> -> list of (abs_source, dest_posix, eff_priority).
 
-    Source paths are resolved case-insensitively against ``lower_index`` (a map of
-    lowercased archive-relative path -> real path). Folders are expanded to their
-    contained files, remapping each onto the destination.
-    """
-    ops: List[FileOperation] = []
+    Single files get ``item.priority + offset``. Folder CONTENTS use the raw
+    ``item.priority`` (the C# folder path does NOT add the phase offset)."""
+    out: List[Tuple[str, str, int]] = []
     src_norm = item.source.replace("\\", "/").strip("/").lower()
     dest_norm = item.destination.replace("\\", "/").strip("/")
 
     if not item.is_folder:
         real = lower_index.get(src_norm)
-        if real is None:
-            return ops
+        if real is None or real.is_dir():
+            return out
         dest = dest_norm or real.name
-        ops.append(FileOperation(str(real), dest, item.priority))
-        return ops
+        out.append((str(real), dest, item.priority + offset))
+        return out
 
-    # Folder: copy every file under the source folder, remapping each file under
-    # the destination while preserving the real (cased) sub-path.
     strip_components = len(src_norm.split("/")) if src_norm else 0
     prefix = src_norm + "/" if src_norm else ""
     for low_path, real in lower_index.items():
@@ -395,109 +430,167 @@ def _resolve_file_item(item: FileItem, package_root: Path,
         rel_real = real.relative_to(package_root).as_posix()
         remainder = "/".join(rel_real.split("/")[strip_components:])
         dest = f"{dest_norm}/{remainder}" if dest_norm else remainder
-        ops.append(FileOperation(str(real), dest.strip("/"), item.priority))
-    return ops
+        out.append((str(real), dest.strip("/"), item.priority))   # raw priority for folders
+    return out
 
 
-def _active_set(active_plugins) -> frozenset:
-    """Lowercased active-plugin set for fileDependency evaluation: the caller's
-    set (collection's declared plugins) unioned with the vanilla masters, which
-    are always present. None -> just the vanilla masters."""
-    try:
-        from utils.vortex_loadorder import SKYRIMSE_VANILLA
-        base = set(SKYRIMSE_VANILLA)
-    except Exception:
-        base = set()
-    if active_plugins:
-        base |= {p.strip().lower() for p in active_plugins if p}
-    return frozenset(base)
-
-
-def resolve_install(config: FomodConfig,
-                    choices_data: Dict,
-                    package_root,
+def resolve_install(config: FomodConfig, choices_data: Dict, package_root,
                     active_plugins=None) -> Tuple[List[FileOperation], ResolveReport]:
-    """Resolve the full set of files to install for a FOMOD given collection choices.
+    """Resolve the files to install for a FOMOD given a collection's recorded choices.
 
-    Args:
-        config: parsed ModuleConfig.
-        choices_data: the mod's ``choices`` block from the collection.
-        package_root: directory containing the ``fomod`` folder (source paths are
-            relative to this).
-        active_plugins: names of the plugins that will be active (the collection's
-            declared ``plugins`` list). Used to evaluate fileDependency conditions
-            so conditional patches only install when their required plugins are
-            actually part of the build. None -> only vanilla masters count as
-            active (conservative: patches gated on non-vanilla mods won't install).
+    ``active_plugins`` is the set of plugins that will be active (the collection's
+    declared plugins + the game's active masters). Used to evaluate fileDependency
+    and dependency-type conditions exactly as Vortex's PluginCondition does.
 
-    Returns:
-        (file_operations, report). ``file_operations`` is ordered by priority so a
-        later op overwrites an earlier one writing to the same destination.
+    Returns (file_operations, report); one operation per destination, the winner of
+    Vortex's priority/conflict rule.
     """
     package_root = Path(package_root)
     report = ResolveReport()
-    active = _active_set(active_plugins)
+    active: Set[str] = {p.strip().lower() for p in (active_plugins or []) if p}
 
-    # Case-insensitive index of everything in the package
     lower_index: Dict[str, Path] = {}
     for p in package_root.rglob("*"):
         rel = str(p.relative_to(package_root)).replace("\\", "/").lower()
         lower_index[rel] = p
 
-    selected_items: List[FileItem] = []
     flags: Dict[str, str] = {}
+    flag_owner: Dict[str, int] = {}
+    selected: Set[int] = set()           # ids of selected options
+    by_step_group, by_group = _preset_index(choices_data)
+    has_preset = bool(by_step_group)
 
-    # 1. Always-installed files: requiredInstallFiles, plus any alwaysInstall file
-    #    on ANY plugin (Vortex installs those regardless of whether the plugin is
-    #    selected).
-    selected_items.extend(config.required_files)
+    def enable(opt: Option):
+        selected.add(id(opt))
+        for fname, fval in opt.set_flags.items():
+            flags[fname] = fval
+            flag_owner[fname] = id(opt)
+
+    def disable(opt: Option):
+        selected.discard(id(opt))
+        for fname in [f for f, o in flag_owner.items() if o == id(opt)]:
+            flags.pop(fname, None)
+            flag_owner.pop(fname, None)
+
+    def is_preset(step: InstallStep, group: Group, opt: Option) -> bool:
+        names = by_step_group.get((_norm(step.name), _norm(group.name)))
+        if names is None:
+            names = by_group.get(_norm(group.name))        # fallback: group-only match
+        return bool(names) and _norm(opt.name) in names
+
+    def group_has_preset(step: InstallStep, group: Group) -> bool:
+        key = (_norm(step.name), _norm(group.name))
+        return key in by_step_group or _norm(group.name) in by_group
+
+    # 0. Mod prerequisites gate (unfulfilled -> nothing installs)
+    if not _eval_dependency(config.mod_prerequisites, flags, active):
+        report.prerequisites_failed = True
+        return [], report
+
+    # 1. fixSteps: a group with >1 Required option loosens AtMostOne/ExactlyOne
     for step in config.install_steps:
         for group in step.groups:
-            for plugin in group.plugins:
-                selected_items.extend(f for f in plugin.files if f.always_install)
+            req = sum(1 for o in group.options
+                      if o.type_resolver.resolve(flags, active) == "Required")
+            if req > 1 and group.group_type == "SelectAtMostOne":
+                group.group_type = "SelectAny"
+            elif req > 1 and group.group_type == "SelectExactlyOne":
+                group.group_type = "SelectAtLeastOne"
 
-    # 2. Chosen plugins. Vortex matches the chosen option by NAME
-    #    (preChoice.name == option.Name) within name-matched steps/groups -- NOT by
-    #    index. So match by name first (prefer the matched group, then anywhere),
-    #    and only fall back to the recorded positional idx.
-    for step_name, group_name, idx, choice_name in selections_from_collection(choices_data):
-        group = _match_group(config, step_name, group_name)
-        plugin = None
-        if choice_name:
-            if group is not None:
-                plugin = _plugin_by_name(group.plugins, choice_name)
-            if plugin is None:
-                plugin = _find_plugin_by_name(config, choice_name)
-        if plugin is None and group is not None and 0 <= idx < len(group.plugins):
-            plugin = group.plugins[idx]
-        if plugin is None:
-            report.unmatched_selections.append(f"{group_name}[{idx}] {choice_name}")
+    # 2. Preselect per VISIBLE step, in order (flags accumulate across steps)
+    for step in config.install_steps:
+        if step.visibility is not None and not _eval_dependency(step.visibility, flags, active):
             continue
-        report.chosen_plugins.append(plugin.name)
-        selected_items.extend(plugin.files)
-        flags.update(plugin.set_flags)
+        for group in step.groups:
+            if any(id(o) in selected for o in group.options):
+                continue
+            set_first = group.group_type == "SelectExactlyOne"
+            for opt in group.options:
+                otype = opt.type_resolver.resolve(flags, active)
+                preset_hit = is_preset(step, group, opt)
+                if preset_hit and otype == "NotUsable":
+                    opt.type_resolver = OptionTypeResolver(static_type="CouldBeUsable")
+                    otype = "CouldBeUsable"
+                enable_it = (otype == "Required"
+                             or (not has_preset and otype == "Recommended")
+                             or group.group_type == "SelectAll"
+                             or preset_hit)
+                if enable_it:
+                    set_first = False
+                    if group_has_preset(step, group) and not preset_hit:
+                        disable(opt)         # group has a preset and this isn't in it
+                    else:
+                        enable(opt)
+            if set_first and group.options:
+                enable(group.options[0])
+        # 3. fixSelected: force Required on, NotUsable off
+        for group in step.groups:
+            for opt in group.options:
+                otype = opt.type_resolver.resolve(flags, active)
+                if otype == "Required":
+                    enable(opt)
+                elif otype == "NotUsable":
+                    disable(opt)
 
     report.flags_set = dict(flags)
+    for step in config.install_steps:
+        for group in step.groups:
+            for opt in group.options:
+                if id(opt) in selected:
+                    report.chosen_plugins.append(opt.name)
 
-    # 3. Conditional installs whose dependency tree (flags + file deps) is satisfied
+    # 4. Build the file set across the three phases.
+    #    required: -1e9, selected (+ alwaysInstall/installIfUsable of unselected): 0,
+    #    conditional sets whose condition holds: +1e9.
+    OFFSET = 10 ** 9
+    phased: List[Tuple[FileItem, int]] = []
+    for f in config.required_files:
+        phased.append((f, -OFFSET))
+    for step in config.install_steps:
+        for group in step.groups:
+            for opt in group.options:
+                if id(opt) in selected:
+                    for f in opt.files:
+                        phased.append((f, 0))
+                else:
+                    otype = opt.type_resolver.resolve(flags, active)
+                    for f in opt.files:
+                        if f.always_install or (f.install_if_usable and otype != "NotUsable"):
+                            phased.append((f, 0))
     for cond in config.conditional_installs:
         if _eval_dependency(cond.dependency, flags, active):
-            selected_items.extend(cond.files)
             report.conditional_patterns_applied += 1
+            for f in cond.files:
+                phased.append((f, OFFSET))
 
-    # 4. Expand to concrete file operations, ordered by priority (stable)
-    ops: List[FileOperation] = []
-    for item in selected_items:
-        ops.extend(_resolve_file_item(item, package_root, lower_index))
-    ops.sort(key=lambda o: o.priority)
+    # 5. Expand + resolve same-destination conflicts (higher priority wins; tie ->
+    #    lexicographically greater source path).
+    winners: Dict[str, Tuple[str, str, int]] = {}   # dest_key -> (abs_source, dest, prio)
+    for item, offset in phased:
+        for abs_source, dest, prio in _resolve_file_item(item, package_root, lower_index, offset):
+            key = dest.lower()
+            cur = winners.get(key)
+            if cur is None or prio > cur[2] or (prio == cur[2] and abs_source > cur[0]):
+                winners[key] = (abs_source, dest, prio)
+
+    ops = [FileOperation(abs_source=a, destination=d, priority=p)
+           for (a, d, p) in winners.values()]
+    ops.sort(key=lambda o: (o.priority, o.destination))
     return ops, report
 
 
-def _find_plugin_by_name(config: FomodConfig, name: str) -> Optional[Plugin]:
-    """Lenient option-name match across every group in the config."""
-    all_plugins = [p for step in config.install_steps for group in step.groups
-                   for p in group.plugins]
-    return _plugin_by_name(all_plugins, name)
+def _find_plugin_by_name(config: FomodConfig, name: str) -> Optional[Option]:
+    """Lenient option-name match across every group (kept for callers/tests)."""
+    target, tnorm = name.strip().lower(), _norm(name)
+    allopts = [o for s in config.install_steps for g in s.groups for o in g.options]
+    for o in allopts:
+        if o.name.strip().lower() == target:
+            return o
+    if tnorm:
+        for o in allopts:
+            if _norm(o.name) == tnorm:
+                return o
+    return None
 
 
 def find_moduleconfig(extract_path) -> Optional[Path]:
