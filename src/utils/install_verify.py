@@ -190,12 +190,16 @@ def verify_archives(collection: Dict[str, Any], ledger: ls.LocalState, *,
         exp_md5 = (src.get("md5") or "").lower()
         row = dl_by_ids.get((mid, fid))
         path = (row or {}).get("dl_local_path") if row else None
-        if not path:
-            # No ledger path -> glob the downloads dir by modId token as a fallback.
-            path = _glob_archive(downloads, mid) if downloads else None
+        # Fall back to globbing the downloads dir whenever the ledger path is
+        # absent OR stale (points at a file that no longer exists). The ledger
+        # often has no local_path (downloads it only knows by id), so this glob
+        # is the common path, not the exception.
+        if (not path or not os.path.exists(path)) and downloads:
+            path = _glob_archive(downloads, mid)
         if not path or not os.path.exists(path):
             findings.append(Finding(ARCHIVE, ERROR, name,
-                            "archive missing on disk (no ledger path and none found)",
+                            "archive not found in downloads (ledger has no path and "
+                            f"no '*-{mid}-*' archive on disk)",
                             {"modId": mid, "fileId": fid}))
             continue
         sizes = {int(exp_size)} if isinstance(exp_size, int) else set()
