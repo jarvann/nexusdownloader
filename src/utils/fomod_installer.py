@@ -79,6 +79,18 @@ class InstallationResult:
 # routes whole root mods to the game root at deploy time).
 
 
+def _collection_active_plugins(collection_data: Dict[str, Any]) -> set:
+    """Lowercased names of the plugins the collection will activate. Feeds the
+    FOMOD engine's fileDependency evaluation so conditional patches only install
+    when the plugin they depend on is part of the build."""
+    out = set()
+    for p in (collection_data or {}).get("plugins", []):
+        n = (p.get("name") or "").strip().lower()
+        if n:
+            out.add(n)
+    return out
+
+
 class FomodInstaller:
     """Handles FOMOD-based mod installation."""
 
@@ -102,6 +114,11 @@ class FomodInstaller:
         else:
             self.logger = logger
         self.archive_handler = get_archive_handler(self.logger)
+        # Lowercased plugin names the collection will activate -- used to evaluate
+        # FOMOD fileDependency conditions so conditional patches only install when
+        # their required plugins are part of the build. Set per-collection by
+        # install_collection(); None means "evaluate against vanilla masters only".
+        self.active_plugins: Optional[set] = None
 
         # Resolve the scratch/temp root override (None -> system default).
         self._temp_root = self._resolve_temp_root(temp_root)
@@ -854,7 +871,8 @@ class FomodInstaller:
             package_root = module_config.parent.parent  # dir containing the fomod/ folder
             try:
                 config = parse_moduleconfig(module_config)
-                file_ops, report = resolve_install(config, choices_data, package_root)
+                file_ops, report = resolve_install(config, choices_data, package_root,
+                                                   active_plugins=self.active_plugins)
             except Exception as parse_error:
                 self.logger.error(
                     f"{mod_name}: failed to parse FOMOD ({parse_error}); falling back to simple install")
@@ -1525,6 +1543,7 @@ class FomodInstaller:
             List of installation results
         """
         results = []
+        self.active_plugins = _collection_active_plugins(collection_data)
 
         # Set aside mods that can't be auto-installed (external/bundled sources)
         collection_data, manual_results = self._partition_manual_mods(collection_data, downloads_path)
@@ -1940,6 +1959,7 @@ class ParallelFomodInstaller(FomodInstaller):
         """
         self.logger.debug(f" install_collection_parallel started")
         results = []
+        self.active_plugins = _collection_active_plugins(collection_data)
 
         # Set aside mods that can't be auto-installed (external/bundled sources)
         collection_data, manual_results = self._partition_manual_mods(collection_data, downloads_path)

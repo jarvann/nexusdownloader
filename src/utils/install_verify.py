@@ -397,6 +397,10 @@ def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.Loc
 
     rows = {r.get("folder"): r for r in ledger.all_mods_with_download()}
     coll_by_ids = {(mid, fid): mod for mid, fid, _s, mod in iter_nexus_mods(collection)}
+    # The collection's declared plugins drive FOMOD fileDependency evaluation, so
+    # the simulation matches what the installer (with the same set) produces.
+    active_plugins = {p.get("name", "").lower() for p in collection.get("plugins", [])
+                      if p.get("name")}
 
     # Build the work list: installed collection mods (optionally filtered).
     def _in_scope(folder: str) -> bool:
@@ -438,7 +442,8 @@ def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.Loc
         tmp = tempfile.mkdtemp(prefix="verify_", dir=temp_root or None)
         try:
             expected = _simulate_expected(installer, handler, Path(archive), mod, Path(tmp),
-                                          find_moduleconfig, parse_moduleconfig, resolve_install)
+                                          find_moduleconfig, parse_moduleconfig, resolve_install,
+                                          active_plugins)
             if expected is None:
                 findings.append(Finding(CONTENT, INFO, folder,
                                 "could not simulate (no ModuleConfig found in archive)"))
@@ -461,7 +466,8 @@ def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.Loc
 
 
 def _simulate_expected(installer, handler, archive: Path, mod: Dict[str, Any], tmp: Path,
-                       find_moduleconfig, parse_moduleconfig, resolve_install) -> Optional[Set[str]]:
+                       find_moduleconfig, parse_moduleconfig, resolve_install,
+                       active_plugins=None) -> Optional[Set[str]]:
     """Expected relative file set (lowercased, posix) the installer would produce,
     computed WITHOUT copying into staging. Mirrors _install_simple/_install_fomod."""
     handler.extract_archive(archive, tmp)
@@ -471,7 +477,8 @@ def _simulate_expected(installer, handler, archive: Path, mod: Dict[str, Any], t
         if not mc:
             return None
         config = parse_moduleconfig(mc)
-        ops, _report = resolve_install(config, choices, mc.parent.parent)
+        ops, _report = resolve_install(config, choices, mc.parent.parent,
+                                       active_plugins=active_plugins)
         return {op.destination.replace("\\", "/").lower()
                 for op in ops if Path(op.abs_source).is_file()}
     # simple mod: copy the stage-root subtree minus skipped files
