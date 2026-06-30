@@ -62,10 +62,8 @@ def setup_logger(game_domain, operation_type="download"):
     
     logger = create_operation_logger(operation_type, game_domain)
     set_download_logger(logger)  # Set the logger for download.py
-    return logger
-    set_endorse_logger(logger) # Set the logger for endorse.py
-    logger.verbose(f"Logger initialized for game domain: {game_domain}")    
-    
+    set_endorse_logger(logger)   # Set the logger for endorse.py
+    logger.verbose(f"Logger initialized for game domain: {game_domain}")
     return logger
 
 def incrementCOUNTER_ThreadSafe():
