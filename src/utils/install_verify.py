@@ -377,7 +377,7 @@ def verify_content_cheap(collection: Dict[str, Any],
 
 def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.LocalState, *,
                         only: Optional[Sequence[str]] = None, limit: Optional[int] = None,
-                        temp_root: Optional[str] = None,
+                        temp_root: Optional[str] = None, downloads: str = "",
                         progress: Optional[Callable[[int, int, str], None]] = None
                         ) -> List[Finding]:
     """Re-extract each mod's archive, run the REAL installer resolver, and diff the
@@ -399,9 +399,17 @@ def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.Loc
     coll_by_ids = {(mid, fid): mod for mid, fid, _s, mod in iter_nexus_mods(collection)}
 
     # Build the work list: installed collection mods (optionally filtered).
-    work: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    def _in_scope(folder: str) -> bool:
+        if only is None:
+            return True
+        fl = folder.lower()
+        # substring match either direction, so a fragment of the folder name works
+        return any(o.lower() in fl or fl in o.lower() for o in only)
+
+    findings: List[Finding] = []
+    work: List[Tuple[str, Dict[str, Any], Dict[str, Any], str]] = []
     for folder, row in rows.items():
-        if only is not None and folder not in only:
+        if not _in_scope(folder):
             continue
         mid, fid = row.get("dl_mod_id"), row.get("dl_file_id")
         if mid is None or fid is None:
@@ -410,18 +418,23 @@ def verify_content_deep(collection: Dict[str, Any], staging: str, ledger: ls.Loc
         if mod is None:
             continue
         archive = row.get("dl_local_path")
+        # Same stale-path fallback as verify_archives: glob the downloads dir.
+        if (not archive or not os.path.exists(archive)) and downloads:
+            archive = _glob_archive(downloads, int(mid))
         if not archive or not os.path.exists(archive):
+            findings.append(Finding(CONTENT, INFO, folder,
+                            "deep check skipped: archive not found on disk"))
             continue
-        work.append((folder, row, mod))
+        work.append((folder, row, mod, archive))
     if limit is not None:
         work = work[:limit]
 
-    findings: List[Finding] = []
     total = len(work)
-    for i, (folder, row, mod) in enumerate(work, 1):
+    if progress:
+        progress(0, total, f"{total} folder(s) in scope")
+    for i, (folder, row, mod, archive) in enumerate(work, 1):
         if progress:
             progress(i, total, folder)
-        archive = row.get("dl_local_path")
         tmp = tempfile.mkdtemp(prefix="verify_", dir=temp_root or None)
         try:
             expected = _simulate_expected(installer, handler, Path(archive), mod, Path(tmp),
@@ -558,7 +571,7 @@ def verify(staging: str, *, downloads: str = "", collection_path: str = "",
                             if f.severity in (ERROR, WARN) and f.component in (STAGING, CONTENT)})
         report.findings += verify_content_deep(collection, staging, ledger, only=scope,
                                                 limit=deep_limit, temp_root=temp_root,
-                                                progress=progress)
+                                                downloads=downloads, progress=progress)
 
     report.stats = {
         "collection": os.path.basename(os.path.dirname(collection_path)),
