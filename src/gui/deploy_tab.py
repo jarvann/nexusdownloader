@@ -125,9 +125,16 @@ class MaintenanceWorkerThread(QThread):
                 plan = mnt.plan_reset(self.staging, game_data=self.game_data,
                                       purge_deploy=self.purge_deploy)
                 res = mnt.run_reset(plan, log=lambda m: self.status.emit(m), progress=prog)
-                self.done.emit(
-                    f"Reset complete: purged {res.purged}, deleted {res.deleted} staging "
-                    f"folder(s), ledger reset. Now 'downloaded, waiting to install'.")
+                total_f = len(plan.folders)
+                if res.errors and res.deleted < total_f:
+                    self.failed.emit(
+                        f"Reset INCOMPLETE: deleted {res.deleted}/{total_f} staging folder(s), "
+                        f"purged {res.purged}, {len(res.errors)} error(s). "
+                        f"First: {res.errors[0]}")
+                else:
+                    self.done.emit(
+                        f"Reset complete: purged {res.purged}, deleted {res.deleted}/{total_f} "
+                        f"staging folder(s), ledger reset. Now 'downloaded, waiting to install'.")
             elif self.mode == "verify":
                 from utils import install_verify as iv
                 rep = iv.verify(self.staging, downloads=self.downloads)

@@ -724,6 +724,16 @@ class InstallTab(QWidget):
             QMessageBox.warning(self, "Remove Installation",
                                 "Set the Mod Staging Folder first.")
             return
+        # Never reset while an install is running: the install would re-create every
+        # folder the reset deletes, so the reset silently "succeeds" but nothing sticks.
+        if self.install_thread and self.install_thread.isRunning():
+            QMessageBox.warning(
+                self, "Remove Installation",
+                "An installation is still running. Wait for it to finish first — "
+                "otherwise the install re-creates whatever the reset deletes.")
+            return
+        if getattr(self, "_remove_thread", None) and self._remove_thread.isRunning():
+            return
         game_data = getattr(getattr(self, "_session", None), "game_data", "") or ""
         can_purge = bool(game_data and os.path.isdir(game_data))
 
@@ -988,7 +998,10 @@ class InstallTab(QWidget):
         if self.install_thread and self.install_thread.isRunning():
             self.log_message("WARNING", "Installation already running, returning")
             return
-        
+        if getattr(self, "_remove_thread", None) and self._remove_thread.isRunning():
+            self.log_message("WARNING", "Remove Installation is running; wait for it to finish")
+            return
+
         # Clear previous results + reset the running mod/file counters.
         self.mod_status_list.clear()
         self._mods_done = self._mods_total = self._files_done = 0

@@ -19,6 +19,13 @@ from typing import Callable, List, Optional, Sequence
 
 from utils import local_state as ls
 
+try:
+    from utils.unified_logging import get_logger
+    _logger = get_logger("maintenance")
+except Exception:  # logging must never block a maintenance op
+    import logging as _logging
+    _logger = _logging.getLogger("nexusdownloader.maintenance")
+
 
 def collection_container(staging: str) -> Optional[str]:
     """Name of the staging subfolder that holds collection.json (preserved on reset)."""
@@ -121,6 +128,8 @@ def run_reset(plan: ResetPlan, *, log: Callable[[str], None] = lambda _m: None,
 
     total_folders = len(plan.folders)
     roots = [os.path.join(plan.staging, d) for d in plan.folders]
+    _logger.info(f"run_reset: staging={plan.staging!r} folders={total_folders} "
+                 f"purge_deploy={plan.purge_deploy}")
 
     if roots:
         # Phase 1 -- enumerate every file under the target folders (flat list).
@@ -173,4 +182,9 @@ def run_reset(plan: ResetPlan, *, log: Callable[[str], None] = lambda _m: None,
         ledger.flush()
         res.ledger_reset = True
         log("Ledger install state reset (downloads + endorsements preserved).")
+
+    if res.errors:
+        _logger.warning(f"run_reset: {len(res.errors)} error(s); first: {res.errors[0]}")
+    _logger.info(f"run_reset done: deleted={res.deleted}/{total_folders} "
+                 f"purged={res.purged} ledger_reset={res.ledger_reset}")
     return res
