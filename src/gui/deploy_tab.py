@@ -254,13 +254,8 @@ class DeployTab(QWidget):
         mrow.addWidget(self.verify_btn)
 
         mrow.addStretch()
-        self.reset_btn = QPushButton("Reset Install (nuke staging + DB)")
-        self.reset_btn.setStyleSheet("QPushButton { color: #b00; }")
-        self.reset_btn.setToolTip("DESTRUCTIVE: delete staging mod folders and reset the ledger "
-                                  "to 'downloaded, waiting to install'. Keeps your downloads "
-                                  "and the collection. Vortex must be CLOSED.")
-        self.reset_btn.clicked.connect(self.reset_install)
-        mrow.addWidget(self.reset_btn)
+        # Reset/"Remove Installation" lives on the Install tab (where you build the
+        # collection); Deploy keeps only Purge + Verify.
         layout.addWidget(maint)
 
         self.panel = PhasePanel("Deploy Progress")
@@ -414,7 +409,7 @@ class DeployTab(QWidget):
 
     # --- maintenance ------------------------------------------------------ #
     def _maint_buttons(self, enabled: bool):
-        for b in (self.purge_btn, self.verify_btn, self.reset_btn, self.deploy_btn):
+        for b in (self.purge_btn, self.verify_btn, self.deploy_btn):
             b.setEnabled(enabled)
 
     def _start_maint(self, mode, starting_msg, purge_deploy=False):
@@ -461,29 +456,3 @@ class DeployTab(QWidget):
             QMessageBox.warning(self, "Verify", "Need the staging path set.")
             return
         self._start_maint("verify", "Verifying installation…")
-
-    def reset_install(self):
-        if not self.staging_path:
-            QMessageBox.warning(self, "Reset", "Need the staging path set.")
-            return
-        also_purge = False
-        if self.game_data_dir:
-            ans = QMessageBox.question(
-                self, "Reset Install — also purge deployment?",
-                "Also un-deploy from the game folder first (remove deployed hardlinks)?\n\n"
-                "Yes = purge game folder + wipe staging.  No = wipe staging only.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                | QMessageBox.StandardButton.Cancel)
-            if ans == QMessageBox.StandardButton.Cancel:
-                return
-            also_purge = ans == QMessageBox.StandardButton.Yes
-        if QMessageBox.warning(
-                self, "Reset Install — confirm",
-                "DESTRUCTIVE: this deletes the staging mod folders and resets the ledger "
-                "to 'downloaded, waiting to install'.\n\n"
-                "PRESERVED: your downloads, endorsements, and the collection.\n"
-                "Vortex must be CLOSED.\n\nProceed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
-                ) != QMessageBox.StandardButton.Yes:
-            return
-        self._start_maint("reset", "Resetting install…", purge_deploy=also_purge)
