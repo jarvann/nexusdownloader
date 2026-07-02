@@ -725,28 +725,37 @@ class InstallTab(QWidget):
                                 "Set the Mod Staging Folder first.")
             return
         game_data = getattr(getattr(self, "_session", None), "game_data", "") or ""
-        also_purge = False
-        if game_data and os.path.isdir(game_data):
-            ans = QMessageBox.question(
-                self, "Remove Installation — also un-deploy from the game?",
-                "Also remove the deployed files from the game folder first "
-                "(un-deploy hardlinks + update vortex.deployment.json in Data and "
-                "staging)?\n\n"
-                "Yes = un-deploy game folder + wipe staging.\nNo = wipe staging only.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                | QMessageBox.StandardButton.Cancel)
-            if ans == QMessageBox.StandardButton.Cancel:
-                return
-            also_purge = ans == QMessageBox.StandardButton.Yes
-        if QMessageBox.warning(
-                self, "Remove Installation — confirm",
-                "DESTRUCTIVE: this deletes every staged mod folder for this collection "
-                "and resets the ledger to 'downloaded, waiting to install'.\n\n"
+        can_purge = bool(game_data and os.path.isdir(game_data))
+
+        # Single confirm whose buttons ARE the actions: pick what to remove, or cancel.
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Remove Installation")
+        box.setText("Remove this collection's installation?")
+        info = ("DESTRUCTIVE: deletes every staged mod folder and resets the ledger to "
+                "'downloaded, waiting to install'.\n"
                 "PRESERVED: your downloads, endorsements, and the collection.\n"
-                "Vortex must be CLOSED.\n\nProceed?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
-                ) != QMessageBox.StandardButton.Yes:
+                "Vortex must be CLOSED.\n\n")
+        if can_purge:
+            info += ("• Staging and Deployed — un-deploy the game folder (remove hardlinks "
+                     "+ update vortex.deployment.json), then wipe staging.\n"
+                     "• Staging Only — wipe staging, leave the game folder as-is.")
+        else:
+            info += "• Staging Only — wipe staging (no deployed game folder detected)."
+        box.setInformativeText(info)
+
+        both_btn = (box.addButton("Staging and Deployed", QMessageBox.ButtonRole.DestructiveRole)
+                    if can_purge else None)
+        box.addButton("Staging Only", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is None or clicked is cancel_btn:
             return
+        also_purge = clicked is both_btn
 
         from gui.deploy_tab import MaintenanceWorkerThread
         self.remove_install_btn.setEnabled(False)
