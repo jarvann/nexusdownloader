@@ -29,7 +29,7 @@
     "log_level": "DEBUG",
     "log_to_file": true,
     "log_to_console": true,
-    "log_directory": "X:/_work/nexusdownloader/logs",
+    "log_directory": "logs",
     "max_log_size_mb": 10,
     "log_backup_count": 5,
     "enable_performance_logging": true,
