@@ -510,23 +510,28 @@ class FomodInstaller:
             "interface", "fonts", "scripts", "facegen", "menus", "lodsettings",
             "lsdata", "sound", "strings", "trees", "asi", "tools", "calientetools",
             "skse",                     # Data/SKSE/Plugins is valid mod content
+            "nemesis_engine", "pandora_engine",  # behaviour-patch inputs (all .txt)
             "fomod",
         ]
-        
+
         def has_mod_content(path: Path) -> bool:
-            """Check if a directory contains mod content."""
+            """True if a directory holds recognized mod content. Case-insensitive:
+            archives use arbitrary casing (Textures/textures, Nemesis_Engine) and
+            the install runs on case-insensitive Windows, so match on lowercased
+            entry names rather than exact-case path probes."""
             if not path.is_dir():
                 return False
-            
+            try:
+                entries = {e.name.lower() for e in path.iterdir()}
+            except OSError:
+                return False
             for pattern in mod_indicators:
                 if pattern.startswith("*"):
-                    # File pattern
-                    if list(path.glob(pattern)):
+                    ext = pattern[1:]  # e.g. ".esp" (mod_indicators are lowercase)
+                    if any(n.endswith(ext) for n in entries):
                         return True
-                else:
-                    # Directory name
-                    if (path / pattern).exists():
-                        return True
+                elif pattern in entries:
+                    return True
             return False
         
         # Check if extract_path itself has mod content
@@ -1410,23 +1415,29 @@ class FomodInstaller:
                 return True
         
         # Check for common mod directories with content
-        mod_directories = ["meshes", "textures", "scripts", "sound", "music", "CalienteTools", "SKSE"]
+        mod_directories = ["meshes", "textures", "scripts", "sound", "music",
+                           "CalienteTools", "SKSE", "Nemesis_Engine", "Pandora_Engine"]
         for dir_name in mod_directories:
             dir_path = mod_path / dir_name
             if dir_path.exists() and dir_path.is_dir():
                 # Check if directory has content
                 if any(dir_path.rglob("*")):
                     return True
-        
-        # If we get here, the folder might just have config/text files
-        # Check if there are any substantial files (not just readme/meta files)
+
+        # Otherwise the payload may be loose files in a tool folder -- e.g. Nemesis
+        # behaviour patches are ALL .txt. Treat the mod as valid if it has any file
+        # that isn't obviously a top-level doc. Match docs by NAME keyword, NOT a
+        # bare ".txt"/".md" substring -- that blanket skip is exactly what failed
+        # .txt-only mods (Nemesis/FNIS/config data is legitimately .txt).
+        doc_keywords = ("readme", "license", "licence", "changelog", "credits")
         for file_path in mod_path.rglob("*"):
-            if file_path.is_file():
-                file_name = file_path.name.lower()
-                # Skip common metadata files
-                if not any(skip in file_name for skip in ["readme", "license", "changelog", ".txt", ".md", "meta.ini"]):
-                    return True
-        
+            if not file_path.is_file():
+                continue
+            name = file_path.name.lower()
+            if name == "meta.ini" or any(k in name for k in doc_keywords):
+                continue
+            return True
+
         return False
 
     def _is_manual_mod(self, mod_data: Dict[str, Any]) -> bool:

@@ -62,3 +62,50 @@ def test_vortex_folder_name_uses_sanitized_archive_stem():
     # invalid path chars get replaced
     bad = inst._get_vortex_folder_name("Mod", Path("/dl/a:b*c?-1.zip"))
     assert ":" not in bad and "*" not in bad and "?" not in bad
+
+
+def _nemesis_tree(base: Path, wrapper=None):
+    """Create a Nemesis behaviour-patch layout (payload is ALL .txt), optionally
+    inside a single wrapper folder + meta.ini (the TK Dodge shape)."""
+    root = base / wrapper if wrapper else base
+    beh = root / "Nemesis_Engine" / "mod" / "tdmh" / "horsebehavior"
+    beh.mkdir(parents=True)
+    (beh / "#0170.txt").write_text("x")
+    (beh / "#0222.txt").write_text("x")
+    if wrapper:
+        (root / "meta.ini").write_text("[General]\n")
+    return base
+
+
+def test_find_mod_root_recognizes_nemesis_at_root(tmp_path):
+    # Nemesis_Engine directly at the extraction root -> that IS the root.
+    _nemesis_tree(tmp_path)
+    inst = _bare_installer()
+    assert inst._find_mod_root(tmp_path) == tmp_path
+
+
+def test_find_mod_root_strips_wrapper_around_nemesis(tmp_path):
+    # Nemesis_Engine inside a single wrapper folder (+meta.ini) -> strip to wrapper
+    # so it stages as Nemesis_Engine/... (deploys to Data/Nemesis_Engine/...).
+    _nemesis_tree(tmp_path, wrapper="TKDodgeFartherSteps")
+    inst = _bare_installer()
+    root = inst._find_mod_root(tmp_path)
+    assert root == tmp_path / "TKDodgeFartherSteps"
+    assert (root / "Nemesis_Engine").is_dir()
+
+
+def test_validate_accepts_txt_only_nemesis_mod(tmp_path):
+    # Regression: a mod whose entire payload is .txt (Nemesis) must be VALID.
+    _nemesis_tree(tmp_path)
+    inst = _bare_installer()
+    assert inst._validate_mod_installation(tmp_path) is True
+
+
+def test_validate_rejects_docs_only_and_empty(tmp_path):
+    inst = _bare_installer()
+    # truly empty
+    assert inst._validate_mod_installation(tmp_path) is False
+    # only a readme + meta.ini -> still invalid
+    (tmp_path / "README.txt").write_text("hi")
+    (tmp_path / "meta.ini").write_text("[General]\n")
+    assert inst._validate_mod_installation(tmp_path) is False
