@@ -992,7 +992,7 @@ class InstallTab(QWidget):
         # Clear previous results + reset the running mod/file counters.
         self.mod_status_list.clear()
         self._mods_done = self._mods_total = self._files_done = 0
-        self.overall_progress.setValue(0)
+        self.overall_progress.setRange(0, 0)   # busy indicator during pre-scan; update_progress sets 0..total
         self.overall_progress.setVisible(True)
 
         # Optionals are opt-in: install required only, unless the user picks some
@@ -1125,7 +1125,12 @@ class InstallTab(QWidget):
         """Update installation progress (bar tracks mods; label adds file totals)."""
         self._mods_done, self._mods_total = current, total
         if total > 0:
-            self.overall_progress.setValue(int((current / total) * 100))
+            # Drive the bar with raw counts, not a 0-100 percentage: setRange here
+            # makes it self-correcting even if a prior op (e.g. Remove Installation's
+            # busy indicator) left the range at 0-0/0-1, which would otherwise clamp
+            # setValue to a false 100%.
+            self.overall_progress.setRange(0, total)
+            self.overall_progress.setValue(current)
         self._refresh_overall_label(mod_name if current < total else "")
 
     def _refresh_overall_label(self, mod_name: str = ""):
