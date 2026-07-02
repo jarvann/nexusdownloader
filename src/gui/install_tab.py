@@ -546,6 +546,14 @@ class InstallTab(QWidget):
         control_layout.addWidget(self.link_vortex_btn)
 
         control_layout.addStretch()
+        self.remove_install_btn = QPushButton("Remove Installation")
+        self.remove_install_btn.setStyleSheet("QPushButton { color: #b00; }")
+        self.remove_install_btn.setToolTip(
+            "DESTRUCTIVE: delete every staged mod folder for this collection, "
+            "optionally un-deploy from the game folder (update vortex.deployment.json), "
+            "and reset the ledger to 'downloaded, waiting to install'. Keeps your "
+            "downloads and the collection. Vortex must be CLOSED.")
+        control_layout.addWidget(self.remove_install_btn)
         layout.addLayout(control_layout)
         
         # Progress section
@@ -607,6 +615,7 @@ class InstallTab(QWidget):
         self.cancel_install_btn.clicked.connect(self.cancel_installation)
         self.clear_log_btn.clicked.connect(self.clear_log)
         self.link_vortex_btn.clicked.connect(self.link_to_vortex)
+        self.remove_install_btn.clicked.connect(self.remove_installation)
         # Live concurrency: moving the spinbox retargets a running install (no restart).
         self.max_workers_spinbox.valueChanged.connect(self._on_workers_changed)
         # Subscribe to the shared store: the global Game/Collection header fills
@@ -704,6 +713,78 @@ class InstallTab(QWidget):
                                    staging=self.game_path)
         # Persist the picks so they come back next session.
         self._save_paths()
+
+    def remove_installation(self):
+        """Nuke this collection's staging install: delete every staged mod folder,
+        optionally un-deploy from the game folder, and reset the ledger to
+        'downloaded, waiting to install'. Downloads + the collection are preserved.
+        Reuses the shared maintenance ops (same as the Deploy tab's Reset)."""
+        staging = self.game_path
+        if not staging or not os.path.isdir(staging):
+            QMessageBox.warning(self, "Remove Installation",
+                                "Set the Mod Staging Folder first.")
+            return
+        game_data = getattr(getattr(self, "_session", None), "game_data", "") or ""
+        also_purge = False
+        if game_data and os.path.isdir(game_data):
+            ans = QMessageBox.question(
+                self, "Remove Installation — also un-deploy from the game?",
+                "Also remove the deployed files from the game folder first "
+                "(un-deploy hardlinks + update vortex.deployment.json in Data and "
+                "staging)?\n\n"
+                "Yes = un-deploy game folder + wipe staging.\nNo = wipe staging only.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel)
+            if ans == QMessageBox.StandardButton.Cancel:
+                return
+            also_purge = ans == QMessageBox.StandardButton.Yes
+        if QMessageBox.warning(
+                self, "Remove Installation — confirm",
+                "DESTRUCTIVE: this deletes every staged mod folder for this collection "
+                "and resets the ledger to 'downloaded, waiting to install'.\n\n"
+                "PRESERVED: your downloads, endorsements, and the collection.\n"
+                "Vortex must be CLOSED.\n\nProceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                ) != QMessageBox.StandardButton.Yes:
+            return
+
+        from gui.deploy_tab import MaintenanceWorkerThread
+        self.remove_install_btn.setEnabled(False)
+        self.start_install_btn.setEnabled(False)
+        self.overall_progress.setVisible(True)
+        self.overall_progress.setRange(0, 0)   # busy indicator until first tick
+        self.progress_label.setText("Removing installation…")
+        self.log_message("INFO", "Remove Installation started"
+                         + (" (with game-folder purge)" if also_purge else ""))
+        self._remove_thread = MaintenanceWorkerThread(
+            "reset", staging, game_data, purge_deploy=also_purge)
+        self._remove_thread.progress.connect(self._on_remove_progress)
+        self._remove_thread.status.connect(lambda m: self.log_message("INFO", m))
+        self._remove_thread.done.connect(self._on_remove_done)
+        self._remove_thread.failed.connect(self._on_remove_failed)
+        self._remove_thread.start()
+
+    def _on_remove_progress(self, done, total, name):
+        if total > 0:
+            self.overall_progress.setRange(0, total)
+            self.overall_progress.setValue(done)
+        self.progress_label.setText(f"Removing… {done}/{total}  {name}")
+
+    def _on_remove_done(self, msg):
+        self.remove_install_btn.setEnabled(True)
+        self.overall_progress.setRange(0, 1)
+        self.overall_progress.setValue(1)
+        self.progress_label.setText(msg)
+        self.log_message("INFO", msg)
+        self.update_start_button_state()
+        QMessageBox.information(self, "Remove Installation", msg)
+
+    def _on_remove_failed(self, msg):
+        self.remove_install_btn.setEnabled(True)
+        self.progress_label.setText("Remove failed")
+        self.log_message("ERROR", msg)
+        self.update_start_button_state()
+        QMessageBox.critical(self, "Remove Installation failed", msg)
 
     def link_to_vortex(self):
         """Register installed mods + the collection into Vortex's DB (two-phase:
