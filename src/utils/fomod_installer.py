@@ -432,6 +432,26 @@ class FomodInstaller:
         mod_name = (mod_data.get("name") or "").lower()
         extensions = ['.zip', '.7z', '.rar', '.tar.gz', '.tar.bz2']
 
+        # 0) OFF-SITE / bundled mods (source.type != nexus) have no modId. Vortex
+        # installs these from the file you fetched by hand (browse/direct) exactly
+        # like a Nexus mod, matching it by the stored md5/size. The collection names
+        # each by its archive filename (+ md5/fileSize), so match precisely: exact
+        # filename, then exact byte-size (a renamed file). Do NOT fall through to the
+        # fuzzy match below -- that would stage a similarly-named but DIFFERENT mod
+        # (e.g. "TES Arena Bikini Armor" grabbing the unrelated "...3BBA SE").
+        if self._is_manual_mod(mod_data):
+            if mod_name and mod_name in available_archives:
+                return available_archives[mod_name]
+            size = source.get("fileSize")
+            if size:
+                for path in available_archives.values():
+                    try:
+                        if path.stat().st_size == size:
+                            return path
+                    except OSError:
+                        pass
+            return None
+
         # 1) PRECISE: Nexus archive/folder names carry the mod id as a "-<modId>-"
         # token (e.g. "Mod Name-69415-1-0-1655653694.7z"). Match on that token --
         # this is the reliable key. When several files share a modId, disambiguate
