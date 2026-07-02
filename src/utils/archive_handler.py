@@ -30,40 +30,36 @@ try:
         """Auto-configure RAR extraction tools."""
         import shutil
         from pathlib import Path
-        
-        # Standard installation paths to check
-        tool_paths = [
-            # 7-Zip locations
-            Path("C:/Program Files/7-Zip/7z.exe"),
-            Path("C:/Program Files (x86)/7-Zip/7z.exe"),
-            # WinRAR locations  
-            Path("C:/Program Files/WinRAR/WinRAR.exe"),
-            Path("C:/Program Files (x86)/WinRAR/WinRAR.exe"),
-            Path("C:/Program Files/WinRAR/unrar.exe"),
-            Path("C:/Program Files (x86)/WinRAR/unrar.exe"),
-        ]
-        
-        # Check PATH first
-        for tool_name in ['unrar', '7z', '7z.exe']:
-            tool_path = shutil.which(tool_name)
-            if tool_path:
-                if 'unrar' in tool_name:
-                    rarfile.UNRAR_TOOL = tool_path
-                    return tool_path
-                elif '7z' in tool_name:
-                    rarfile.SEVENZIP_TOOL = tool_path
-                    return tool_path
-        
-        # Check standard installation paths
-        for tool_path in tool_paths:
-            if tool_path.exists():
-                if '7z.exe' in str(tool_path):
-                    rarfile.SEVENZIP_TOOL = str(tool_path)
-                    return str(tool_path)
-                elif 'unrar.exe' in str(tool_path) or 'WinRAR.exe' in str(tool_path):
-                    rarfile.UNRAR_TOOL = str(tool_path)
-                    return str(tool_path)
-        
+
+        # Prefer a NATIVE unrar (RAR's own engine -- fastest on the big solid
+        # archives collections ship, and no GUI window). Look on PATH and in the
+        # standard WinRAR dir BEFORE 7-Zip: otherwise a 7z on PATH shadows an
+        # installed WinRAR and every RAR gets extracted by the slower engine.
+        unrar = shutil.which('unrar') or shutil.which('UnRAR.exe')
+        if not unrar:
+            for p in [Path("C:/Program Files/WinRAR/UnRAR.exe"),
+                      Path("C:/Program Files (x86)/WinRAR/UnRAR.exe"),
+                      Path("C:/Program Files/WinRAR/Rar.exe"),
+                      Path("C:/Program Files (x86)/WinRAR/Rar.exe")]:
+                if p.exists():
+                    unrar = str(p)
+                    break
+        if unrar:
+            rarfile.UNRAR_TOOL = unrar
+            return unrar
+
+        # Fall back to 7-Zip for RAR support.
+        sevenz = shutil.which('7z') or shutil.which('7z.exe')
+        if not sevenz:
+            for p in [Path("C:/Program Files/7-Zip/7z.exe"),
+                      Path("C:/Program Files (x86)/7-Zip/7z.exe")]:
+                if p.exists():
+                    sevenz = str(p)
+                    break
+        if sevenz:
+            rarfile.SEVENZIP_TOOL = sevenz
+            return sevenz
+
         return None
     
     # Try to auto-configure on import
@@ -108,7 +104,26 @@ def _find_external_7z_tools():
             if path.exists():
                 tools['winrar'] = str(path)
                 break
-    
+
+    # Native console RAR extractor (UnRAR.exe / Rar.exe). This is the fastest
+    # tool for RAR and -- unlike WinRAR.exe -- never pops a GUI window, so it is
+    # the preferred backend for single-pass RAR extraction. Discover it even when
+    # 7-Zip is present so RAR routes to its own engine.
+    unrar_path = shutil.which('unrar') or shutil.which('UnRAR.exe')
+    if not unrar_path:
+        unrar_paths = [
+            Path("C:/Program Files/WinRAR/UnRAR.exe"),
+            Path("C:/Program Files (x86)/WinRAR/UnRAR.exe"),
+            Path("C:/Program Files/WinRAR/Rar.exe"),
+            Path("C:/Program Files (x86)/WinRAR/Rar.exe"),
+        ]
+        for path in unrar_paths:
+            if path.exists():
+                unrar_path = str(path)
+                break
+    if unrar_path:
+        tools['unrar'] = unrar_path
+
     return tools
 
 # Find external tools for fallback
@@ -377,15 +392,84 @@ class ArchiveHandler:
                 f"Archive {archive_path.name} could not be extracted "
                 f"(py7zr: {error_msg}). Install 7-Zip or WinRAR for broader format support.")
     
+    def _extraction_timeout(self, archive_path: Path) -> int:
+        """Timeout (seconds) for a single-pass external extraction, scaled to
+        archive size. A flat 5-minute cap silently killed multi-GB extractions
+        mid-run; scale by size assuming a conservative ~10 MB/s floor (covers slow
+        disks and highly-compressed archives), clamped to [10 min, 2 h]."""
+        try:
+            size = archive_path.stat().st_size
+        except OSError:
+            size = 0
+        return max(600, min(7200, size // (10 * 1024 * 1024)))
+
+    def _extract_rar_native(self, archive_path: Path, extract_to: Path,
+                            selected_files: Optional[List[str]] = None) -> bool:
+        """Extract a RAR in a SINGLE subprocess via the fastest native tool.
+
+        Tries UnRAR/WinRAR first (RAR's own engine -- best on solid/RAR5), then
+        7-Zip. ONE invocation per archive, so a solid archive is decompressed
+        exactly once -- never once per file. If ``selected_files`` is given they
+        are passed as arguments to that single invocation (all extractors accept a
+        file list), so a caller wanting a subset still gets one pass, not one pass
+        per file and not the whole archive. Returns True on success, False if no
+        external tool worked (caller falls back to the rarfile library)."""
+        timeout = self._extraction_timeout(archive_path)
+        dest = str(extract_to) + os.sep
+        files = list(selected_files) if selected_files else []
+        attempts = []
+        if 'unrar' in _external_tools:
+            # unrar/Rar: x=extract with full paths, -o+=overwrite, -y=assume yes.
+            # Destination path goes LAST, after any file list.
+            attempts.append(('UnRAR', [_external_tools['unrar'], 'x', '-o+', '-y',
+                                       str(archive_path), *files, dest]))
+        if 'winrar' in _external_tools:
+            attempts.append(('WinRAR', [_external_tools['winrar'], 'x', '-o+', '-y',
+                                        str(archive_path), *files, dest]))
+        if '7z' in _external_tools:
+            # 7-Zip handles RAR too. -mmt2 caps threads so many parallel installs
+            # don't oversubscribe the CPU (matches the .7z path).
+            attempts.append(('7-Zip', [_external_tools['7z'], 'x', str(archive_path),
+                                       f'-o{extract_to}', '-y', '-mmt2', *files]))
+
+        for label, cmd in attempts:
+            try:
+                self.logger.debug(f"RAR single-pass via {label}: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=timeout, cwd=extract_to.parent)
+                if result.returncode != 0:
+                    self.logger.warning(
+                        f"{label} failed (code {result.returncode}) for "
+                        f"{archive_path.name}: {result.stderr or result.stdout}")
+                    continue
+                if extract_to.exists() and any(extract_to.iterdir()):
+                    self.logger.debug(f"RAR extracted via {label}: {archive_path.name}")
+                    return True
+            except subprocess.TimeoutExpired:
+                self.logger.warning(
+                    f"{label} extraction timed out after {timeout}s for {archive_path.name}")
+            except FileNotFoundError:
+                self.logger.warning(f"{label} executable not found: {cmd[0]}")
+        return False
+
     def _extract_rar(self, archive_path: Path, extract_to: Path, selected_files: Optional[List[str]]):
-        """Extract RAR archive."""
+        """Extract a RAR archive in ONE pass, into temp.
+
+        RAR "repository" archives in collections are typically SOLID and huge
+        (12-15 GB LODGen/BodySlide outputs). Pulling files one at a time re-reads
+        the whole solid block for every file -- effectively O(n^2), and with the
+        subprocess backend it re-opens the whole archive per file, which turned a
+        single 12 GB archive into an hour-plus extraction. We always extract in a
+        SINGLE invocation instead (optionally scoped to ``selected_files``); the
+        caller hardlinks only the files it needs into staging."""
+        if self._extract_rar_native(archive_path, extract_to, selected_files):
+            return
+
+        # Fallback (no external tool succeeded): rarfile library. Extract the WHOLE
+        # archive in one call -- never the per-file loop that caused the O(n^2) hang.
         try:
             with rarfile.RarFile(archive_path, 'r') as rf:
-                if selected_files:
-                    for file_path in selected_files:
-                        rf.extract(file_path, extract_to)
-                else:
-                    rf.extractall(extract_to)
+                rf.extractall(extract_to)
         except rarfile.RarCannotExec as e:
             self.logger.error(f"RAR extraction tool not found: {e}")
             raise ValueError(
@@ -421,13 +505,14 @@ class ArchiveHandler:
             cmd.extend(selected_files)
         
         self.logger.debug(f"Running external 7-Zip: {' '.join(cmd)}")
-        
+
+        timeout = self._extraction_timeout(archive_path)
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 minute timeout
+                timeout=timeout,  # size-scaled; a flat cap killed multi-GB extracts
                 cwd=extract_to.parent
             )
             
@@ -469,7 +554,7 @@ class ArchiveHandler:
                     self.logger.warning(f"Some selected files were not extracted: {missing_files}")
             
         except subprocess.TimeoutExpired:
-            raise ValueError("7-Zip extraction timed out after 5 minutes")
+            raise ValueError(f"7-Zip extraction timed out after {timeout}s")
         except FileNotFoundError:
             raise ValueError(f"7-Zip executable not found: {sevenz_exe}")
     
@@ -491,13 +576,14 @@ class ArchiveHandler:
             cmd.extend(selected_files)
         
         self.logger.debug(f"Running external WinRAR: {' '.join(cmd)}")
-        
+
+        timeout = self._extraction_timeout(archive_path)
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 minute timeout
+                timeout=timeout,  # size-scaled; a flat cap killed multi-GB extracts
                 cwd=extract_to.parent
             )
             
@@ -541,7 +627,7 @@ class ArchiveHandler:
                     self.logger.warning(f"Some selected files were not extracted: {missing_files}")
             
         except subprocess.TimeoutExpired:
-            raise ValueError("WinRAR extraction timed out after 5 minutes")
+            raise ValueError(f"WinRAR extraction timed out after {timeout}s")
         except FileNotFoundError:
             raise ValueError(f"WinRAR executable not found: {winrar_exe}")
     
