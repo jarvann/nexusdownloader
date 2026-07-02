@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from utils.vortex_schema import P, GAME_ID, NEXUS_DOMAIN
 
