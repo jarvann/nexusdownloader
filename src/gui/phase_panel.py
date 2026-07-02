@@ -35,11 +35,13 @@ class PhasePanel(QGroupBox):
     """One phase's live progress: bar + status + item grid + collapsible log."""
 
     def __init__(self, title: str, parent: Optional[QWidget] = None,
-                 show_grid: bool = True):
+                 show_grid: bool = True, monitor: bool = False,
+                 monitor_header: str = "File"):
         super().__init__(title, parent)
-        self._build(show_grid)
+        self._build(show_grid, monitor, monitor_header)
 
-    def _build(self, show_grid: bool):
+    def _build(self, show_grid: bool, monitor: bool = False,
+               monitor_header: str = "File"):
         root = QVBoxLayout(self)
 
         self.bar = QProgressBar()
@@ -49,6 +51,16 @@ class PhasePanel(QGroupBox):
         self.status = QLabel("Idle")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
+
+        # Optional live per-thread activity table (same widget the install tab
+        # uses). Hidden until the first set_active() so ops that don't feed it
+        # (purge/verify/reset) still show just the bar + grid.
+        self.monitor = None
+        if monitor:
+            from gui.install_monitor import InstallMonitorWidget
+            self.monitor = InstallMonitorWidget(item_header=monitor_header, show_tool=False)
+            self.monitor.setVisible(False)
+            root.addWidget(self.monitor, 1)
 
         if show_grid:
             self.grid = QListWidget()
@@ -87,7 +99,20 @@ class PhasePanel(QGroupBox):
         self.status.setText("Idle")
         if self.grid is not None:
             self.grid.clear()
+        if self.monitor is not None:
+            self.monitor.reset()
+            self.monitor.setVisible(False)
         self.log_view.clear()
+
+    def set_active(self, payload):
+        """Feed the live per-thread activity table (shown on first call). payload is
+        the same dict the install monitor consumes: {active, done, failed,
+        max_threads, files_per_sec}."""
+        if self.monitor is None:
+            return
+        if not self.monitor.isVisible():
+            self.monitor.setVisible(True)
+        self.monitor.update_view(payload)
 
     def start(self, message: str = "Working..."):
         self.bar.setRange(0, 0)        # indeterminate until first set_progress

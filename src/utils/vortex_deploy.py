@@ -412,7 +412,8 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
            link: bool = True, deployment_time_ms: int = 0,
            workers: int = 1, only_folders: Optional[Iterable[str]] = None,
            manifest_name: str = MANIFEST_NAME,
-           progress: Optional[Callable[[int, int, str], None]] = None) -> DeployResult:
+           progress: Optional[Callable[[int, int, str], None]] = None,
+           activity: Optional[Callable[[int, str], None]] = None) -> DeployResult:
     """Hard-link staged files into the game folder and write the deployment manifest.
 
     ``enabled_folders`` must be in **load order** (ascending priority) so that, on
@@ -502,7 +503,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
     linked = 0
     if link:
         total = len(links)
-        from threading import Lock
+        from threading import Lock, get_ident
         lock, done = Lock(), [0]
 
         failures: List[Tuple[str, str]] = []
@@ -518,11 +519,15 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
                 # must not abort the whole deploy. Record it and move on.
                 with lock:
                     failures.append((nrel, str(ex)))
-            if progress is not None:
+            if progress is not None or activity is not None:
                 with lock:
                     done[0] += 1
-                    if done[0] % 200 == 0 or done[0] == total:
+                    tick = done[0] % 200 == 0 or done[0] == total
+                if tick:
+                    if progress is not None:
                         progress(done[0], total, nrel)
+                    if activity is not None:
+                        activity(get_ident(), nrel)
 
         if workers and workers > 1 and len(links) > 1:
             from concurrent.futures import ThreadPoolExecutor
@@ -818,7 +823,8 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
                       game_root: Optional[str] = None,
                       node: str = "node", deployment_time_ms: int = 0,
                       workers: int = 1, only_folders: Optional[Iterable[str]] = None,
-                      progress: Optional[Callable[[int, int, str], None]] = None
+                      progress: Optional[Callable[[int, int, str], None]] = None,
+                      activity: Optional[Callable[[int, str], None]] = None
                       ) -> Tuple[DeployResult, Any]:
     """High-level: hard-link + write manifest(s), then mark the deployment in the DB.
 
@@ -854,7 +860,7 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
         staging_dir, target_data_dir, game_root, enabled_folders,
         instance_id=instance_id, game_id=game_id,
         deployment_time_ms=deployment_time_ms, workers=workers,
-        only_folders=only_folders, progress=progress)
+        only_folders=only_folders, progress=progress, activity=activity)
     result = _aggregate(results, os.path.join(target_data_dir, MANIFEST_NAME))
     db_write = mark_deployed_in_db(db_path, game_id, node=node)
     return result, db_write
@@ -875,7 +881,8 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
                         deployment_time_ms: int = 0, backup: bool = True,
                         workers: int = 1, eslify: bool = True,
                         only_folders: Optional[Iterable[str]] = None,
-                        progress: Optional[Callable[[int, int, str], None]] = None) -> FinalizeResult:
+                        progress: Optional[Callable[[int, int, str], None]] = None,
+                        activity: Optional[Callable[[int, str], None]] = None) -> FinalizeResult:
     """Full post-install pipeline: order mods -> deploy -> sort plugins.
 
     Resolves deploy order from ``collection.modRules``, hard-links + writes the
@@ -893,7 +900,7 @@ def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: s
     result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
                                   collection=collection, node=node,
                                   deployment_time_ms=deployment_time_ms, workers=workers,
-                                  only_folders=only_folders, progress=progress)
+                                  only_folders=only_folders, progress=progress, activity=activity)
 
     # Auto-flag eligible plugins as light (ESL) -- our equivalent of Vortex's
     # "mark could-be-light as light". Without it the full-plugin count blows past

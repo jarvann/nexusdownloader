@@ -10,6 +10,8 @@ live deploy grid, mirroring the Download/Install phases.
 import os
 import glob
 import re
+import time
+import threading
 from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
@@ -50,6 +52,7 @@ class DeployWorkerThread(QThread):
     finished_ok = Signal(object)            # FinalizeResult
     failed = Signal(str)
     busy = Signal(str)                      # Vortex running / DB locked
+    active_deploys_updated = Signal(dict)   # live per-thread hard-link table
 
     def __init__(self, collection_path, staging_path, game_data_dir,
                  localappdata_dir, db_path="", workers=16):
@@ -60,6 +63,13 @@ class DeployWorkerThread(QThread):
         self.localappdata_dir = localappdata_dir
         self.db_path = db_path
         self.workers = workers
+        # Live per-thread activity tracking for the monitor table.
+        self._active = {}                   # thread_id -> {thread, mod(=file), phase}
+        self._lock = threading.Lock()
+        self._deploy_done = 0
+        self._deploy_total = 0
+        self._t0 = None
+        self._last_emit = 0.0
 
     def run(self):
         try:
@@ -83,7 +93,7 @@ class DeployWorkerThread(QThread):
                     db, collection, self.staging_path, self.game_data_dir,
                     self.localappdata_dir, deployment_time_ms=int(time.time() * 1000),
                     workers=self.workers,
-                    progress=lambda d, t, n: self.progress.emit(d, t, n))
+                    progress=self._on_progress, activity=self._on_activity)
             except VortexBusyError as e:
                 self.busy.emit(str(e))
                 return
@@ -92,6 +102,31 @@ class DeployWorkerThread(QThread):
             self.finished_ok.emit(res)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+    def _on_progress(self, done, total, name):
+        self.progress.emit(done, total, name)
+        self._deploy_done, self._deploy_total = done, total
+        if self._t0 is None:
+            self._t0 = time.monotonic()
+
+    def _on_activity(self, thread_id, rel_path):
+        """Per-thread hard-link activity (worker thread): record which file each
+        thread is linking, then emit a throttled snapshot for the monitor table."""
+        with self._lock:
+            self._active[thread_id] = {"thread": thread_id, "mod": rel_path,
+                                       "phase": "linking"}
+        now = time.monotonic()
+        if (now - self._last_emit) < 0.2:
+            return
+        self._last_emit = now
+        with self._lock:
+            active = list(self._active.values())
+        elapsed = (now - self._t0) if self._t0 else 0
+        fps = (self._deploy_done / elapsed) if elapsed > 0.5 else 0
+        self.active_deploys_updated.emit({
+            "active": active, "done": self._deploy_done, "failed": 0,
+            "max_threads": self.workers, "files_per_sec": fps,
+        })
 
 
 class MaintenanceWorkerThread(QThread):
@@ -274,7 +309,7 @@ class DeployTab(QWidget):
         # collection); Deploy keeps only Purge + Verify.
         layout.addWidget(maint)
 
-        self.panel = PhasePanel("Deploy Progress")
+        self.panel = PhasePanel("Deploy Progress", monitor=True, monitor_header="File")
         layout.addWidget(self.panel, 1)   # progress panel absorbs vertical stretch
 
     # --- path discovery --------------------------------------------------- #
@@ -369,6 +404,7 @@ class DeployTab(QWidget):
             self.collection_path, self.staging_path, self.game_data_dir,
             self.localappdata_dir, workers=self.workers_spin.value())
         self._thread.progress.connect(self._on_progress)
+        self._thread.active_deploys_updated.connect(self.panel.set_active)
         self._thread.status.connect(lambda m: self.panel.set_progress(
             self.panel.bar.value(), max(self.panel.bar.maximum(), 1), m))
         self._thread.finished_ok.connect(self._on_done)
@@ -377,9 +413,9 @@ class DeployTab(QWidget):
         self._thread.start()
 
     def _on_progress(self, done, total, name):
+        # Bar only -- the live per-thread file activity is shown in the monitor
+        # table (fed by active_deploys_updated), so we no longer add grid rows.
         self.panel.set_progress(done, total, f"Hard-linking… {name}")
-        if done % 1000 == 0:
-            self.panel.add_item(name, "ok")
 
     def _on_done(self, res):
         self.deploy_btn.setEnabled(True)

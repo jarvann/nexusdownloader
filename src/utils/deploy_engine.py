@@ -55,7 +55,8 @@ def deploy_all(staging_dir: str, data_dir: str, game_root: Optional[str],
                game_id: str = GAME_ID, workers: int = 1, deployment_time_ms: int = 0,
                only_folders: Optional[Iterable[str]] = None,
                log: Optional[Callable[[str, str], None]] = None,
-               progress: Optional[Callable[[int, int, str], None]] = None
+               progress: Optional[Callable[[int, int, str], None]] = None,
+               activity: Optional[Callable[[int, str], None]] = None
                ) -> Dict[str, vd.DeployResult]:
     """Deploy every modtype to its target. Returns ``{type_id: DeployResult}``.
 
@@ -84,7 +85,7 @@ def deploy_all(staging_dir: str, data_dir: str, game_root: Optional[str],
                         instance_id=instance_id, workers=workers,
                         deployment_time_ms=deployment_time_ms,
                         manifest_name=mt.manifest_name(),
-                        only_folders=sub_only, progress=progress)
+                        only_folders=sub_only, progress=progress, activity=activity)
         results[type_id] = res
         if log:
             log("INFO", f"modtype '{type_id or 'default'}' -> {target}: "

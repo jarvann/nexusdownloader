@@ -1,10 +1,12 @@
-"""Live install monitor: a table of the mods currently being installed, one row
-per active worker thread, mirroring the download ProgressMonitorWidget.
+"""Live thread-activity monitor: a table of the work each worker thread is doing
+right now, plus an aggregate header (active/max threads, done/failed tallies, and
+a files/sec throughput). Mirrors the download ProgressMonitorWidget.
 
-Unlike the old completed-list, this shows what each thread is doing *right now*
-(extracting -> staging -> verifying) plus an aggregate header (active thread
-count, done/failed tallies, and a files/sec throughput readout). It is driven by
-a single dict payload emitted (throttled) from the install worker thread.
+Used by BOTH the install tab (columns: Thread | Mod | Tool | Status, phases
+extracting -> staging -> verifying) and the deploy tab (Thread | File | Status,
+phase 'linking'). Driven by a single dict payload emitted (throttled) from a
+worker thread: {active:[{thread,mod,phase,tool,done,total}], done, failed,
+max_threads, files_per_sec}.
 """
 from __future__ import annotations
 
@@ -21,17 +23,30 @@ _PHASE_COLORS = {
     "extracting": QColor(120, 170, 255),   # blue
     "staging": QColor(210, 170, 90),       # amber
     "hardlinking": QColor(210, 170, 90),
+    "linking": QColor(210, 170, 90),
     "copying": QColor(210, 170, 90),
     "verifying": QColor(180, 130, 220),    # purple
 }
 
 
 class InstallMonitorWidget(QWidget):
-    """Table of in-flight mod installs + an aggregate header. Fed by update_view()."""
+    """Table of in-flight per-thread work + an aggregate header. Fed by update_view().
 
-    def __init__(self, initial_max_threads: int = 4):
+    item_header: label for the 2nd column ("Mod" for installs, "File" for deploy).
+    show_tool:   include a "Tool" column (extractor name) -- installs only.
+    """
+
+    def __init__(self, initial_max_threads: int = 4, item_header: str = "Mod",
+                 show_tool: bool = True):
         super().__init__()
         self.max_threads = initial_max_threads
+        self.show_tool = show_tool
+        # Column layout: 0=Thread, 1=item, [2=Tool], last=Status.
+        cols = ["Thread", item_header] + (["Tool"] if show_tool else []) + ["Status"]
+        self._cols = cols
+        self._c_item = 1
+        self._c_tool = 2 if show_tool else None
+        self._c_status = len(cols) - 1
         self._setup_ui()
 
     def _setup_ui(self):
@@ -58,17 +73,17 @@ class InstallMonitorWidget(QWidget):
 
         # --- the live table ----------------------------------------------------
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Thread", "Mod", "Tool", "Status"])
+        self.table.setColumnCount(len(self._cols))
+        self.table.setHorizontalHeaderLabels(self._cols)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        hh.setSectionResizeMode(3, QHeaderView.Fixed)
+        for c in range(len(self._cols)):
+            hh.setSectionResizeMode(
+                c, QHeaderView.Stretch if c == self._c_item else QHeaderView.Fixed)
         self.table.setColumnWidth(0, 90)
-        self.table.setColumnWidth(2, 90)
-        self.table.setColumnWidth(3, 150)
+        if self._c_tool is not None:
+            self.table.setColumnWidth(self._c_tool, 90)
+        self.table.setColumnWidth(self._c_status, 150)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -87,30 +102,28 @@ class InstallMonitorWidget(QWidget):
         self.rate_label.setText("0 files/s")
 
     def update_view(self, payload: Dict[str, Any]):
-        """Render one snapshot. payload: {active:[{thread,mod,phase}], done, failed,
-        max_threads, files_per_sec}. Rows are sorted by thread for stable ordering."""
+        """Render one snapshot; rows are sorted by thread for stable ordering."""
         active = payload.get("active", []) or []
         self.active_label.setText(f"Active: {len(active)}")
         if payload.get("max_threads"):
             self.set_max_threads(payload["max_threads"])
-        self.done_label.setText(f"Done: {payload.get('done', 0)}")
-        self.failed_label.setText(f"Failed: {payload.get('failed', 0)}")
+        self.done_label.setText(f"Done: {payload.get('done', 0):,}")
+        self.failed_label.setText(f"Failed: {payload.get('failed', 0):,}")
         fps = payload.get("files_per_sec", 0) or 0
         self.rate_label.setText(f"{fps:,.0f} files/s")
 
         rows = sorted(active, key=lambda r: r.get("thread", 0))
-        # Preserve the scroll position across refreshes so the view doesn't jump.
         sb = self.table.verticalScrollBar()
         pos = sb.value()
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            tid = str(r.get("thread", ""))[-5:]   # last digits keep it short
-            self.table.setItem(i, 0, QTableWidgetItem(tid))
-            mod_item = QTableWidgetItem(r.get("mod", ""))
-            mod_item.setToolTip(r.get("mod", ""))
-            self.table.setItem(i, 1, mod_item)
-            self.table.setItem(i, 2, QTableWidgetItem(r.get("tool") or ""))
+            self.table.setItem(i, 0, QTableWidgetItem(str(r.get("thread", ""))[-5:]))
+            item = QTableWidgetItem(r.get("mod", ""))
+            item.setToolTip(r.get("mod", ""))
+            self.table.setItem(i, self._c_item, item)
+            if self._c_tool is not None:
+                self.table.setItem(i, self._c_tool, QTableWidgetItem(r.get("tool") or ""))
             phase = (r.get("phase") or "").lower()
             done, total = r.get("done"), r.get("total")
             if total:
@@ -121,6 +134,6 @@ class InstallMonitorWidget(QWidget):
             color = _PHASE_COLORS.get(phase)
             if color:
                 st.setForeground(color)
-            self.table.setItem(i, 3, st)
+            self.table.setItem(i, self._c_status, st)
         self.table.setUpdatesEnabled(True)
         sb.setValue(pos)
