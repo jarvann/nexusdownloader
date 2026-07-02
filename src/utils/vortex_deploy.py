@@ -43,6 +43,34 @@ MANIFEST_VERSION = 1
 # purge only removes empty dirs that contain it (so it never deletes a dir the
 # user/game owns). We mirror that so a Vortex-side purge cleans our dirs too.
 MANAGED_TAG = "__folder_managed_by_vortex"
+# The exact text Vortex writes into the marker (LinkingDeployment.ts onDirCreated),
+# so a deployed folder is byte-identical to one Vortex produced.
+MANAGED_TAG_CONTENT = ("This directory was created by Vortex deployment and will "
+                       "be removed during purging if it's empty")
+
+# Files Vortex NEVER hard-links into the game folder -- its DEPLOY_BLACKLIST
+# (mod_management/constants.ts), applied at DEPLOY time (LinkingDeployment.activate),
+# NOT at install. So these stay in staging (a faithful copy) but never leak into
+# the game Data folder. Vortex matches them case-insensitively with "**/x" globs,
+# which reduce to: a set of basenames, and a set of directory segments (any file
+# under such a dir). meta.ini is here because MO2-packaged mods ship one (Vortex
+# never authors it); .git*/hg are VCS junk; _macosx/__MACOSX are mac archive junk.
+_DEPLOY_BLACKLIST_NAMES = frozenset({
+    "meta.ini", ".gitignore", ".hgignore", ".gitattributes",
+    "vortex_override_instructions.json",
+})
+_DEPLOY_BLACKLIST_DIRS = frozenset({".git", "_macosx", "__macosx"})
+
+
+def is_deploy_blacklisted(rel_path: str) -> bool:
+    """True if Vortex would skip ``rel_path`` when linking staging -> game folder
+    (its DEPLOY_BLACKLIST). ``rel_path`` is mod-relative, any separator style."""
+    segs = rel_path.replace("\\", "/").lower().strip("/").split("/")
+    if not segs or not segs[-1]:
+        return False
+    if segs[-1] in _DEPLOY_BLACKLIST_NAMES:
+        return True
+    return any(seg in _DEPLOY_BLACKLIST_DIRS for seg in segs[:-1])
 
 
 def _to_backslash(rel: str) -> str:
@@ -70,6 +98,10 @@ def resolve_deployment(
     """
     winners: Dict[str, Tuple[str, str, int]] = {}
     for folder, rel, mtime in staged:
+        # Vortex applies its DEPLOY_BLACKLIST here (staging -> game link step):
+        # blacklisted files stay in staging but are never linked into the game.
+        if is_deploy_blacklisted(rel):
+            continue
         nrel = _to_backslash(rel)
         winners[nrel.lower()] = (folder, nrel, mtime)
 
@@ -456,6 +488,17 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
         new_keys = {e["relPath"].lower() for e in entries}
         stale = {k: v for k, v in prev.items() if k not in new_keys}
 
+    # Vortex tags only dirs it CREATES during deploy. Snapshot which needed dirs
+    # already exist BEFORE we link; the rest are ours to tag afterward.
+    needed_dirs = set()
+    for e in entries:
+        d = os.path.dirname(e["relPath"].replace("\\", os.sep))
+        while d:
+            needed_dirs.add(d)
+            d = os.path.dirname(d)
+    pre_existing_dirs = {d for d in needed_dirs
+                         if os.path.isdir(os.path.join(target_data_dir, d))}
+
     linked = 0
     if link:
         total = len(links)
@@ -495,7 +538,7 @@ def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str
                   f"(first few: {shown})")
 
     if link:
-        _tag_managed_dirs(target_data_dir, entries)
+        _tag_managed_dirs(target_data_dir, needed_dirs - pre_existing_dirs)
 
     # Unlink files dropped since the last deployment (only when actually linking).
     # Safe-remove: keep a file the user replaced by hand (no longer our hardlink).
@@ -687,21 +730,17 @@ def purge_by_inode(staging_dir: str, target_data_dir: str,
     return removed
 
 
-def _tag_managed_dirs(target_dir: str, entries: Iterable[Dict[str, Any]]) -> None:
-    """Drop the ``__folder_managed_by_vortex`` marker in every directory we deploy
-    into (and its ancestors), so a later Vortex purge can clean them."""
-    dirs = set()
-    for e in entries:
-        d = os.path.dirname(e["relPath"].replace("\\", os.sep))
-        while d:
-            dirs.add(d)
-            d = os.path.dirname(d)
-    for d in dirs:
-        tag = os.path.join(target_dir, d, MANAGED_TAG)
+def _tag_managed_dirs(target_dir: str, dir_relpaths: Iterable[str]) -> None:
+    """Drop the ``__folder_managed_by_vortex`` marker into each given directory
+    (relative to ``target_dir``). Matches Vortex, which tags only the dirs it
+    CREATES during deploy -- so a later purge removes exactly those and never a dir
+    the user/game owned. Marker content mirrors Vortex's text byte-for-byte."""
+    for d in dir_relpaths:
+        tag = os.path.join(target_dir, d.replace("\\", os.sep), MANAGED_TAG)
         try:
             if os.path.isdir(os.path.dirname(tag)) and not os.path.lexists(tag):
                 with open(tag, "w", encoding="utf-8") as fh:
-                    fh.write("")
+                    fh.write(MANAGED_TAG_CONTENT)
         except OSError:
             pass
 

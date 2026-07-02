@@ -111,3 +111,46 @@ def test_mark_deployed_increments_counter(monkeypatch):
     vd.mark_deployed_in_db("/db", "skyrimse")
     assert captured["records"]["persistent###deployment###deploymentCounter###skyrimse"] == "8"
     assert captured["records"]["persistent###deployment###needToDeploy###skyrimse"] == "false"
+
+
+# --- Vortex DEPLOY_BLACKLIST parity --------------------------------------
+def test_is_deploy_blacklisted_matches_vortex():
+    # blacklisted basenames (any depth, any case)
+    for p in ["meta.ini", "Nemesis_Engine/mod/x/meta.ini", "a\\b\\META.INI",
+              ".gitignore", "sub/.gitattributes", ".hgignore",
+              "vortex_override_instructions.json"]:
+        assert vd.is_deploy_blacklisted(p), p
+    # blacklisted directory segments (any file beneath)
+    for p in [".git/config", "a/.git/hooks/pre-commit", "__MACOSX/._foo",
+              "_macosx/junk.dds", "A/_MacOSX/b.nif"]:
+        assert vd.is_deploy_blacklisted(p), p
+    # NOT blacklisted -- Vortex deploys these (real assets, docs, thumbs.db, fomod)
+    for p in ["meshes/x.nif", "textures/meta_ini_sign.dds", "readme.txt",
+              "Thumbs.db", "desktop.ini", "fomod/ModuleConfig.xml",
+              "scripts/gitignore_board.pex", "meshes/.gitkeepish/x.nif"]:
+        assert not vd.is_deploy_blacklisted(p), p
+
+
+def test_resolve_deployment_drops_blacklisted_files():
+    staged = [
+        ("ModA", "meshes/x.nif", 100),
+        ("ModA", "meta.ini", 100),                 # blacklisted -> not deployed
+        ("ModA", "Nemesis_Engine/mod/y/meta.ini", 100),  # blacklisted (nested)
+        ("ModA", ".git/config", 100),              # blacklisted dir
+        ("ModA", "textures/y.dds", 100),
+    ]
+    entries, links = vd.resolve_deployment(staged)
+    rels = {e["relPath"].lower() for e in entries}
+    assert rels == {"meshes\\x.nif", "textures\\y.dds"}
+    assert len(links) == 2
+
+
+def test_tag_managed_dirs_writes_vortex_content(tmp_path):
+    (tmp_path / "Nemesis_Engine").mkdir()
+    vd._tag_managed_dirs(str(tmp_path), ["Nemesis_Engine"])
+    tag = tmp_path / "Nemesis_Engine" / vd.MANAGED_TAG
+    assert tag.is_file()
+    assert tag.read_text(encoding="utf-8") == vd.MANAGED_TAG_CONTENT
+    # a non-existent target dir is skipped silently (no crash, no stray file)
+    vd._tag_managed_dirs(str(tmp_path), ["DoesNotExist"])
+    assert not (tmp_path / "DoesNotExist").exists()

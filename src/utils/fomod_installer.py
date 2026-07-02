@@ -695,24 +695,19 @@ class FomodInstaller:
                 placed_by_robocopy = True
                 for item in mod_install_path.rglob("*"):
                     if item.is_file():
-                        rel_path = item.relative_to(mod_install_path)
-                        if self._should_skip_file(rel_path):
-                            try:
-                                item.unlink()
-                            except OSError:
-                                pass
-                        else:
-                            installed_files.append(item)
+                        installed_files.append(item)
 
             if not placed_by_robocopy:
                 for item in root_path.rglob("*"):
                     if item.is_file():
-                        # Skip FOMOD files and metadata
+                        # Vortex's basic installer stages EVERY file verbatim; the
+                        # only content filtering (meta.ini/.git/_macosx/...) happens
+                        # at DEPLOY (vortex_deploy.is_deploy_blacklisted), never at
+                        # install -- so stage a faithful copy.
                         rel_path = item.relative_to(root_path)
-                        if not self._should_skip_file(rel_path):
-                            dest_path = mod_install_path / rel_path
-                            if self._copy_long(item, dest_path):
-                                installed_files.append(dest_path)
+                        dest_path = mod_install_path / rel_path
+                        if self._copy_long(item, dest_path):
+                            installed_files.append(dest_path)
 
             # Clean up temp extraction immediately after copying
             if temp_extract and temp_extract.exists():
