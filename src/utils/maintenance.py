@@ -12,7 +12,9 @@ from __future__ import annotations
 import glob
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Callable, List, Optional, Sequence
 
 from utils import local_state as ls
@@ -79,13 +81,31 @@ def purge_deployment(staging: str, game_data: str, *, force: bool = True,
     return vd.purge(staging, game_data, force=force, workers=workers, progress=progress)
 
 
+def _rm_root(full: str) -> Optional[str]:
+    """Remove a now-emptied staging mod folder skeleton; error string else None."""
+    try:
+        shutil.rmtree(full)
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # collected + reported to the caller, never fatal
+        return f"could not remove {os.path.basename(full)}: {e}"
+    return None
+
+
 def run_reset(plan: ResetPlan, *, log: Callable[[str], None] = lambda _m: None,
-              progress: Optional[Callable] = None) -> ResetResult:
+              progress: Optional[Callable] = None, workers: int = 16) -> ResetResult:
     """Execute a previously computed :class:`ResetPlan`.
 
     Deletes the staging mod folders (downloads live elsewhere and are untouched),
     optionally purges the deployment first, then resets the ledger's install state
     while preserving the downloads + endorsements.
+
+    The wipe is done at *file* granularity: every file under the target folders is
+    enumerated into one flat list and deleted across ``workers`` threads (one task
+    per file, mirroring vortex_deploy's linker). The pool auto-balances, so a
+    single 10k-file texture mod can't monopolize one worker while the rest idle --
+    which is exactly what per-folder parallelism suffered from. The emptied
+    directory skeletons are then removed in a cheap parallel pass.
     """
     res = ResetResult()
 
@@ -99,17 +119,53 @@ def run_reset(plan: ResetPlan, *, log: Callable[[str], None] = lambda _m: None,
             res.errors.append(f"deploy purge failed: {e}")
             log(f"  WARNING: {res.errors[-1]} (continuing)")
 
-    total = len(plan.folders)
-    for i, d in enumerate(plan.folders, 1):
-        full = os.path.join(plan.staging, d)
-        try:
-            shutil.rmtree(full)
-            res.deleted += 1
-        except Exception as e:
-            res.errors.append(f"could not delete {d}: {e}")
-        if progress:
-            progress(i, total, d)
-    log(f"Deleted {res.deleted}/{total} staging mod folders.")
+    total_folders = len(plan.folders)
+    roots = [os.path.join(plan.staging, d) for d in plan.folders]
+
+    if roots:
+        # Phase 1 -- enumerate every file under the target folders (flat list).
+        log(f"Scanning {total_folders} staging folder(s) for files...")
+        files: List[str] = []
+        for full in roots:
+            for dirpath, _dirnames, filenames in os.walk(full):
+                files.extend(os.path.join(dirpath, fn) for fn in filenames)
+        total = len(files)
+
+        # Phase 2 -- delete files flat + parallel (pool auto-balances the big mods).
+        log(f"Deleting {total} file(s) across up to {workers} threads...")
+        lock, done = Lock(), [0]
+
+        def _wipe_one(fp):
+            try:
+                os.remove(fp)
+            except FileNotFoundError:
+                pass  # already gone -- fine
+            except Exception as e:
+                with lock:
+                    res.errors.append(f"could not delete {fp}: {e}")
+            if progress is not None:
+                with lock:
+                    done[0] += 1
+                    if done[0] % 200 == 0 or done[0] == total:
+                        progress(done[0], total, "")
+
+        if workers and workers > 1 and total > 1:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_wipe_one, files))
+        else:
+            for fp in files:
+                _wipe_one(fp)
+
+        # Phase 3 -- remove the now-empty directory skeletons (cheap, parallel).
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(roots)))) as ex:
+            for err in ex.map(_rm_root, roots):
+                if err:
+                    res.errors.append(err)
+                else:
+                    res.deleted += 1
+
+        log(f"Deleted {res.deleted}/{total_folders} staging mod folder(s) "
+            f"({total} files).")
 
     if os.path.exists(plan.db_path):
         ledger = ls.get_ledger(plan.db_path)
