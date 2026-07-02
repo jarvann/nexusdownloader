@@ -7,6 +7,8 @@ with collection-based automation.
 
 import os
 import json
+import time
+import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -14,7 +16,7 @@ import html as _html
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog,
-    QTextEdit, QProgressBar, QGroupBox, QGridLayout, QListWidget, QSplitter,
+    QTextEdit, QProgressBar, QGroupBox, QGridLayout, QListWidget,
     QListWidgetItem, QMessageBox, QSpinBox, QCheckBox, QInputDialog, QDialog,
     QScrollArea, QDialogButtonBox, QStyle
 )
@@ -65,7 +67,8 @@ class InstallWorkerThread(QThread):
     installation_complete = Signal(str, bool, str, int)  # mod_name, success, message, file_count
     log_message = Signal(str, str)  # level, message
     installation_finished = Signal(list)  # List of InstallationResult
-    
+    active_installs_updated = Signal(dict)  # {active:[{thread,mod,phase}], done, failed, max_threads, files_per_sec}
+
     def __init__(self, collection_path: str, downloads_path: str, staging_path: str,
                  use_parallel: bool = True, max_workers: int = 4, temp_root: str = "",
                  game_root: str = ""):
@@ -79,6 +82,14 @@ class InstallWorkerThread(QThread):
         self.temp_root = temp_root
         self.game_root = game_root or ""
         self._installer = None   # live ref so concurrency can be changed mid-run
+        # Live active-thread tracking for the monitor view.
+        self._active: Dict[int, dict] = {}     # thread_id -> {mod, phase}
+        self._active_lock = threading.Lock()
+        self._done_count = 0
+        self._failed_count = 0
+        self._files_total = 0
+        self._run_t0 = None                    # first-completion timestamp for files/sec
+        self._last_emit = 0.0                  # throttle gate
     
     def cancel(self):
         """Cancel the installation process."""
@@ -149,6 +160,7 @@ class InstallWorkerThread(QThread):
                     self.log_message.emit("DEBUG", "Setting up callbacks")
                     installer.set_progress_callback(self._on_progress_update)
                     installer.set_installation_callback(self._on_installation_complete)
+                    installer.set_status_callback(self._on_status)
                     
                     # Run parallel installation (includes pre-scan)
                     self.log_message.emit("DEBUG", "Starting install_collection_parallel with pre-scan")
@@ -210,9 +222,52 @@ class InstallWorkerThread(QThread):
         if not self.is_cancelled:
             self.progress_updated.emit(current, total, mod_name)
     
+    def _on_status(self, thread_id: int, mod_name: str, phase):
+        """Installer phase callback (worker-thread): update the active-thread map.
+
+        Runs on ThreadPoolExecutor worker threads; only touches a locked dict and a
+        throttled Qt signal (safe to emit cross-thread), so it never blocks install
+        work."""
+        with self._active_lock:
+            self._active[thread_id] = {"thread": thread_id, "mod": mod_name,
+                                       "phase": phase or "working"}
+        self._emit_active_snapshot()
+
+    def _emit_active_snapshot(self, force: bool = False):
+        """Emit a throttled snapshot of active threads + tallies + files/sec."""
+        now = time.monotonic()
+        if not force and (now - self._last_emit) < 0.2:
+            return
+        self._last_emit = now
+        with self._active_lock:
+            active = list(self._active.values())
+        elapsed = (now - self._run_t0) if self._run_t0 else 0
+        fps = (self._files_total / elapsed) if elapsed > 0.5 else 0
+        self.active_installs_updated.emit({
+            "active": active,
+            "done": self._done_count,
+            "failed": self._failed_count,
+            "max_threads": self.max_workers,
+            "files_per_sec": fps,
+        })
+
     def _on_installation_complete(self, mod_name: str, success: bool, message: str,
                                   file_count: int = 0):
         """Callback for individual mod installation completion."""
+        # Free this thread's active row + update tallies/throughput.
+        if self._run_t0 is None:
+            self._run_t0 = time.monotonic()
+        with self._active_lock:
+            for tid, row in list(self._active.items()):
+                if row.get("mod") == mod_name:
+                    del self._active[tid]
+                    break
+        if success:
+            self._done_count += 1
+            self._files_total += max(0, file_count)
+        else:
+            self._failed_count += 1
+        self._emit_active_snapshot(force=True)
         if not self.is_cancelled:
             self.installation_complete.emit(mod_name, success, message, file_count)
 
@@ -571,42 +626,29 @@ class InstallTab(QWidget):
         self.progress_label = QLabel("Ready to install")
         progress_layout.addWidget(self.progress_label)
         
-        # Splitter for mod list and log
-        splitter = QSplitter(Qt.Horizontal)
-        
-        # Mod installation status list
+        # Live install monitor: one row per active worker thread showing what it's
+        # doing right now (extracting -> staging -> verifying), plus an aggregate
+        # header (active/max threads, done/failed, files/sec). Full width.
+        from gui.install_monitor import InstallMonitorWidget
         mod_status_group = QGroupBox("Mod Installation Status")
         mod_status_layout = QVBoxLayout(mod_status_group)
-        
-        self.mod_status_list = QListWidget()
-        mod_status_layout.addWidget(self.mod_status_list)
-        
-        splitter.addWidget(mod_status_group)
-        
-        # Installation log
-        log_group = QGroupBox("Installation Log")
-        log_layout = QVBoxLayout(log_group)
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        # Note: PySide6 QTextEdit doesn't have setMaximumBlockCount, using document().setMaximumBlockCount instead
-        self.log_text.document().setMaximumBlockCount(1000)  # Limit log size
-        log_layout.addWidget(self.log_text)
-        
-        # Log controls
-        log_controls = QHBoxLayout()
-        self.clear_log_btn = QPushButton("Clear Log")
-        log_controls.addWidget(self.clear_log_btn)
-        log_controls.addStretch()
-        log_layout.addLayout(log_controls)
-        
-        splitter.addWidget(log_group)
-        splitter.setSizes([300, 500])  # Set initial sizes
-        
-        progress_layout.addWidget(splitter, 1)   # splitter fills the progress group
+        self.install_monitor = InstallMonitorWidget(
+            getattr(self, "max_workers_spinbox", None).value()
+            if getattr(self, "max_workers_spinbox", None) else 4)
+        mod_status_layout.addWidget(self.install_monitor)
+        progress_layout.addWidget(mod_status_group, 1)
         # Stretch factor 1: the progress group absorbs all extra vertical space
         # when the window grows, while Paths/Options stay at their natural height.
         layout.addWidget(progress_group, 1)
+
+        # The completed-list + log pane were removed from the UI, but plenty of
+        # code paths still write to them (on_mod_installed history, log_message,
+        # clear_log). Keep the objects alive off-screen so nothing AttributeErrors.
+        self.mod_status_list = QListWidget()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.document().setMaximumBlockCount(1000)
+        self.clear_log_btn = QPushButton("Clear Log")
     
     def setup_connections(self):
         """Setup signal connections."""
@@ -652,6 +694,8 @@ class InstallTab(QWidget):
         if self.install_thread and self.install_thread.isRunning():
             self.install_thread.set_concurrency(value)
             self.log_message("INFO", f"Install concurrency changed to {value} (live)")
+        if getattr(self, "install_monitor", None):
+            self.install_monitor.set_max_threads(value)
         self._save_ui_pref("max_concurrent_installs", value)
 
     def _save_ui_pref(self, key: str, value):
@@ -1052,6 +1096,7 @@ class InstallTab(QWidget):
 
         # Clear previous results + reset the running mod/file counters.
         self.mod_status_list.clear()
+        self.install_monitor.reset()
         self._mods_done = self._mods_total = self._files_done = 0
         self.overall_progress.setRange(0, 0)   # busy indicator during pre-scan; update_progress sets 0..total
         self.overall_progress.setVisible(True)
@@ -1134,6 +1179,7 @@ class InstallTab(QWidget):
         self.install_thread.installation_complete.connect(self.on_mod_installed)
         self.install_thread.log_message.connect(self.log_message)
         self.install_thread.installation_finished.connect(self.on_installation_finished)
+        self.install_thread.active_installs_updated.connect(self.install_monitor.update_view)
         
         self.log_message("DEBUG", "Starting thread")
         self.install_thread.start()

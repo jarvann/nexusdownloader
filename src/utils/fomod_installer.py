@@ -684,6 +684,7 @@ class FomodInstaller:
             # by classifying the staged folder's top-level -- nothing is copied to
             # the game folder here. (See utils.modtypes / utils.deploy_engine.)
             installed_files = []
+            self._emit_status(mod_name, "staging")
             root_path = self._stage_root_for(temp_extract)
 
             # Cross-volume + robocopy available: copy the whole tree multi-threaded
@@ -733,6 +734,7 @@ class FomodInstaller:
                 )
             
             # Verify mod folder has content and is valid
+            self._emit_status(mod_name, "verifying")
             if not self._validate_mod_installation(mod_install_path):
                 error_msg = f"Installation completed but mod folder appears to be empty or invalid for {mod_name}"
                 self.logger.error(error_msg)
@@ -934,6 +936,7 @@ class FomodInstaller:
                 )
             
             # Verify mod folder has content and is valid
+            self._emit_status(mod_name, "verifying")
             if not self._validate_mod_installation(mod_install_path):
                 error_msg = f"FOMOD installation completed but mod folder appears to be empty or invalid for {mod_name}"
                 self.logger.error(error_msg)
@@ -1707,7 +1710,8 @@ class ParallelFomodInstaller(FomodInstaller):
         self._total_count = 0
         self._progress_callback: Optional[Callable] = None
         self._installation_callback: Optional[Callable] = None
-        
+        self._status_callback: Optional[Callable] = None
+
         # Individual temp directories per thread to avoid conflicts
         self._thread_temp_dirs: Dict[int, Path] = {}
 
@@ -1735,7 +1739,25 @@ class ParallelFomodInstaller(FomodInstaller):
     def set_installation_callback(self, callback: Callable[[str, bool, str, int], None]):
         """Set callback for individual installation completion."""
         self._installation_callback = callback
-        
+
+    def set_status_callback(self, callback: Callable[[int, str, Optional[str]], None]):
+        """Set callback for live per-thread phase updates: (thread_id, mod_name, phase).
+
+        Called as a mod moves through extracting -> staging -> verifying so the GUI
+        can show what each worker is doing right now. Completion is reported via the
+        installation callback, so no explicit 'done' phase is emitted here."""
+        self._status_callback = callback
+
+    def _emit_status(self, mod_name: str, phase: Optional[str]):
+        """Fire the status callback for the current thread; never fatal."""
+        cb = self._status_callback
+        if cb is None:
+            return
+        try:
+            cb(threading.get_ident(), mod_name, phase)
+        except Exception:
+            pass
+
     def _get_thread_temp_dir(self) -> Path:
         """Get or create a temporary directory for the current thread."""
         thread_id = threading.get_ident()
@@ -1882,6 +1904,7 @@ class ParallelFomodInstaller(FomodInstaller):
                     # Check if mod has installation choices
                     choices = mod_data.get("choices", {})
                     fomod = bool(choices) and choices.get("type") == "fomod"
+                    self._emit_status(mod_name, "extracting")
 
                     # Retry the "empty result" race. Tiny mods (a single file, a
                     # Pandora behavior cache) extract so fast that under high
