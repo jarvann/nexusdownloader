@@ -186,10 +186,21 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
     # Collection entries indexed by (modId,fileId) so a ledger mod -- which holds
     # the authoritative download identity -- can pull its display metadata.
     coll_by_modfile: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    # Off-site (browse/direct/bundle) entries have no modId; index them by archive
+    # name-stem and md5 so an installed off-site mod can still be matched to its
+    # collection entry and tagged (else it lands in the untagged "unspecified" pile).
+    coll_offsite: Dict[str, Dict[str, Any]] = {}
     for m in collection.get("mods", []):
         s = m.get("source") or {}
         if s.get("type") == "nexus" and s.get("modId") and s.get("fileId"):
             coll_by_modfile[(int(s["modId"]), int(s["fileId"]))] = m
+        elif s.get("type") and s.get("type") != "nexus":
+            stem = (m.get("name") or "").rsplit(".", 1)[0].lower()
+            if stem:
+                coll_offsite.setdefault(stem, m)
+            md5 = (s.get("md5") or "").lower()
+            if md5:
+                coll_offsite.setdefault(md5, m)
 
     def add(record_type: str, base: str, leaves: Dict[str, Any]):
         plan.violations.extend(
@@ -249,15 +260,31 @@ def build_plan(collection: Dict[str, Any], *, ledger_mods: List[Dict[str, Any]],
             if lf:
                 folder_by_logical[lf] = folder
         else:
-            # A staging folder with no matching collection nexus entry (the user's
-            # own mods, manual installs). Bare record -- identical to Vortex's own
-            # stub -- so refreshMods sees parity and never re-stubs it.
-            base, leaves = vr.build_orphan_mod(folder, install_time=install_time_iso)
-            plan.records.update(vr.to_absolute(base, leaves))
-            base, leaves = vr.build_profile_modstate(profile_id, folder, install_ms)
-            add("profile_modstate", base, leaves)
-            plan.orphan_count += 1
-            plan.profile_enables += 1
+            # Off-site collection member? Match by folder name-stem (our staging
+            # folder is the archive stem) or md5, and tag it to the collection so
+            # Vortex associates it instead of parking it under "unspecified".
+            off = coll_offsite.get(folder.lower())
+            if off is None and md5:
+                off = coll_offsite.get(md5.lower())
+            if off is not None:
+                base, leaves = vr.build_orphan_mod(
+                    folder, install_time=install_time_iso,
+                    source=off.get("source", {}), variant=coll_name)
+                plan.records.update(vr.to_absolute(base, leaves))
+                base, leaves = vr.build_profile_modstate(profile_id, folder, install_ms)
+                add("profile_modstate", base, leaves)
+                plan.mod_count += 1
+                plan.profile_enables += 1
+            else:
+                # A staging folder with no matching collection entry (the user's own
+                # mods, manual installs). Bare record -- identical to Vortex's own
+                # stub -- so refreshMods sees parity and never re-stubs it.
+                base, leaves = vr.build_orphan_mod(folder, install_time=install_time_iso)
+                plan.records.update(vr.to_absolute(base, leaves))
+                base, leaves = vr.build_profile_modstate(profile_id, folder, install_ms)
+                add("profile_modstate", base, leaves)
+                plan.orphan_count += 1
+                plan.profile_enables += 1
         recorded.add(folder)
 
     # Phase 1b: translate the collection's modRules into per-mod conflict rules.

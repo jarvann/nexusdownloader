@@ -197,9 +197,10 @@ def build_profile_modstate(profile_id: str, folder: str,
     return base, _flatten({"enabled": True, "enabledTime": enabled_time})
 
 
-def build_orphan_mod(folder: str, install_time: str = "") -> Tuple[str, Dict[str, Any]]:
-    """Build a minimal installed-mod record for a staging folder that isn't a
-    collection member (an old version, a manually-added mod, a duplicate).
+def build_orphan_mod(folder: str, install_time: str = "", *,
+                     source: Optional[Dict[str, Any]] = None,
+                     variant: str = "") -> Tuple[str, Dict[str, Any]]:
+    """Build a minimal installed-mod record for a staging folder.
 
     Shaped identically to the bare record Vortex's own ``refreshMods`` creates on
     "Apply Changes" (``{id, type:"", installationPath, state:"installed",
@@ -207,10 +208,22 @@ def build_orphan_mod(folder: str, install_time: str = "") -> Tuple[str, Dict[str
     what stops the "Mods changed on disk" prompt -- Vortex only flags folders that
     have no mod record, so full folder<->record parity means it never fires (and
     so never strips our real records to stubs).
+
+    When ``source`` (an off-site collection entry's source) is given, the record is
+    tagged to the collection via ``referenceTag`` (+ ``variant``) so Vortex
+    associates the mod with the collection instead of listing it as an unassigned
+    "unspecified" mod -- how Vortex itself tags a browse/direct member it installs.
     """
-    attributes: Dict[str, Any] = {"name": folder, "installedAsDependency": False}
+    member = bool(source and _ref_tag(source))
+    attributes: Dict[str, Any] = {"name": folder, "installedAsDependency": member}
     if install_time:
         attributes["installTime"] = install_time
+    if member:
+        attributes["referenceTag"] = _ref_tag(source)
+        if variant:
+            attributes["variant"] = variant
+        if source.get("type"):
+            attributes["source"] = source["type"]
     tree = {
         "id": folder, "installationPath": folder, "state": "installed", "type": "",
         "fileOverrides": [], "attributes": attributes,
