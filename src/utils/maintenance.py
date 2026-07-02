@@ -119,7 +119,8 @@ def run_reset(plan: ResetPlan, *, log: Callable[[str], None] = lambda _m: None,
     if plan.purge_deploy and plan.game_data:
         try:
             log(f"Purging deployment from {plan.game_data} ...")
-            pr = purge_deployment(plan.staging, plan.game_data, force=True, progress=progress)
+            pr = purge_deployment(plan.staging, plan.game_data, force=True,
+                                  workers=workers, progress=progress)
             res.purged = getattr(pr, "removed", 0)
             log(f"  removed {res.purged} deployed file(s).")
         except Exception as e:

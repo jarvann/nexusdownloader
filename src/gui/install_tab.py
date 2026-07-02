@@ -492,7 +492,10 @@ class InstallTab(QWidget):
         self.max_workers_spinbox = QSpinBox()
         self.max_workers_spinbox.setMinimum(1)
         self.max_workers_spinbox.setMaximum(48)
-        self.max_workers_spinbox.setValue(install_config.get("max_concurrent_installs", 4))
+        _saved_workers = (self.config.get("ui_preferences") or {}).get("max_concurrent_installs")
+        self.max_workers_spinbox.setValue(
+            int(_saved_workers) if _saved_workers
+            else install_config.get("max_concurrent_installs", 4))
         self.max_workers_spinbox.setToolTip("Number of mods to install simultaneously (1-48). "
                                             "External 7-Zip keeps memory bounded, so high values "
                                             "are safe on many-core machines.")
@@ -644,10 +647,28 @@ class InstallTab(QWidget):
         self.update_start_button_state()
 
     def _on_workers_changed(self, value: int):
-        """Apply a new concurrency to the running install immediately, if any."""
+        """Apply a new concurrency to the running install immediately, if any, and
+        persist it so the choice survives a restart (used for install AND reset)."""
         if self.install_thread and self.install_thread.isRunning():
             self.install_thread.set_concurrency(value)
             self.log_message("INFO", f"Install concurrency changed to {value} (live)")
+        self._save_ui_pref("max_concurrent_installs", value)
+
+    def _save_ui_pref(self, key: str, value):
+        """Persist a single ui_preferences key to config.json (atomic write)."""
+        try:
+            p = self._config_file()
+            cfg = {}
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            cfg.setdefault("ui_preferences", {})[key] = value
+            tmp = str(p) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            os.replace(tmp, str(p))
+        except Exception as e:
+            self.log_message("DEBUG", f"Could not save {key}: {e}")
 
     def browse_collection_file(self):
         """Browse for collection JSON file."""
@@ -714,6 +735,30 @@ class InstallTab(QWidget):
         # Persist the picks so they come back next session.
         self._save_paths()
 
+    def _confirm_if_elevated(self, action: str) -> bool:
+        """Warn when running elevated; return False if the user cancels.
+
+        Files created by an Administrator run are owned by the Administrators group,
+        so a later non-elevated run can't delete them (WinError 5) -- which is what
+        breaks Remove Installation. Keep every run at the same (ideally non-admin)
+        elevation."""
+        try:
+            from utils.platform_admin import is_elevated
+            if not is_elevated():
+                return True
+        except Exception:
+            return True
+        ans = QMessageBox.warning(
+            self, "Running as Administrator",
+            f"This app is running elevated (Administrator). If you {action} now, the "
+            f"files it stages are tied to the Administrator account — a normal "
+            f"(non-elevated) run may then be unable to delete them, which breaks "
+            f"Remove Installation.\n\nRecommended: cancel, relaunch WITHOUT admin, and "
+            f"keep every run at the same level.\n\nProceed anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return ans == QMessageBox.StandardButton.Yes
+
     def remove_installation(self):
         """Nuke this collection's staging install: delete every staged mod folder,
         optionally un-deploy from the game folder, and reset the ledger to
@@ -776,7 +821,8 @@ class InstallTab(QWidget):
         self.log_message("INFO", "Remove Installation started"
                          + (" (with game-folder purge)" if also_purge else ""))
         self._remove_thread = MaintenanceWorkerThread(
-            "reset", staging, game_data, purge_deploy=also_purge)
+            "reset", staging, game_data, purge_deploy=also_purge,
+            workers=self.max_workers_spinbox.value())
         self._remove_thread.progress.connect(self._on_remove_progress)
         self._remove_thread.status.connect(lambda m: self.log_message("INFO", m))
         self._remove_thread.done.connect(self._on_remove_done)
@@ -1000,6 +1046,8 @@ class InstallTab(QWidget):
             return
         if getattr(self, "_remove_thread", None) and self._remove_thread.isRunning():
             self.log_message("WARNING", "Remove Installation is running; wait for it to finish")
+            return
+        if not self._confirm_if_elevated("install"):
             return
 
         # Clear previous results + reset the running mod/file counters.

@@ -102,13 +102,15 @@ class MaintenanceWorkerThread(QThread):
     done = Signal(str)        # summary line
     failed = Signal(str)
 
-    def __init__(self, mode, staging, game_data, downloads="", purge_deploy=False):
+    def __init__(self, mode, staging, game_data, downloads="", purge_deploy=False,
+                 workers=16):
         super().__init__()
         self.mode = mode
         self.staging = staging
         self.game_data = game_data
         self.downloads = downloads
         self.purge_deploy = purge_deploy
+        self.workers = workers
 
     def run(self):
         try:
@@ -124,13 +126,20 @@ class MaintenanceWorkerThread(QThread):
                 from utils import maintenance as mnt
                 plan = mnt.plan_reset(self.staging, game_data=self.game_data,
                                       purge_deploy=self.purge_deploy)
-                res = mnt.run_reset(plan, log=lambda m: self.status.emit(m), progress=prog)
+                res = mnt.run_reset(plan, log=lambda m: self.status.emit(m), progress=prog,
+                                    workers=self.workers)
                 total_f = len(plan.folders)
                 if res.errors and res.deleted < total_f:
+                    from utils.platform_admin import looks_like_permission_error
+                    hint = ""
+                    if any(looks_like_permission_error(e) for e in res.errors[:50]):
+                        hint = ("  This looks like a PERMISSIONS problem — if the install ran "
+                                "as Administrator, run this removal as Administrator too (keep "
+                                "both at the same elevation).")
                     self.failed.emit(
                         f"Reset INCOMPLETE: deleted {res.deleted}/{total_f} staging folder(s), "
                         f"purged {res.purged}, {len(res.errors)} error(s). "
-                        f"First: {res.errors[0]}")
+                        f"First: {res.errors[0]}{hint}")
                 else:
                     self.done.emit(
                         f"Reset complete: purged {res.purged}, deleted {res.deleted}/{total_f} "
