@@ -222,15 +222,22 @@ class InstallWorkerThread(QThread):
         if not self.is_cancelled:
             self.progress_updated.emit(current, total, mod_name)
     
-    def _on_status(self, thread_id: int, mod_name: str, phase):
+    def _on_status(self, thread_id: int, mod_name: str, phase,
+                   files_done=None, files_total=None, tool=None):
         """Installer phase callback (worker-thread): update the active-thread map.
 
         Runs on ThreadPoolExecutor worker threads; only touches a locked dict and a
         throttled Qt signal (safe to emit cross-thread), so it never blocks install
-        work."""
+        work. `tool` is sent once at 'extracting'; it's retained for the mod's later
+        phases so the Tool column stays populated through staging/verifying."""
         with self._active_lock:
+            prev = self._active.get(thread_id, {})
+            keep_tool = tool if tool is not None else (
+                prev.get("tool") if prev.get("mod") == mod_name else None)
             self._active[thread_id] = {"thread": thread_id, "mod": mod_name,
-                                       "phase": phase or "working"}
+                                       "phase": phase or "working",
+                                       "done": files_done, "total": files_total,
+                                       "tool": keep_tool}
         self._emit_active_snapshot()
 
     def _emit_active_snapshot(self, force: bool = False):

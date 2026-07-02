@@ -699,16 +699,19 @@ class FomodInstaller:
                         installed_files.append(item)
 
             if not placed_by_robocopy:
-                for item in root_path.rglob("*"):
-                    if item.is_file():
-                        # Vortex's basic installer stages EVERY file verbatim; the
-                        # only content filtering (meta.ini/.git/_macosx/...) happens
-                        # at DEPLOY (vortex_deploy.is_deploy_blacklisted), never at
-                        # install -- so stage a faithful copy.
-                        rel_path = item.relative_to(root_path)
-                        dest_path = mod_install_path / rel_path
-                        if self._copy_long(item, dest_path):
-                            installed_files.append(dest_path)
+                # Vortex's basic installer stages EVERY file verbatim; the only
+                # content filtering (meta.ini/.git/_macosx/...) happens at DEPLOY
+                # (vortex_deploy.is_deploy_blacklisted), never at install -- so stage
+                # a faithful copy. Materialize the list so we can report live X/N.
+                src_files = [f for f in root_path.rglob("*") if f.is_file()]
+                n_total = len(src_files)
+                for idx, item in enumerate(src_files, 1):
+                    rel_path = item.relative_to(root_path)
+                    dest_path = mod_install_path / rel_path
+                    if self._copy_long(item, dest_path):
+                        installed_files.append(dest_path)
+                    if idx % 50 == 0 or idx == n_total:      # throttle: ~1 update / 50 files
+                        self._emit_status(mod_name, "staging", idx, n_total)
 
             # Clean up temp extraction immediately after copying
             if temp_extract and temp_extract.exists():
@@ -1748,15 +1751,29 @@ class ParallelFomodInstaller(FomodInstaller):
         installation callback, so no explicit 'done' phase is emitted here."""
         self._status_callback = callback
 
-    def _emit_status(self, mod_name: str, phase: Optional[str]):
-        """Fire the status callback for the current thread; never fatal."""
+    def _emit_status(self, mod_name: str, phase: Optional[str],
+                     files_done: Optional[int] = None, files_total: Optional[int] = None,
+                     tool: Optional[str] = None):
+        """Fire the status callback (thread_id, mod, phase, done, total, tool); never fatal."""
         cb = self._status_callback
         if cb is None:
             return
         try:
-            cb(threading.get_ident(), mod_name, phase)
+            cb(threading.get_ident(), mod_name, phase, files_done, files_total, tool)
         except Exception:
             pass
+
+    def _archive_file_count(self, archive_path) -> Optional[int]:
+        """Cheap file count from the archive index -- one header read, no extraction.
+
+        Best-effort: returns None if the index can't be read (missing optional dep,
+        odd archive) so the UI just omits the total rather than guessing."""
+        try:
+            names = self.archive_handler.list_archive_contents(archive_path)
+            n = sum(1 for x in names if not str(x).endswith("/"))
+            return n or None
+        except Exception:
+            return None
 
     def _get_thread_temp_dir(self) -> Path:
         """Get or create a temporary directory for the current thread."""
@@ -1904,7 +1921,9 @@ class ParallelFomodInstaller(FomodInstaller):
                     # Check if mod has installation choices
                     choices = mod_data.get("choices", {})
                     fomod = bool(choices) and choices.get("type") == "fomod"
-                    self._emit_status(mod_name, "extracting")
+                    self._emit_status(mod_name, "extracting", None,
+                                      self._archive_file_count(archive_path),
+                                      self.archive_handler.extractor_name(archive_path))
 
                     # Retry the "empty result" race. Tiny mods (a single file, a
                     # Pandora behavior cache) extract so fast that under high

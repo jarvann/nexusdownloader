@@ -58,15 +58,17 @@ class InstallMonitorWidget(QWidget):
 
         # --- the live table ----------------------------------------------------
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Thread", "Mod", "Status"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Thread", "Mod", "Tool", "Status"])
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 90)
-        self.table.setColumnWidth(2, 140)
+        self.table.setColumnWidth(2, 90)
+        self.table.setColumnWidth(3, 150)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -108,11 +110,17 @@ class InstallMonitorWidget(QWidget):
             mod_item = QTableWidgetItem(r.get("mod", ""))
             mod_item.setToolTip(r.get("mod", ""))
             self.table.setItem(i, 1, mod_item)
+            self.table.setItem(i, 2, QTableWidgetItem(r.get("tool") or ""))
             phase = (r.get("phase") or "").lower()
-            st = QTableWidgetItem(phase or "working")
+            done, total = r.get("done"), r.get("total")
+            if total:
+                label = f"{phase} {done}/{total}" if done is not None else f"{phase} ({total:,})"
+            else:
+                label = phase or "working"
+            st = QTableWidgetItem(label)
             color = _PHASE_COLORS.get(phase)
             if color:
                 st.setForeground(color)
-            self.table.setItem(i, 2, st)
+            self.table.setItem(i, 3, st)
         self.table.setUpdatesEnabled(True)
         sb.setValue(pos)

@@ -129,6 +129,34 @@ def _find_external_7z_tools():
 # Find external tools for fallback
 _external_tools = _find_external_7z_tools()
 
+
+def _primary_extractor_name(ext: str) -> str:
+    """Display name of the tool that will PRIMARILY extract a .<ext> archive.
+
+    Reflects the routing in extract_archive (fallbacks aside) using the tools
+    discovered once at import, so it costs zero I/O per call."""
+    ext = (ext or "").lower().lstrip(".")
+    if ext == "zip":
+        return "zipfile"
+    if ext == "7z":
+        if _external_tools.get("7z"):
+            return "7-Zip"
+        if HAS_7ZIP:
+            return "py7zr"
+        if _external_tools.get("winrar"):
+            return "WinRAR"
+        return "7z"
+    if ext == "rar":
+        p = (_rar_tool_path or "").lower()
+        if "unrar" in p:
+            return "UnRAR"
+        if "winrar" in p or p.endswith("rar.exe"):
+            return "WinRAR"
+        if "7z" in p:
+            return "7-Zip"
+        return "UnRAR" if _rar_tool_path else "rar"
+    return ext or ""
+
 try:
     import patoolib
     HAS_PATOOL = True
@@ -631,6 +659,14 @@ class ArchiveHandler:
         except FileNotFoundError:
             raise ValueError(f"WinRAR executable not found: {winrar_exe}")
     
+    def extractor_name(self, archive_path: Union[str, Path]) -> str:
+        """Display name of the tool that will primarily extract this archive
+        (e.g. 'zipfile', '7-Zip', 'UnRAR'). Best-effort, by extension; never raises."""
+        try:
+            return _primary_extractor_name(Path(archive_path).suffix)
+        except Exception:
+            return ""
+
     def list_archive_contents(self, archive_path: Union[str, Path]) -> List[str]:
         """List all files in an archive."""
         archive_path = Path(archive_path)
