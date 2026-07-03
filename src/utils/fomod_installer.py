@@ -2074,6 +2074,51 @@ class ParallelFomodInstaller(FomodInstaller):
         # denominator (the old "4950/4949").
         self._total_count = self._completed_count + len(mods)
 
+        # Largest-archive-first (Longest-Processing-Time) scheduling: submit the
+        # biggest extractions first so the giants run for the whole session instead
+        # of straggling at the tail while the pool drains -- minimizes total
+        # wall-clock on a fixed worker set. We use REAL on-disk archive sizes: the
+        # collection's recorded fileSize is unreliable (some entries are placeholders
+        # like 16 bytes). One scandir of the downloads folder reads every size
+        # cheaply (the entry carries it -- no per-file stat), and we size ONLY the
+        # collection mods we're about to install by resolving each to its archive,
+        # so unrelated archives sitting in downloads never affect the order. Install
+        # order is otherwise irrelevant -- deploy decides conflict winners -- and the
+        # already-installed mods were filtered out above, so this reordering is safe.
+        size_by_name: Dict[str, int] = {}
+        try:
+            with os.scandir(str(downloads_path)) as _entries:
+                for _entry in _entries:
+                    if _entry.is_file():
+                        try:
+                            size_by_name[_entry.name.lower()] = _entry.stat().st_size
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
+        def _archive_size(m: Dict[str, Any]) -> int:
+            ap = self._find_mod_archive_optimized(m, self._archive_cache)
+            if ap is None:
+                return 0
+            sz = size_by_name.get(ap.name.lower())
+            if sz is not None:
+                return sz
+            try:
+                return ap.stat().st_size
+            except OSError:
+                return 0
+
+        sized = sorted(((_archive_size(m), m) for m in mods),
+                       key=lambda t: t[0], reverse=True)
+        mods = [m for _sz, m in sized]
+        if sized:
+            _unknown = sum(1 for _sz, _m in sized if _sz == 0)
+            self.logger.info(
+                f"Scheduling largest-archive-first: {len(mods)} mods to install, "
+                f"biggest ~{sized[0][0] / (1024 * 1024):,.0f} MB, "
+                f"{_unknown} with unknown size (sorted last)")
+
         # In robocopy placement mode, cap concurrency so workers x /MT threads
         # can't swamp a cross-disk copy (no effect for hardlink/copy modes).
         capped = self.placement_worker_cap(self.max_workers)
