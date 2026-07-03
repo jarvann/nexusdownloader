@@ -112,15 +112,19 @@ class DeployWorkerThread(QThread):
     def _on_activity(self, thread_id, rel_path):
         """Per-thread hard-link activity (worker thread): record which file each
         thread is linking, then emit a throttled snapshot for the monitor table."""
+        now = time.monotonic()
         with self._lock:
             self._active[thread_id] = {"thread": thread_id, "mod": rel_path,
-                                       "phase": "linking"}
-        now = time.monotonic()
+                                       "phase": "linking", "ts": now}
         if (now - self._last_emit) < 0.2:
             return
         self._last_emit = now
         with self._lock:
-            active = list(self._active.values())
+            # Activity ticks globally (every 200 files), so whichever thread hits a
+            # tick gets recorded and stale entries pile up past the pool size. Show
+            # only the freshest `workers` threads so live "Active" never exceeds Max.
+            active = sorted(self._active.values(), key=lambda e: e.get("ts", 0),
+                            reverse=True)[:self.workers]
         elapsed = (now - self._t0) if self._t0 else 0
         fps = (self._deploy_done / elapsed) if elapsed > 0.5 else 0
         self.active_deploys_updated.emit({
@@ -417,9 +421,21 @@ class DeployTab(QWidget):
         # table (fed by active_deploys_updated), so we no longer add grid rows.
         self.panel.set_progress(done, total, f"Hard-linking… {name}")
 
+    def _drain_monitor(self, done: int = 0, failed: int = 0):
+        """Clear the live per-thread table when the run ends so it doesn't freeze on
+        the last in-flight snapshot. Shows Active: 0 with the final tallies; no-op if
+        the table never became visible (e.g. Vortex-busy before any linking)."""
+        mon = getattr(self.panel, "monitor", None)
+        if mon is None or not mon.isVisible():
+            return
+        self.panel.set_active({"active": [], "done": done, "failed": failed,
+                               "max_threads": self.workers_spin.value(),
+                               "files_per_sec": 0})
+
     def _on_done(self, res):
         self.deploy_btn.setEnabled(True)
         self.launch_btn.setEnabled(bool(self.skse_path) or True)
+        self._drain_monitor(res.deploy.files)
         esl = getattr(res, "esl_flagged", 0)
         self.panel.finish(
             f"Deployed {res.deploy.files:,} files, {res.active_plugins:,} plugins active"
@@ -433,11 +449,13 @@ class DeployTab(QWidget):
 
     def _on_failed(self, msg):
         self.deploy_btn.setEnabled(True)
+        self._drain_monitor()
         self.panel.finish(msg, ok=False)
         QMessageBox.critical(self, "Deploy failed", msg)
 
     def _on_busy(self, msg):
         self.deploy_btn.setEnabled(True)
+        self._drain_monitor()
         self.panel.finish("Vortex is open — close it and retry.", ok=False)
         QMessageBox.warning(self, "Close Vortex", msg)
 
