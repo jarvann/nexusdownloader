@@ -783,25 +783,52 @@ def purge_collection(db_path: str, staging_dir: str, target_data_dir: str,
 
 
 def order_folders_for_deploy(staging_dir: str, collection: Optional[Dict[str, Any]],
-                             folder_by_modid: Optional[Dict[str, list]] = None
-                             ) -> list:
-    """Resolve the staging folders into deploy order via the collection's modRules.
+                             folder_by_modid: Optional[Dict[str, list]] = None,
+                             db_path: Optional[str] = None,
+                             game_id: str = GAME_ID,
+                             node: Optional[str] = None) -> list:
+    """Resolve the staging folders into deploy order.
 
-    Falls back to sorted folder order when no collection/rules are available. The
-    returned order is ascending priority (later folders win file conflicts), which
-    is what the collection author's "after" rules intend.
+    Order of preference:
+      1. **Vortex's effective rules** from ``state.v2`` (``db_path`` given, DB
+         readable) -- the collection rules Vortex imported PLUS any user overrides
+         / conflict resolutions. This is what a real Vortex deploy would use.
+      2. The collection's own ``modRules`` (offline fallback / DB had no rules).
+      3. Plain sorted folder order (no collection at all).
+
+    The returned order is ascending priority (later folders win file conflicts),
+    matching Vortex's own ``sortMods`` topsort direction.
     """
     folders = sorted(d for d in os.listdir(staging_dir)
                      if os.path.isdir(os.path.join(staging_dir, d)))
-    if not collection:
+    if not folders:
         return folders
 
     from utils import vortex_loadorder as lo
     from utils.vortex_sync import index_by_modid
     if folder_by_modid is None:
         folder_by_modid = index_by_modid(folders)
-    resolve = lo.build_mod_resolver(collection.get("mods", []), folder_by_modid)
-    return lo.order_mods(folders, collection.get("modRules", []), resolve)
+    coll_resolve = (lo.build_mod_resolver(collection.get("mods", []), folder_by_modid)
+                    if collection else None)
+
+    # 1) Vortex's effective rules (collection import + user overrides). Best-effort:
+    # if the DB is locked / Node is missing, silently fall through to the collection.
+    if db_path:
+        try:
+            from utils import vortex_db
+            rules_by_folder = vortex_db.read_mod_rules(db_path, game_id, node=node)
+            ordered, n_edges = lo.order_mods_from_db(folders, rules_by_folder, coll_resolve)
+            if n_edges:
+                return ordered
+        except Exception:
+            pass
+
+    # 2) collection.json modRules.
+    if collection:
+        return lo.order_mods(folders, collection.get("modRules", []), coll_resolve)
+
+    # 3) plain sorted order.
+    return folders
 
 
 def _aggregate(results: Dict[str, DeployResult], primary_path: str) -> DeployResult:
@@ -842,7 +869,8 @@ def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
     """
     from utils import deploy_engine
     if enabled_folders is None:
-        enabled_folders = order_folders_for_deploy(staging_dir, collection)
+        enabled_folders = order_folders_for_deploy(
+            staging_dir, collection, db_path=db_path, game_id=game_id, node=node)
     if game_root is None:
         game_root = os.path.dirname(os.path.normpath(target_data_dir))
     # Use Vortex's authoritative app.instanceId for the manifest so Vortex accepts

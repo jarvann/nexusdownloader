@@ -147,6 +147,83 @@ def order_mods(folder_keys: Sequence[str], mod_rules: List[dict],
 
 
 # --------------------------------------------------------------------------- #
+# Mod rules from Vortex's own DB (effective rules: collection import + overrides)
+# --------------------------------------------------------------------------- #
+def build_db_ref_resolver(folders: Sequence[str],
+                          coll_resolve: Optional[Callable[[dict], Optional[str]]] = None
+                          ) -> Callable[[dict], Optional[str]]:
+    """Resolve a Vortex-DB rule ``reference`` to an installed staging folder.
+
+    Vortex records the referenced mod's install folder directly in ``id``/``idHint``
+    (the common case), so match those against the live folder set first; fall back
+    to the collection resolver (``fileMD5``/``logicalFileName``) and finally a
+    literal ``fileExpression`` folder. Only ever returns a folder that actually
+    exists in staging (or ``None``), so a dangling reference is dropped rather than
+    inventing an edge to a mod that isn't installed.
+    """
+    folderset = set(folders)
+
+    def resolve(ref: dict) -> Optional[str]:
+        for key in ("id", "idHint"):
+            v = ref.get(key)
+            if v and v in folderset:
+                return v
+        if coll_resolve is not None:
+            hit = coll_resolve(ref)
+            if hit and hit in folderset:
+                return hit
+        fe = ref.get("fileExpression")
+        return fe if fe and fe in folderset else None
+
+    return resolve
+
+
+def db_rule_edges(rules_by_folder: Dict[str, list], folders: Sequence[str],
+                  resolve_ref: Callable[[dict], Optional[str]]) -> List[Tuple[str, str]]:
+    """Convert Vortex's per-mod stored rules into ``(before, after)`` deploy edges.
+
+    The owning folder (dict key) is the rule *source*; only ``after``/``before``
+    rules affect deploy order (``requires``/``recommends``/``conflicts`` are
+    ignored). Mirrors Vortex's own graph construction in ``sortMods``
+    (``before`` -> edge source->reference; ``after`` -> edge reference->source),
+    so the resulting order matches what Vortex would deploy.
+    """
+    folderset = set(folders)
+    edges: List[Tuple[str, str]] = []
+    for src, arr in rules_by_folder.items():
+        if src not in folderset:
+            continue
+        for r in arr or []:
+            t = r.get("type")
+            if t not in ("after", "before"):
+                continue
+            ref = resolve_ref(r.get("reference") or {})
+            if not ref or ref == src:
+                continue
+            if t == "after":
+                edges.append((ref, src))    # source deploys after reference
+            else:                           # before
+                edges.append((src, ref))    # source deploys before reference
+    return edges
+
+
+def order_mods_from_db(folder_keys: Sequence[str], rules_by_folder: Dict[str, list],
+                       coll_resolve: Optional[Callable[[dict], Optional[str]]] = None
+                       ) -> Tuple[List[str], int]:
+    """Order folders for deploy using Vortex's effective DB rules.
+
+    Returns ``(ordered_folders, edge_count)``. ``edge_count == 0`` means the DB
+    carried no applicable order rules for these folders, so the caller should fall
+    back to the collection's own modRules.
+    """
+    resolve_ref = build_db_ref_resolver(folder_keys, coll_resolve)
+    edges = db_rule_edges(rules_by_folder, folder_keys, resolve_ref)
+    if not edges:
+        return list(folder_keys), 0
+    return stable_toposort(folder_keys, edges), len(edges)
+
+
+# --------------------------------------------------------------------------- #
 # Plugin master detection + load order
 # --------------------------------------------------------------------------- #
 def read_record_flags(path: str) -> int:

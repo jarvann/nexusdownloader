@@ -382,6 +382,35 @@ def read_collection_identity(db_path: str, game: str = "skyrimse",
     return (cid, slug) if (cid is not None and slug) else None
 
 
+def read_mod_rules(db_path: str, game: str = "skyrimse",
+                   node: Optional[str] = None) -> Dict[str, list]:
+    """Return ``{mod_install_folder: [rule, ...]}`` for every mod carrying a
+    ``rules`` array in state.v2 (requires Vortex closed).
+
+    Vortex stores a mod's conflict/ordering rules *on the mod itself*: the mod's
+    install-folder name is the record key and each rule is
+    ``{type, reference:{id|idHint|fileMD5|logicalFileName|fileExpression|...}}``.
+    The rule's *source* is the owning mod; ``reference`` names the other mod
+    (``id``/``idHint`` are that mod's install folder). This is Vortex's *effective*
+    rule set -- the collection's imported rules PLUS any user overrides / conflict
+    resolutions -- which is what deploy order should honor. The bridge stores each
+    ``rules`` array as one JSON value under a ``...###<folder>###rules`` key (it does
+    not split array elements into ``###0###`` sub-keys), so a single suffix-filtered
+    read returns them all.
+    """
+    base = f"persistent###mods###{game}###"
+    suffix = "###rules"
+    data = read_prefix(db_path, base, node=node, suffix=suffix)
+    out: Dict[str, list] = {}
+    for k, arr in data.items():
+        if not isinstance(arr, list) or not arr:
+            continue
+        folder = k[len(base):-len(suffix)]   # strip base + trailing '###rules'
+        if folder:
+            out[folder] = arr
+    return out
+
+
 def collection_diagnostic(db_path: str, game: str = "skyrimse", node: Optional[str] = None) -> str:
     """Short diagnostic of what the DB read sees -- included in errors so a failure
     is self-explaining (db path, how many mods / collection records were found)."""
