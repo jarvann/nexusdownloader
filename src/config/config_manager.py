@@ -96,6 +96,8 @@ class UIPreferencesConfig:
     last_collection_file: str = ""
     last_downloads_folder: str = ""
     last_staging_folder: str = ""
+    # Install/reset worker thread count (Install-tab spinbox), persisted across sessions.
+    max_concurrent_installs: int = 0
 
 
 @dataclass
