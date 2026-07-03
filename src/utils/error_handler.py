@@ -8,7 +8,7 @@ mechanisms for robust download operations.
 import time
 import hashlib
 import requests
-from typing import Callable, Any, Optional, Dict
+from typing import Callable, Any, Dict
 from enum import Enum
 import logging
 

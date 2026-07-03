@@ -10,9 +10,8 @@ import shutil
 import hashlib
 import tempfile
 import time
-import json
 from pathlib import Path
-from typing import Dict, Optional, Any, List, Callable, Union
+from typing import Dict, Optional, List, Callable
 import logging
 from contextlib import contextmanager
 import threading
@@ -722,7 +721,7 @@ class DownloadFileManager(FileManager):
         partial_path = f"{target_path}.partial"
         
         # Create empty partial file
-        with open(partial_path, 'wb') as f:
+        with open(partial_path, 'wb'):
             pass
         
         return partial_path

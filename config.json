@@ -1,0 +1,48 @@
+{
+  "version": "1.1",
+  "nexus_api": {
+    "api_key": "",
+    "base_url": "https://api.nexusmods.com",
+    "user_agent": "NexusDownloader/1.0",
+    "rate_limit_requests_per_minute": 60,
+    "rate_limit_requests_per_hour": 1000,
+    "timeout_seconds": 30
+  },
+  "vortex": {
+    "downloads_folder_root": "",
+    "auto_detect_vortex_path": true,
+    "vortex_executable_path": "",
+    "check_vortex_running": true,
+    "auto_close_vortex": false
+  },
+  "downloads": {
+    "max_concurrent_downloads": 4,
+    "max_retries": 3,
+    "retry_delay_seconds": 5.0,
+    "chunk_size_bytes": 8192,
+    "verify_checksums": true,
+    "resume_partial_downloads": true,
+    "cleanup_failed_downloads": true
+  },
+  "logging": {
+    "log_level": "INFO",
+    "log_to_file": true,
+    "log_to_console": true,
+    "log_directory": "logs",
+    "max_log_size_mb": 10,
+    "log_backup_count": 5,
+    "enable_performance_logging": true,
+    "enable_colored_output": true
+  },
+  "security": {
+    "use_secure_api_storage": true,
+    "enable_rate_limiting": true,
+    "validate_ssl_certificates": true,
+    "anonymize_logs": false,
+    "auto_cleanup_logs_days": 30
+  },
+  "ui_preferences": {
+    "last_collection_directory": "",
+    "remember_collection_location": true
+  }
+}

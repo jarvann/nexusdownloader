@@ -1,35 +1,40 @@
-# Core dependencies (existing)
-requests>=2.28.0
-urllib3>=1.26.0
+# Core dependencies
+requests>=2.34.2
+urllib3>=2.7.0
 
 # Enhanced Error Handling & Security
-cryptography>=3.4.8
-keyring>=23.0.0
+cryptography>=48.0.0
+keyring>=25.7.0
 
 # File Operations & Validation
 pathlib2>=2.3.7; python_version < '3.4'
 
 # Logging & Performance Monitoring
-colorama>=0.4.4
+colorama>=0.4.6
 
 # Configuration Management
 dataclasses>=0.6; python_version < '3.7'
-PySide6>=6.4.0
-requests>=2.25.0
-# Development & Testing
-pytest>=7.0.0
-pytest-cov>=4.0.0
-black>=22.0.0
-flake8>=4.0.0
 
-# Optional dependencies for enhanced functionality
-# Archive handling (for Phase 2)
-# rarfile>=4.0.0
-# py7zr>=0.20.0
+# Development & Testing
+pytest>=9.0.3
+pytest-cov>=7.1.0
+black>=26.5.1
+flake8>=7.3.0
+
+# Archive handling for FOMOD installation
+rarfile>=4.2
+py7zr>=1.1.0
+patool>=4.0.5
+
+# Safe XML parsing for third-party FOMOD ModuleConfig.xml files
+defusedxml>=0.7.1
 
 # GUI framework
-PySide6>=6.4.0  # For enhanced GUI
+PySide6>=6.11.1  # For enhanced GUI
 # tkinter is included with Python standard library (legacy GUI)
 
+# Process / lock detection (is Vortex running before we touch its DB?)
+psutil>=6.0.0
+
 # Windows-specific dependencies
-pywin32>=227; sys_platform == "win32"
+pywin32>=311; sys_platform == "win32"

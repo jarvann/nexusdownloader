@@ -14,7 +14,6 @@ import logging
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from collections import deque
 
 
 @dataclass

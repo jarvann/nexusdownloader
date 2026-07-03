@@ -29,7 +29,7 @@ if "%VIRTUAL_ENV%"=="" (
 REM Upgrade pip and install build dependencies
 echo Installing build dependencies...
 python -m pip install --upgrade pip
-pip install pyinstaller[encryption]
+pip install "pyinstaller>=6.20.0"
 pip install -r requirements.txt
 
 REM Clean previous builds

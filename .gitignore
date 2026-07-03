@@ -32,6 +32,9 @@ screenshots/
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+#  ...but our build uses hand-maintained spec files, so track those (issue #1).
+!nexusdownloader.spec
+!gui.spec
 
 # Installer logs
 pip-log.txt
@@ -201,3 +204,9 @@ build_dist/
 *.collection_resume.json
 .nexusdownloader_state/
 nul
+
+# Node deps for the Vortex DB bridge (vortex_leveldb.js / vortex_sync.js are tracked)
+node_modules/
+
+# Windows Mark-of-the-Web alternate-data-stream artifacts
+*:Zone.Identifier

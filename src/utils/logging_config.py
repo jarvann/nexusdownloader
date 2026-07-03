@@ -12,7 +12,7 @@ import time
 import logging
 import logging.handlers
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Dict, Optional, Any, List
+from typing import TYPE_CHECKING, Dict, Optional, Any
 
 if TYPE_CHECKING:
     from config.config_manager import LoggingConfig
@@ -224,8 +224,47 @@ class NexusLogger:
     Provides centralized logging configuration with multiple handlers,
     performance tracking, and specialized logging methods for download operations.
     """
-    
-    def __init__(self, log_level: int = logging.INFO, 
+
+    @staticmethod
+    def _resolve_log_dir(requested: str) -> Path:
+        """Resolve a usable log directory, tolerating stale/foreign config paths.
+
+        A machine-specific absolute path (e.g. a leftover ``X:/_work/...`` from a
+        prior checkout location) must never brick startup. Relative values resolve
+        against the *project root* (this file is ``src/utils/logging_config.py``, so
+        the root is ``parents[2]``) rather than the CWD, so the GUI (launched from
+        the repo root) and the CLI (launched from ``src/``) agree. We try, in order:
+        the requested dir, the project-root ``logs``, then a per-user fallback."""
+        try:
+            project_root = Path(__file__).resolve().parents[2]
+        except Exception:
+            project_root = Path.cwd()
+
+        def _drive_style(s: str) -> bool:
+            # "X:/..." or "X:\\..." — a Windows drive-qualified path.
+            return len(s) >= 2 and s[1] == ":" and s[0].isalpha()
+
+        candidates = []
+        if requested and not (_drive_style(requested) and os.name != "nt"):
+            # (A Windows drive path is meaningless on a POSIX host — skip it so we
+            #  don't accidentally create a literal "X:" folder under the CWD.)
+            p = Path(requested)
+            candidates.append(p if p.is_absolute() else (project_root / p))
+        candidates.append(project_root / "logs")
+        candidates.append(Path.home() / ".nexusdownloader" / "logs")
+
+        for cand in candidates:
+            try:
+                cand.mkdir(parents=True, exist_ok=True)
+                return cand
+            except Exception:
+                continue
+        # Last resort: CWD-relative, so we always return a writable directory.
+        fallback = Path.cwd() / "logs"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+    def __init__(self, log_level: int = logging.INFO,
                  log_dir: str = "logs",
                  max_file_size: int = 10 * 1024 * 1024,  # 10MB
                  backup_count: int = 5,
@@ -233,15 +272,14 @@ class NexusLogger:
                  enable_colors: bool = True,
                  enable_performance_logging: bool = True):
         
-        self.log_dir = Path(log_dir)
         self.log_level = log_level
         self.max_file_size = max_file_size
         self.backup_count = backup_count
         self.enable_console = enable_console
         self.enable_colors = enable_colors and self._supports_color()
-        
-        # Create log directory
-        self.log_dir.mkdir(exist_ok=True)
+
+        # Resolve + create log directory (robust against stale/foreign paths in config)
+        self.log_dir = self._resolve_log_dir(log_dir)
         
         # Initialize performance metrics
         self.performance_metrics = PerformanceMetrics() if enable_performance_logging else None
@@ -283,8 +321,11 @@ class NexusLogger:
     def _setup_file_handlers(self, logger: logging.Logger):
         """Setup rotating file handlers"""
         
-        # Main log file (all messages)
-        main_handler = logging.handlers.RotatingFileHandler(
+        # Import custom rotating handler
+        from .unified_logging import CustomRotatingFileHandler
+        
+        # Main log file (all messages) with proper rotation naming
+        main_handler = CustomRotatingFileHandler(
             self.log_dir / "nexusdownloader.log",
             maxBytes=self.max_file_size,
             backupCount=self.backup_count,
@@ -297,9 +338,9 @@ class NexusLogger:
         ))
         logger.addHandler(main_handler)
         
-        # Error log file (errors and warnings only)
-        error_handler = logging.handlers.RotatingFileHandler(
-            self.log_dir / "errors.log",
+        # Error log file (errors and warnings only) with proper rotation naming
+        error_handler = CustomRotatingFileHandler(
+            self.log_dir / "nexusdownloader_errors.log",
             maxBytes=self.max_file_size,
             backupCount=self.backup_count,
             encoding='utf-8'
@@ -312,10 +353,10 @@ class NexusLogger:
         ))
         logger.addHandler(error_handler)
         
-        # Performance log file (if enabled)
+        # Performance log file (if enabled) with proper rotation naming
         if self.performance_metrics:
-            perf_handler = logging.handlers.RotatingFileHandler(
-                self.log_dir / "performance.log",
+            perf_handler = CustomRotatingFileHandler(
+                self.log_dir / "nexusdownloader_performance.log",
                 maxBytes=self.max_file_size,
                 backupCount=self.backup_count,
                 encoding='utf-8'

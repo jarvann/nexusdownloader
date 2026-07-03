@@ -7,15 +7,14 @@ display scaling based on the number of active operations.
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QTableWidget, 
+    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QProgressBar, QHeaderView, QGroupBox,
-    QScrollArea, QFrame, QCheckBox, QPushButton
+    QFrame, QCheckBox, QSizePolicy
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtGui import QFont, QColor
-from typing import List, Dict, Any
+from typing import List
 from datetime import timedelta
-import time
 
 from progress_tracking import DownloadProgress
 
@@ -56,9 +55,10 @@ class ProgressMonitorWidget(QWidget):
         header_section = self._create_header_section()
         layout.addWidget(header_section)
         
-        # Main downloads table with scrolling support
+        # Main downloads table -- stretch factor 1 so it absorbs the window's
+        # vertical space (header/summary stay compact); more rows show when taller.
         downloads_area = self._create_downloads_table()
-        layout.addWidget(downloads_area)
+        layout.addWidget(downloads_area, 1)
         
         # Summary statistics section
         summary_section = self._create_summary_section()
@@ -103,23 +103,19 @@ class ProgressMonitorWidget(QWidget):
         Returns:
             QWidget containing the downloads table
         """
-        # Scroll area for dynamic content
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
-        # Main downloads table
+        # The QTableWidget has its own scrollbars, so it is NOT wrapped in a
+        # QScrollArea (that produced a second, redundant scrollbar). It expands to
+        # fill its pane and grows with the window -- more rows become visible as
+        # you make the window taller, and it scrolls internally beyond that.
         self.downloads_table = QTableWidget()
         self.downloads_table.setColumnCount(6)
         self.downloads_table.setHorizontalHeaderLabels([
             "File", "Progress", "Speed", "ETA", "Thread", "Status"
         ])
-        
+        self.downloads_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         self._configure_table_appearance()
-        
-        scroll_area.setWidget(self.downloads_table)
-        return scroll_area
+        return self.downloads_table
         
     def _configure_table_appearance(self):
         """Configure table appearance and column sizing."""
@@ -215,25 +211,26 @@ class ProgressMonitorWidget(QWidget):
         # Update active count display
         active_count = len(active_downloads)
         self.active_count_label.setText(f"Active: {active_count}")
-        
-        # Adjust table size for current content
-        self._adjust_table_size(active_count)
-        
-        # Clear existing content and repopulate
-        self.downloads_table.setRowCount(0)
-        
-        # Sort downloads by thread ID for organized display
+
+        # Stable order so rows don't jump around between the ~4 updates/sec.
         sorted_downloads = sorted(active_downloads, key=lambda x: x.thread_id or "")
-        
-        # Populate table rows
+
+        table = self.downloads_table
+        # Preserve the user's scroll position across the refresh -- previously the
+        # table was fully cleared each tick, snapping the view back to the top and
+        # making it impossible to scroll while downloads were active.
+        scroll_pos = table.verticalScrollBar().value()
+        table.setUpdatesEnabled(False)
+        # Resize in place (extend/truncate) instead of clearing, then overwrite
+        # each row's cells.
+        table.setRowCount(len(sorted_downloads))
         for row_index, download in enumerate(sorted_downloads):
-            self.downloads_table.insertRow(row_index)
             self._populate_table_row(row_index, download)
-        
-        # Apply auto-resize if enabled
         if self.auto_resize_checkbox.isChecked():
-            self.downloads_table.resizeRowsToContents()
-        
+            table.resizeRowsToContents()
+        table.setUpdatesEnabled(True)
+        table.verticalScrollBar().setValue(scroll_pos)
+
         # Update summary statistics
         self._update_summary_statistics(active_downloads)
         
@@ -465,23 +462,11 @@ class ProgressMonitorWidget(QWidget):
         Args:
             active_count: Number of currently active downloads
         """
-        # Calculate optimal height
-        base_height = 60   # Minimum height for headers
-        row_height = 25    # Height per row
-        max_height = 350   # Maximum before scrolling
-        
-        optimal_height = min(
-            base_height + (active_count * row_height),
-            max_height
-        )
-        
-        self.downloads_table.setMinimumHeight(optimal_height)
-        
-        # Enable scrolling for large numbers of downloads
-        if active_count > (max_height - base_height) // row_height:
-            self.downloads_table.setMaximumHeight(max_height)
-        else:
-            self.downloads_table.setMaximumHeight(optimal_height)
+        # Intentionally a no-op: the table fills its pane and scrolls internally,
+        # so it must NOT be pinned to a content-based height (that capped it at
+        # 350px and stopped the window resize from revealing more rows). Kept as a
+        # method so existing callers don't need to change.
+        return
             
     def _adjust_display_for_thread_count(self):
         """Adjust display parameters based on configured thread count."""

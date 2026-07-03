@@ -1,0 +1,500 @@
+"""
+Collection rule ordering: mod deploy order (pre-deploy) and plugin load order
+(post-deploy).
+
+Two distinct orderings, both reverse-engineered from a real collection.json +
+the load-order files Vortex writes:
+
+* **Mod rules -> deploy order.** ``collection.json:modRules`` is a list of
+  ``{type: "after"|"before", source, reference}`` constraints (endpoints matched
+  by ``fileMD5``/``logicalFileName``/folder name). They decide which mod's files
+  win a conflict, so they must be resolved into a deploy order *before* deploying
+  (the override is "last wins"; an "after" mod ends up later -> wins). See
+  :func:`order_mods`.
+
+* **Plugin rules -> load order.** ``collection.json:pluginRules.plugins`` gives
+  explicit per-plugin ``after`` constraints; with a masters-first invariant these
+  produce ``plugins.txt`` / ``loadorder.txt`` *after* deploy. See
+  :func:`order_plugins` and :func:`render_plugins_txt` / :func:`render_loadorder`.
+
+  NOTE: ``pluginRules.groups`` (LOOT group ordering) is intentionally NOT applied
+  here -- the group->plugin assignment comes from LOOT's masterlist, which the
+  collection doesn't carry. This module honors the collection's *explicit* plugin
+  rules + masters-first; a full LOOT pass is a separate concern.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import struct
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+# Skyrim SE base masters in canonical load order. Always loaded, never listed in
+# plugins.txt (they still appear, in this order, at the top of loadorder.txt).
+# CC content (cc*.es[lmp]) loads after these but before mods and is also excluded
+# from plugins.txt -- see :func:`is_vanilla_master`.
+SKYRIMSE_VANILLA_ORDER = [
+    "Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm",
+]
+SKYRIMSE_VANILLA = {n.lower() for n in SKYRIMSE_VANILLA_ORDER}
+PLUGIN_EXTS = (".esp", ".esm", ".esl")
+
+_MASTER_FLAG = 0x00000001   # ESM flag in the TES4 record header
+_LIGHT_FLAG = 0x00000200    # ESL / light-master flag
+
+
+# --------------------------------------------------------------------------- #
+# Generic stable topological sort
+# --------------------------------------------------------------------------- #
+def stable_toposort(nodes: Sequence[str],
+                    edges: Iterable[Tuple[str, str]]) -> List[str]:
+    """Topologically sort ``nodes`` honoring ``(before, after)`` edges, breaking
+    ties by original order. Unknown edge endpoints and cycles are tolerated
+    (a cycle's remaining nodes are appended in original order)."""
+    pos = {n: i for i, n in enumerate(nodes)}
+    succ: Dict[str, List[str]] = {n: [] for n in nodes}
+    indeg: Dict[str, int] = {n: 0 for n in nodes}
+    seen = set()
+    for a, b in edges:
+        if a in pos and b in pos and a != b and (a, b) not in seen:
+            seen.add((a, b))
+            succ[a].append(b)
+            indeg[b] += 1
+
+    import heapq
+    avail = [pos[n] for n in nodes if indeg[n] == 0]
+    heapq.heapify(avail)
+    order: List[str] = []
+    while avail:
+        n = nodes[heapq.heappop(avail)]
+        order.append(n)
+        for m in succ[n]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                heapq.heappush(avail, pos[m])
+    if len(order) != len(nodes):   # cycle -> append leftovers stably
+        done = set(order)
+        order += [n for n in nodes if n not in done]
+    return order
+
+
+# --------------------------------------------------------------------------- #
+# Mod rules -> deploy order
+# --------------------------------------------------------------------------- #
+def build_mod_resolver(mods: List[dict], folder_by_modid: Dict[str, List[str]]
+                       ) -> Callable[[dict], Optional[str]]:
+    """Return a resolver mapping a modRule endpoint to an installed folder name.
+
+    Matches by ``fileMD5`` first (most reliable), then ``logicalFileName``, then
+    falls back to a literal ``fileExpression``/``idHint`` (which is a folder name).
+    """
+    from utils.vortex_sync import _best_match   # deferred: avoid import-time cost
+    by_md5: Dict[str, str] = {}
+    by_logical: Dict[str, str] = {}
+    recorded: set = set()
+    for m in mods:
+        s = m.get("source") or {}
+        folders = folder_by_modid.get(str(s.get("modId")), [])
+        if not folders:
+            continue
+        # Disambiguate shared-modId variants the SAME way the Link path does, so a
+        # rule endpoint resolves to the specific variant it names, not folders[0]
+        # (which mis-attributes ordering constraints across variants of one modId).
+        folder = _best_match([f for f in folders if f not in recorded] or folders, m)
+        recorded.add(folder)
+        if s.get("md5"):
+            by_md5[s["md5"].lower()] = folder
+        if s.get("logicalFilename"):
+            by_logical[s["logicalFilename"].lower()] = folder
+
+    def resolve(endpoint: dict) -> Optional[str]:
+        md5 = (endpoint.get("fileMD5") or "").lower()
+        if md5 and md5 in by_md5:
+            return by_md5[md5]
+        lf = (endpoint.get("logicalFileName") or "").lower()
+        if lf and lf in by_logical:
+            return by_logical[lf]
+        for key in ("fileExpression", "idHint"):
+            if endpoint.get(key):
+                return endpoint[key]
+        return None
+
+    return resolve
+
+
+def mod_rule_edges(mod_rules: List[dict],
+                   resolve: Callable[[dict], Optional[str]]) -> List[Tuple[str, str]]:
+    """Convert modRules into ``(before_folder, after_folder)`` edges."""
+    edges: List[Tuple[str, str]] = []
+    for r in mod_rules or []:
+        src = resolve(r.get("source") or {})
+        ref = resolve(r.get("reference") or {})
+        if not src or not ref or src == ref:
+            continue
+        if r.get("type") == "after":        # source after reference
+            edges.append((ref, src))
+        elif r.get("type") == "before":     # source before reference
+            edges.append((src, ref))
+    return edges
+
+
+def order_mods(folder_keys: Sequence[str], mod_rules: List[dict],
+               resolve: Callable[[dict], Optional[str]]) -> List[str]:
+    """Order installed mod folders for deployment per the collection's modRules."""
+    return stable_toposort(folder_keys, mod_rule_edges(mod_rules, resolve))
+
+
+# --------------------------------------------------------------------------- #
+# Mod rules from Vortex's own DB (effective rules: collection import + overrides)
+# --------------------------------------------------------------------------- #
+def build_db_ref_resolver(folders: Sequence[str],
+                          coll_resolve: Optional[Callable[[dict], Optional[str]]] = None
+                          ) -> Callable[[dict], Optional[str]]:
+    """Resolve a Vortex-DB rule ``reference`` to an installed staging folder.
+
+    Vortex records the referenced mod's install folder directly in ``id``/``idHint``
+    (the common case), so match those against the live folder set first; fall back
+    to the collection resolver (``fileMD5``/``logicalFileName``) and finally a
+    literal ``fileExpression`` folder. Only ever returns a folder that actually
+    exists in staging (or ``None``), so a dangling reference is dropped rather than
+    inventing an edge to a mod that isn't installed.
+    """
+    folderset = set(folders)
+
+    def resolve(ref: dict) -> Optional[str]:
+        for key in ("id", "idHint"):
+            v = ref.get(key)
+            if v and v in folderset:
+                return v
+        if coll_resolve is not None:
+            hit = coll_resolve(ref)
+            if hit and hit in folderset:
+                return hit
+        fe = ref.get("fileExpression")
+        return fe if fe and fe in folderset else None
+
+    return resolve
+
+
+def db_rule_edges(rules_by_folder: Dict[str, list], folders: Sequence[str],
+                  resolve_ref: Callable[[dict], Optional[str]]) -> List[Tuple[str, str]]:
+    """Convert Vortex's per-mod stored rules into ``(before, after)`` deploy edges.
+
+    The owning folder (dict key) is the rule *source*; only ``after``/``before``
+    rules affect deploy order (``requires``/``recommends``/``conflicts`` are
+    ignored). Mirrors Vortex's own graph construction in ``sortMods``
+    (``before`` -> edge source->reference; ``after`` -> edge reference->source),
+    so the resulting order matches what Vortex would deploy.
+    """
+    folderset = set(folders)
+    edges: List[Tuple[str, str]] = []
+    for src, arr in rules_by_folder.items():
+        if src not in folderset:
+            continue
+        for r in arr or []:
+            t = r.get("type")
+            if t not in ("after", "before"):
+                continue
+            ref = resolve_ref(r.get("reference") or {})
+            if not ref or ref == src:
+                continue
+            if t == "after":
+                edges.append((ref, src))    # source deploys after reference
+            else:                           # before
+                edges.append((src, ref))    # source deploys before reference
+    return edges
+
+
+def order_mods_from_db(folder_keys: Sequence[str], rules_by_folder: Dict[str, list],
+                       coll_resolve: Optional[Callable[[dict], Optional[str]]] = None
+                       ) -> Tuple[List[str], int]:
+    """Order folders for deploy using Vortex's effective DB rules.
+
+    Returns ``(ordered_folders, edge_count)``. ``edge_count == 0`` means the DB
+    carried no applicable order rules for these folders, so the caller should fall
+    back to the collection's own modRules.
+    """
+    resolve_ref = build_db_ref_resolver(folder_keys, coll_resolve)
+    edges = db_rule_edges(rules_by_folder, folder_keys, resolve_ref)
+    if not edges:
+        return list(folder_keys), 0
+    return stable_toposort(folder_keys, edges), len(edges)
+
+
+# --------------------------------------------------------------------------- #
+# Plugin master detection + load order
+# --------------------------------------------------------------------------- #
+def read_record_flags(path: str) -> int:
+    """Read the TES4 header record flags (0 if unreadable / not a plugin)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+    except OSError:
+        return 0
+    if len(head) < 12 or head[:4] != b"TES4":
+        return 0
+    return struct.unpack("<I", head[8:12])[0]
+
+
+def read_masters(path: str) -> List[str]:
+    """Return the master files a plugin depends on (its MAST subrecords).
+
+    Parses the TES4 header record: a 24-byte Skyrim record header followed by
+    ``dataSize`` bytes of subrecords, each ``type[4] size[2] data[size]``. Master
+    filenames live in ``MAST`` subrecords as null-terminated strings. Returns an
+    empty list if the file isn't a plugin or can't be read -- this is best-effort
+    diagnostics, not a hard parser.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+            if len(head) < 24 or head[:4] != b"TES4":
+                return []
+            data_size = struct.unpack("<I", head[4:8])[0]
+            body = fh.read(data_size)
+    except OSError:
+        return []
+    masters: List[str] = []
+    i = 0
+    while i + 6 <= len(body):
+        sig = body[i:i + 4]
+        size = struct.unpack("<H", body[i + 4:i + 6])[0]
+        start = i + 6
+        chunk = body[start:start + size]
+        if sig == b"MAST":
+            masters.append(chunk.split(b"\x00", 1)[0].decode("cp1252", "replace"))
+        i = start + size
+    return masters
+
+
+def is_master_block(name: str, path: Optional[str] = None) -> bool:
+    """True if the plugin loads in the master block (.esm/.esl, or ESM/ESL flag)."""
+    ext = name.lower().rsplit(".", 1)[-1]
+    if ext in ("esm", "esl"):
+        return True
+    if path and (read_record_flags(path) & (_MASTER_FLAG | _LIGHT_FLAG)):
+        return True
+    return False
+
+
+# Bethesda Creation Club plugins follow a fixed scheme: "cc" + a 3-char dev
+# code + "sse" + a 3-digit number (e.g. ccBGSSSE001, ccafdsse001, cceejsse001).
+# Match THAT, not any "cc" prefix -- collection mods legitimately start with "cc"
+# (Creation Club *patches/addons* like "cc open helmets.esp", "ccquest -
+# experience patch.esp"), and a bare startswith("cc") was wrongly dropping those
+# from plugins.txt, leaving them disabled in-game.
+_BASE_CC_RE = re.compile(r"^cc[a-z0-9]{3}sse\d{3}", re.IGNORECASE)
+
+
+def is_vanilla_master(name: str, vanilla: Iterable[str] = SKYRIMSE_VANILLA) -> bool:
+    """True for base-game / Creation Club plugins (excluded from plugins.txt)."""
+    low = name.lower()
+    return low in set(vanilla) or bool(_BASE_CC_RE.match(low))
+
+
+def order_plugins(plugin_names: Sequence[str],
+                  is_master_fn: Callable[[str], bool],
+                  plugin_after: Optional[Dict[str, List[str]]] = None) -> List[str]:
+    """Order plugins masters-first, applying explicit ``after`` rules within each
+    block (cross-block ``after`` edges are dropped -- masters always precede)."""
+    lower_to_name = {p.lower(): p for p in plugin_names}
+    edges: List[Tuple[str, str]] = []
+    for name, afters in (plugin_after or {}).items():
+        tgt = lower_to_name.get(name.lower())
+        if not tgt:
+            continue
+        for a in afters:
+            src = lower_to_name.get(a.lower())
+            if src and src != tgt:
+                edges.append((src, tgt))   # src loads before tgt
+
+    masters = [p for p in plugin_names if is_master_fn(p)]
+    regular = [p for p in plugin_names if not is_master_fn(p)]
+    ms, rs = set(masters), set(regular)
+    ordered_m = stable_toposort(masters, [(a, b) for a, b in edges if a in ms and b in ms])
+    ordered_r = stable_toposort(regular, [(a, b) for a, b in edges if a in rs and b in rs])
+    return ordered_m + ordered_r
+
+
+# --------------------------------------------------------------------------- #
+# Render the load-order files (exact Vortex format)
+# --------------------------------------------------------------------------- #
+def render_loadorder(ordered_all: Sequence[str]) -> str:
+    """``loadorder.txt``: every plugin, original case, Vortex header."""
+    return "# Automatically generated by Vortex\n" + "".join(f"{p}\n" for p in ordered_all)
+
+
+def render_plugins_txt(ordered_active: Sequence[str],
+                       enabled: Dict[str, bool], *, strict: bool = False,
+                       force_enable: Optional[Set[str]] = None) -> str:
+    """``plugins.txt``: non-vanilla plugins, lowercase, ``*`` prefix when enabled.
+
+    ``strict`` (set when the collection ships an explicit plugin list): plugins
+    that are deployed but NOT in that list are written *un*-activated. Mods often
+    ship optional/alternate ESPs the collection deliberately leaves off; auto-
+    enabling every ESP on disk pushed the active count past Skyrim's hard caps
+    (254 full / 4096 light). Without a list we keep the old default-on behavior.
+
+    ``force_enable`` (lower-cased names) is ALWAYS activated regardless of strict
+    mode. We pass the deployed masters here: Vortex never strict-disables a master
+    (a lone-plugin mod is auto-enabled on install, and the collection parser only
+    overrides plugins it explicitly lists), so blanket-disabling an unlisted master
+    here was leaving dependents with a missing master ("plugin X depends on Y that
+    is not enabled"). Masters are few, so forcing them on can't blow the 254 cap.
+    """
+    force_enable = force_enable or set()
+    lines = [
+        "# This file is used by Skyrim to keep track of your downloaded content.",
+        "# Please do not modify this file.",
+    ]
+    for p in ordered_active:
+        low = p.lower()
+        default = not strict          # unlisted plugins: off in strict mode
+        on = (low in force_enable) or enabled.get(low, default)
+        mark = "*" if on else ""
+        lines.append(f"{mark}{low}")
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Compose a full load order from deployed plugins + collection rules
+# --------------------------------------------------------------------------- #
+def scan_plugins(data_dir: str) -> List[str]:
+    """List plugin files (.esp/.esm/.esl) directly in the game's Data folder."""
+    try:
+        names = os.listdir(data_dir)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.lower().endswith(PLUGIN_EXTS)
+                  and os.path.isfile(os.path.join(data_dir, n)))
+
+
+def after_map(collection: dict) -> Dict[str, List[str]]:
+    """Extract ``{plugin: [after...]}`` from ``collection.pluginRules.plugins``."""
+    rules = ((collection.get("pluginRules") or {}).get("plugins")) or []
+    return {r["name"]: list(r.get("after") or []) for r in rules if r.get("name")}
+
+
+def enabled_map(collection: dict) -> Dict[str, bool]:
+    """Extract ``{plugin_lower: enabled}`` from ``collection.plugins`` (deduped)."""
+    out: Dict[str, bool] = {}
+    for p in collection.get("plugins") or []:
+        if p.get("name"):
+            # Vortex treats a missing/falsy `enabled` as disabled (`&& p.enabled`).
+            out[p["name"].lower()] = bool(p.get("enabled", False))
+    return out
+
+
+def read_ccc(game_data_dir: str, cc_file: str = "Skyrim.ccc") -> List[str]:
+    """Read the game's Creation Club load list (one plugin per line) from the game
+    install root (parent of Data). Lower-cased, in file order. ``cc_file`` is the
+    game's CC filename (Skyrim.ccc / Fallout4.ccc / Starfield.ccc); empty -> no CC.
+    Returns ``[]`` if absent -- Vortex uses this exact list to know which plugins
+    are native CC content (excluded from plugins.txt); a regex can't catch them all.
+    """
+    if not cc_file:
+        return []
+    ccc = os.path.join(os.path.dirname(os.path.normpath(game_data_dir)), cc_file)
+    try:
+        with open(ccc, "r", encoding="utf-8", errors="ignore") as fh:
+            return [ln.strip().lower() for ln in fh if ln.strip()]
+    except OSError:
+        return []
+
+
+def compose_load_order(scanned: Sequence[str], data_dir: str,
+                       plugin_after: Optional[Dict[str, List[str]]] = None,
+                       vanilla: Optional[Iterable[str]] = None,
+                       base_order: Optional[Sequence[str]] = None
+                       ) -> Tuple[List[str], List[str]]:
+    """Build ``(full_order, active_order)`` from scanned Data-folder plugins.
+
+    ``full_order`` (-> loadorder.txt) is: canonical core masters (``base_order``,
+    fixed), then CC content, then everything else ordered masters-first +
+    collection rules. ``active_order`` (-> plugins.txt) is just the non-vanilla/
+    non-CC plugins, in the same relative order. ``vanilla`` is the full base+CC set
+    (callers augment the game's core masters with the real .ccc contents);
+    ``base_order`` is the game's core masters in fixed order (defaults to Skyrim SE).
+    """
+    base_order = list(SKYRIMSE_VANILLA_ORDER if base_order is None else base_order)
+    base_set = {n.lower() for n in base_order}
+    vanilla_names = set(base_set if vanilla is None else vanilla)
+    present = {n.lower(): n for n in scanned}
+    vanilla_list = [present[v] for v in base_set if v in present]
+    vanilla_list += [n for n in scanned
+                     if is_vanilla_master(n, vanilla_names) and n.lower() not in base_set]
+    vanilla_set = {n.lower() for n in vanilla_list}
+
+    others = [n for n in scanned if n.lower() not in vanilla_set]
+
+    def master_here(name: str) -> bool:
+        return is_master_block(name, os.path.join(data_dir, name))
+
+    active = order_plugins(others, master_here, plugin_after)
+    # canonical core masters first (fixed order), then CC (sorted), then ordered rest
+    core = [present[v.lower()] for v in base_order if v.lower() in present]
+    cc = sorted((n for n in vanilla_list if n.lower() not in base_set), key=str.lower)
+    full = core + cc + active
+    return full, active
+
+
+def write_load_order(localappdata_dir: str, full_order: Sequence[str],
+                     active_order: Sequence[str], enabled: Dict[str, bool], *,
+                     backup: bool = True, strict: bool = False,
+                     force_enable: Optional[Set[str]] = None) -> Tuple[str, str]:
+    """Write ``loadorder.txt`` + ``plugins.txt`` (backing up any existing pair).
+
+    Returns the two written paths. ``localappdata_dir`` is the game's
+    ``%LOCALAPPDATA%/<Game>`` folder (e.g. ``.../Skyrim Special Edition``).
+    """
+    lo_path = os.path.join(localappdata_dir, "loadorder.txt")
+    pl_path = os.path.join(localappdata_dir, "plugins.txt")
+    if backup:
+        for path in (lo_path, pl_path):
+            if os.path.isfile(path):
+                shutil.copy2(path, path + ".nxd-bak")
+    os.makedirs(localappdata_dir, exist_ok=True)
+    with open(lo_path, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write(render_loadorder(full_order))
+    with open(pl_path, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write(render_plugins_txt(active_order, enabled, strict=strict,
+                                    force_enable=force_enable))
+    return lo_path, pl_path
+
+
+def sort_plugins(collection: dict, game_data_dir: str, localappdata_dir: str, *,
+                 backup: bool = True) -> Tuple[str, str, int]:
+    """End-to-end collection-rules plugin sort: scan -> order -> write the files.
+
+    Returns ``(loadorder_path, plugins_path, active_count)``.
+    """
+    scanned = scan_plugins(game_data_dir)
+    # Game-generic via game_meta (Nexus domain from the collection): core master
+    # order + CC filename. Native CC content comes from the real .ccc, augmenting
+    # the core masters (a regex misses CC plugins outside the cc???sse### shape).
+    from utils import game_meta
+    meta = game_meta.get(game_meta.collection_domain(collection))
+    base_order = list(meta.master_order) or list(SKYRIMSE_VANILLA_ORDER)
+    cc_file = meta.cc_file or "Skyrim.ccc"
+    vanilla = {n.lower() for n in base_order} | set(read_ccc(game_data_dir, cc_file))
+    full, active = compose_load_order(scanned, game_data_dir, after_map(collection),
+                                      vanilla=vanilla, base_order=base_order)
+    enabled = enabled_map(collection)
+    # Strict activation only when the collection actually ships a plugin list,
+    # so we don't accidentally disable everything for list-less collections.
+    strict = bool(enabled)
+    # Deployed masters are always kept active (Vortex never strict-disables a
+    # master); excludes vanilla/CC, which aren't listed in plugins.txt at all.
+    masters = {p.lower() for p in active
+               if is_master_block(p, os.path.join(game_data_dir, p))
+               and not is_vanilla_master(p)}
+    lo_path, pl_path = write_load_order(localappdata_dir, full, active, enabled,
+                                        backup=backup, strict=strict,
+                                        force_enable=masters)
+    # Count what's actually activated (strict drops unlisted plugins, keeps masters).
+    active_count = sum(1 for p in active
+                       if p.lower() in masters or enabled.get(p.lower(), not strict))
+    return lo_path, pl_path, active_count

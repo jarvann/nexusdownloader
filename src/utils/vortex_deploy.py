@@ -1,0 +1,948 @@
+"""
+Vortex deployment writer.
+
+After mods are staged, Vortex "deploys" them by hard-linking each staged file into
+the game's Data folder and recording a manifest (``vortex.deployment.json``) so it
+knows exactly what it placed (and can purge/redeploy later). This module
+reproduces that step so a collection we staged shows up in-game *without* the user
+clicking Deploy, and Vortex still recognises the deployment as its own.
+
+Layers (mirrors the rest of the sync code):
+
+* :func:`resolve_deployment` -- **pure**. Given staged files in ascending priority
+  order it picks the winning source per relative path (last wins, like Vortex's
+  hardlink deploy order) and returns the manifest entries + the link plan.
+* :func:`build_manifest` -- **pure**. Wraps entries in the exact manifest shape
+  Vortex 2.0.x writes (verified against a live ``vortex.deployment.json``).
+* :func:`deploy` -- **I/O**. Walks staging, hard-links winners into the target,
+  and writes the manifest atomically.
+* :func:`mark_deployed_in_db` -- **I/O**. Bumps ``deploymentCounter`` and clears
+  ``needToDeploy`` in state.v2 so Vortex sees the deployment as current.
+
+The manifest's ``instance`` must match the live Vortex instance id; it is read
+from an existing manifest, else the ``__vortex_staging_folder`` marker.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import stat
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+from utils.vortex_schema import GAME_ID
+
+MANIFEST_NAME = "vortex.deployment.json"
+STAGING_MARKER = "__vortex_staging_folder"
+DEPLOY_METHOD = "hardlink_activator"
+MANIFEST_VERSION = 1
+# Vortex drops this marker in every directory it creates during deploy, and on
+# purge only removes empty dirs that contain it (so it never deletes a dir the
+# user/game owns). We mirror that so a Vortex-side purge cleans our dirs too.
+MANAGED_TAG = "__folder_managed_by_vortex"
+# The exact text Vortex writes into the marker (LinkingDeployment.ts onDirCreated),
+# so a deployed folder is byte-identical to one Vortex produced.
+MANAGED_TAG_CONTENT = ("This directory was created by Vortex deployment and will "
+                       "be removed during purging if it's empty")
+
+# Files Vortex NEVER hard-links into the game folder -- its DEPLOY_BLACKLIST
+# (mod_management/constants.ts), applied at DEPLOY time (LinkingDeployment.activate),
+# NOT at install. So these stay in staging (a faithful copy) but never leak into
+# the game Data folder. Vortex matches them case-insensitively with "**/x" globs,
+# which reduce to: a set of basenames, and a set of directory segments (any file
+# under such a dir). meta.ini is here because MO2-packaged mods ship one (Vortex
+# never authors it); .git*/hg are VCS junk; _macosx/__MACOSX are mac archive junk.
+_DEPLOY_BLACKLIST_NAMES = frozenset({
+    "meta.ini", ".gitignore", ".hgignore", ".gitattributes",
+    "vortex_override_instructions.json",
+})
+_DEPLOY_BLACKLIST_DIRS = frozenset({".git", "_macosx", "__macosx"})
+
+
+def is_deploy_blacklisted(rel_path: str) -> bool:
+    """True if Vortex would skip ``rel_path`` when linking staging -> game folder
+    (its DEPLOY_BLACKLIST). ``rel_path`` is mod-relative, any separator style."""
+    segs = rel_path.replace("\\", "/").lower().strip("/").split("/")
+    if not segs or not segs[-1]:
+        return False
+    if segs[-1] in _DEPLOY_BLACKLIST_NAMES:
+        return True
+    return any(seg in _DEPLOY_BLACKLIST_DIRS for seg in segs[:-1])
+
+
+def _to_backslash(rel: str) -> str:
+    """Manifest paths use Windows separators regardless of the host OS."""
+    return rel.replace("/", "\\")
+
+
+# --------------------------------------------------------------------------- #
+# Pure planning
+# --------------------------------------------------------------------------- #
+def resolve_deployment(
+    staged: Iterable[Tuple[str, str, int]]
+) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+    """Resolve file conflicts and produce manifest entries + a link plan.
+
+    Args:
+        staged: ``(source_folder, rel_path, mtime_ms)`` tuples in **ascending
+            priority** -- later entries override earlier ones on a path collision
+            (case-insensitive, matching Vortex/Windows semantics).
+
+    Returns:
+        ``(entries, links)`` where ``entries`` are manifest dicts
+        ``{relPath, source, target, time}`` (sorted for determinism) and ``links``
+        is the winning ``(source_folder, rel_path)`` list to hard-link.
+    """
+    winners: Dict[str, Tuple[str, str, int]] = {}
+    for folder, rel, mtime in staged:
+        # Vortex applies its DEPLOY_BLACKLIST here (staging -> game link step):
+        # blacklisted files stay in staging but are never linked into the game.
+        if is_deploy_blacklisted(rel):
+            continue
+        nrel = _to_backslash(rel)
+        winners[nrel.lower()] = (folder, nrel, mtime)
+
+    entries: List[Dict[str, Any]] = []
+    links: List[Tuple[str, str]] = []
+    for folder, nrel, mtime in winners.values():
+        entries.append({"relPath": nrel, "source": folder, "target": "", "time": mtime})
+        links.append((folder, nrel))
+    entries.sort(key=lambda e: e["relPath"].lower())
+    links.sort(key=lambda fl: fl[1].lower())
+    return entries, links
+
+
+_WSL_MOUNT_RE = re.compile(r"^/mnt/([a-zA-Z])(/.*)?$")
+
+
+def to_windows_path(p: str) -> str:
+    """Translate a WSL mount path (``/mnt/<d>/...``) to Windows form (``<D>:\\...``).
+
+    Vortex is a Windows app and compares its configured staging/target folders
+    against the manifest's ``stagingPath``/``targetPath`` as plain strings, so the
+    manifest MUST hold Windows paths even when the deploy is run from WSL (where
+    these are ``/mnt/...`` mounts). Already-Windows or relative paths pass through
+    unchanged, so this is a no-op when run natively on Windows.
+    """
+    m = _WSL_MOUNT_RE.match(p)
+    if not m:
+        return p
+    drive = m.group(1).upper()
+    rest = (m.group(2) or "").replace("/", "\\")
+    return f"{drive}:{rest}"
+
+
+def build_manifest(instance_id: str, game_id: str, staging_path: str, target_path: str,
+                   entries: List[Dict[str, Any]], *, deployment_time_ms: int = 0) -> Dict[str, Any]:
+    """Wrap manifest entries in the exact shape Vortex 2.0.x writes.
+
+    ``stagingPath``/``targetPath`` are always normalized to Windows form (see
+    :func:`to_windows_path`) so a WSL-run deploy doesn't leave ``/mnt/...`` paths
+    that Vortex can't match against its config.
+    """
+    return {
+        "instance": instance_id,
+        "version": MANIFEST_VERSION,
+        "deploymentMethod": DEPLOY_METHOD,
+        "gameId": game_id,
+        "deploymentTime": deployment_time_ms,
+        "stagingPath": to_windows_path(staging_path),
+        "targetPath": to_windows_path(target_path),
+        "files": entries,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# I/O
+# --------------------------------------------------------------------------- #
+def read_instance_id(staging_dir: str, target_data_dir: str) -> Optional[str]:
+    """Find the live Vortex instance id (existing manifest first, then marker)."""
+    manifest = os.path.join(target_data_dir, MANIFEST_NAME)
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8") as fh:
+                inst = json.load(fh).get("instance")
+            if inst:
+                return inst
+        except (OSError, ValueError):
+            pass
+    marker = os.path.join(staging_dir, STAGING_MARKER)
+    if os.path.isfile(marker):
+        try:
+            with open(marker, "r", encoding="utf-8") as fh:
+                return json.load(fh).get("instance")
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def write_staging_tag(staging_dir: str, instance_id: str, game_id: str = GAME_ID) -> None:
+    """Write Vortex's ``__vortex_staging_folder`` marker into the staging root.
+
+    Vortex creates this to mark a folder as its own; staging we build ourselves
+    lacks it, so Vortex warns "Mod Staging Folder invalid" on launch. The format
+    mirrors ``writeStagingTag`` in Vortex's stagingDirectory.ts exactly:
+    ``{"instance": <app.instanceId>, "game": <gameId>}``. Skip silently if we
+    don't have an instance id (writing a bad one is worse than no marker)."""
+    if not instance_id or not os.path.isdir(staging_dir):
+        return
+    marker = os.path.join(staging_dir, STAGING_MARKER)
+    try:
+        with open(marker, "w", encoding="utf-8") as fh:
+            json.dump({"instance": instance_id, "game": game_id}, fh)
+    except OSError:
+        pass
+
+
+def _hardlink(src: str, dst: str) -> None:
+    """Hard-link ``src`` to ``dst`` (replacing any existing target).
+
+    Falls back to a copy when a hard link isn't possible (e.g. the staging and
+    game folders live on different volumes).
+    """
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    # If dst is already the SAME physical file (a hard link laid down by a prior
+    # deploy), there's nothing to do -- and trying to copy a file onto itself
+    # raises shutil.SameFileError. This is the common case on a re-deploy.
+    try:
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            return
+    except OSError:
+        pass
+    if os.path.lexists(dst):
+        _backup_or_remove(dst)
+    try:
+        os.link(src, dst)
+    except OSError:
+        try:
+            shutil.copy2(src, dst)
+        except shutil.SameFileError:
+            pass        # already the same content/inode; leave it
+        except PermissionError:
+            # dst still there and read-only -> clear the attribute and overwrite.
+            _force_remove(dst)
+            shutil.copy2(src, dst)
+
+
+BACKUP_SUFFIX = ".vortex_backup"
+
+
+def _backup_or_remove(dst: str) -> None:
+    """Make room at ``dst`` for a link. A *real* file (a standalone vanilla/loose
+    game file, nlink==1) is renamed to ``<dst>.vortex_backup`` so a later purge can
+    restore it -- matching Vortex's deployFile. A prior deploy's hardlink (nlink>1)
+    is just removed. An existing backup is never clobbered."""
+    bak = dst + BACKUP_SUFFIX
+    try:
+        st = os.lstat(dst)
+        is_real_file = stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+    except OSError:
+        is_real_file = False
+    if is_real_file and not os.path.lexists(bak):
+        try:
+            os.replace(dst, bak)
+            return
+        except OSError:
+            pass
+    _force_remove(dst)
+
+
+def _restore_backup(target: str) -> bool:
+    """If ``<target>.vortex_backup`` exists, move it back into place. Returns True
+    if a backup was restored. Called on purge so vanilla files come back."""
+    bak = target + BACKUP_SUFFIX
+    if os.path.lexists(bak):
+        try:
+            os.replace(bak, target)
+            return True
+        except OSError:
+            pass
+    return False
+
+
+def _force_remove(path: str) -> None:
+    """Remove ``path``, clearing a read-only attribute first if needed.
+
+    Steam ships some Data files read-only and prior deploys can leave links
+    read-only; on Windows ``os.remove`` then raises ``PermissionError`` (Errno
+    13). Clearing the write bit and retrying lets a re-deploy replace them
+    instead of aborting the whole run on one file."""
+    try:
+        os.remove(path)
+        return
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        pass
+    except OSError:
+        return
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _walk_one(staging_dir: str, folder: str) -> List[Tuple[str, str, int]]:
+    """Collect ``(folder, rel_path, mtime_ms)`` for every file under one folder."""
+    out: List[Tuple[str, str, int]] = []
+    root = os.path.join(staging_dir, folder)
+    if not os.path.isdir(root):
+        return out
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, root)
+            try:
+                mtime_ms = int(os.path.getmtime(full) * 1000)
+            except OSError:
+                mtime_ms = 0
+            out.append((folder, rel, mtime_ms))
+    return out
+
+
+def _walk_staged(staging_dir: str, folders: Iterable[str],
+                 workers: int = 1) -> List[Tuple[str, str, int]]:
+    """Collect ``(folder, rel_path, mtime_ms)`` for every file under each folder.
+
+    The per-folder walk is latency-bound over network/9p mounts, so ``workers > 1``
+    fans the folders out across a thread pool (the os calls release the GIL). Order
+    is preserved -- results come back in the input ``folders`` order, which
+    :func:`resolve_deployment` relies on for conflict-winner priority.
+    """
+    folders = list(folders)
+    if workers and workers > 1 and len(folders) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            per_folder = list(ex.map(lambda f: _walk_one(staging_dir, f), folders))
+        return [t for sub in per_folder for t in sub]
+    return [t for folder in folders for t in _walk_one(staging_dir, folder)]
+
+
+MSGPACK_BACKUP = "vortex.deployment.msgpack"
+
+
+def _atomic_write(path: str, text: str) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def save_manifest(staging_dir: str, target_data_dir: str,
+                  manifest: Dict[str, Any],
+                  manifest_name: str = MANIFEST_NAME) -> str:
+    """Write the manifest to BOTH locations Vortex reads (activationStore):
+
+    * primary ``vortex.deployment.json`` in the game/Data folder, and
+    * the staging-folder copy Vortex falls back to (``loadActivation`` reads
+      ``<staging>/vortex.deployment.json`` before the binary backup).
+
+    A stale ``vortex.deployment.msgpack`` left by a real Vortex deploy is removed
+    so Vortex can't fall back to outdated binary state (we can't write msgpack, but
+    two consistent JSON copies are enough redundancy). Returns the primary path.
+    """
+    data = json.dumps(manifest, indent=2)
+    primary = os.path.join(target_data_dir, manifest_name)
+    _atomic_write(primary, data)
+    if staging_dir and os.path.isdir(staging_dir):
+        try:
+            _atomic_write(os.path.join(staging_dir, manifest_name), data)
+            stale = os.path.join(staging_dir, MSGPACK_BACKUP)
+            if os.path.lexists(stale):
+                os.remove(stale)
+        except OSError:
+            pass
+    return primary
+
+
+def _load_manifest(target_data_dir: str, manifest_name: str = MANIFEST_NAME,
+                   staging_dir: str = "") -> Dict[str, Any]:
+    """Load the full manifest dict, preferring the game-folder copy and falling
+    back to the staging copy (so a Vortex-purged Data state, where Vortex removed
+    its own manifest, still exposes the staging copy). ``{}`` if neither exists."""
+    for d in (target_data_dir, staging_dir):
+        if not d:
+            continue
+        path = os.path.join(d, manifest_name)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                continue
+    return {}
+
+
+def read_manifest_entries(target_data_dir: str,
+                          manifest_name: str = MANIFEST_NAME,
+                          staging_dir: str = "") -> Dict[str, Dict[str, Any]]:
+    """Read an existing manifest's file entries, keyed by lower-cased relPath.
+
+    Returns ``{}`` when no (or an unreadable) manifest exists. Prefers the
+    game-folder copy, falling back to the staging copy. Used by the incremental
+    deploy to keep every already-tracked file instead of rebuilding from a full
+    staging walk, and by purge to know what to un-deploy.
+    """
+    data = _load_manifest(target_data_dir, manifest_name, staging_dir)
+    out: Dict[str, Dict[str, Any]] = {}
+    for e in data.get("files", []):
+        rel = e.get("relPath")
+        if rel:
+            out[rel.lower()] = e
+    return out
+
+
+@dataclass
+class DeployResult:
+    files: int
+    manifest_path: str
+    instance_id: str
+    linked: int
+    skipped_conflicts: int = 0   # changed-folder files left to an existing higher
+                                 # -priority winner (incremental mode only)
+    removed_stale: int = 0       # files unlinked because they're no longer deployed
+
+
+def deploy(staging_dir: str, target_data_dir: str, enabled_folders: Iterable[str],
+           game_id: str = GAME_ID, *, instance_id: Optional[str] = None,
+           link: bool = True, deployment_time_ms: int = 0,
+           workers: int = 1, only_folders: Optional[Iterable[str]] = None,
+           manifest_name: str = MANIFEST_NAME,
+           progress: Optional[Callable[[int, int, str], None]] = None,
+           activity: Optional[Callable[[int, str], None]] = None) -> DeployResult:
+    """Hard-link staged files into the game folder and write the deployment manifest.
+
+    ``enabled_folders`` must be in **load order** (ascending priority) so that, on
+    a file conflict, the higher-priority mod wins -- the manifest always matches
+    whatever ends up on disk, so Vortex stays consistent either way.
+
+    ``only_folders`` switches to **incremental** mode: only those folders are
+    walked + linked, and their files are MERGED into the existing manifest (every
+    other already-tracked file is preserved). This turns a one-mod reinstall into
+    a delta instead of a full 684k-file redeploy. A changed file wins unless a
+    DIFFERENT folder already owns that path in the manifest (a real cross-mod
+    conflict) -- those are left to the existing winner and counted, since resolving
+    them correctly needs the full load order (run a full deploy for that).
+
+    ``workers > 1`` parallelizes the (latency-bound) file walk and hard-linking
+    across a thread pool. Conflict resolution still happens centrally on the
+    ordered walk, so each link target is unique -- the links can run in any order.
+
+    ``progress(done, total, rel_path)`` is called (throttled, thread-safe) as files
+    are hard-linked, so a GUI can show live deploy progress.
+    """
+    instance_id = instance_id or read_instance_id(staging_dir, target_data_dir)
+    if not instance_id:
+        raise RuntimeError(
+            "Could not determine the Vortex instance id (no deployment manifest "
+            f"or {STAGING_MARKER} marker found). Open Vortex for this game once.")
+
+    # Hard links need staging + target on the SAME volume (Vortex gates deploy on
+    # this). Cross-volume falls back to copies (nlink==1) -- slower, and Vortex
+    # won't recognize them as its links. Warn once up front rather than silently.
+    if link:
+        try:
+            if os.path.isdir(target_data_dir) and \
+                    os.stat(staging_dir).st_dev != os.stat(target_data_dir).st_dev:
+                print(f"WARNING: staging and {target_data_dir} are on different "
+                      f"volumes; files will be COPIED, not hard-linked.")
+        except OSError:
+            pass
+
+    skipped_conflicts = 0
+    # Files in the LAST deployment that are gone now -- Vortex's finalize() unlinks
+    # these (a removed mod, or a file dropped from a mod, must leave the game folder
+    # instead of orphaning a hardlink). {relPath_lower: entry}.
+    stale: Dict[str, Dict[str, Any]] = {}
+    if only_folders is not None:
+        # Incremental: walk only the changed folders, merge into the live manifest.
+        changed = set(only_folders)
+        staged = _walk_staged(staging_dir, list(changed), workers=workers)
+        new_entries, _ = resolve_deployment(staged)
+        existing = read_manifest_entries(target_data_dir, manifest_name)
+        new_keys = {e["relPath"].lower() for e in new_entries}
+        # A path the changed folder used to own but no longer provides -> stale.
+        for k, v in existing.items():
+            if v.get("source") in changed and k not in new_keys:
+                stale[k] = v
+        merged = {k: v for k, v in existing.items() if k not in stale}
+        links = []
+        for e in new_entries:
+            key = e["relPath"].lower()
+            cur = merged.get(key)
+            if cur is None or cur.get("source") == e["source"]:
+                merged[key] = e
+                links.append((e["source"], e["relPath"]))
+            else:
+                skipped_conflicts += 1
+        entries = sorted(merged.values(), key=lambda x: x["relPath"].lower())
+        links.sort(key=lambda fl: fl[1].lower())
+    else:
+        folders = list(enabled_folders)
+        prev = read_manifest_entries(target_data_dir, manifest_name)
+        staged = _walk_staged(staging_dir, folders, workers=workers)
+        entries, links = resolve_deployment(staged)
+        new_keys = {e["relPath"].lower() for e in entries}
+        stale = {k: v for k, v in prev.items() if k not in new_keys}
+
+    # Vortex tags only dirs it CREATES during deploy. Snapshot which needed dirs
+    # already exist BEFORE we link; the rest are ours to tag afterward.
+    needed_dirs = set()
+    for e in entries:
+        d = os.path.dirname(e["relPath"].replace("\\", os.sep))
+        while d:
+            needed_dirs.add(d)
+            d = os.path.dirname(d)
+    pre_existing_dirs = {d for d in needed_dirs
+                         if os.path.isdir(os.path.join(target_data_dir, d))}
+
+    linked = 0
+    if link:
+        total = len(links)
+        from threading import Lock, get_ident
+        lock, done = Lock(), [0]
+
+        failures: List[Tuple[str, str]] = []
+
+        def _link_one(fl):
+            folder, nrel = fl
+            sub = nrel.replace("\\", os.sep)
+            try:
+                _hardlink(os.path.join(staging_dir, folder, sub),
+                          os.path.join(target_data_dir, sub))
+            except OSError as ex:
+                # One unrecoverable file (locked by a running game, ACL-denied)
+                # must not abort the whole deploy. Record it and move on.
+                with lock:
+                    failures.append((nrel, str(ex)))
+            if progress is not None or activity is not None:
+                with lock:
+                    done[0] += 1
+                    tick = done[0] % 200 == 0 or done[0] == total
+                if tick:
+                    if progress is not None:
+                        progress(done[0], total, nrel)
+                    if activity is not None:
+                        activity(get_ident(), nrel)
+
+        if workers and workers > 1 and len(links) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_link_one, links))
+        else:
+            for fl in links:
+                _link_one(fl)
+        linked = total - len(failures)
+        if failures:
+            shown = "; ".join(f"{r} ({e})" for r, e in failures[:5])
+            print(f"WARNING: {len(failures)} of {total} files could not be linked "
+                  f"(first few: {shown})")
+
+    if link:
+        _tag_managed_dirs(target_data_dir, needed_dirs - pre_existing_dirs)
+
+    # Unlink files dropped since the last deployment (only when actually linking).
+    # Safe-remove: keep a file the user replaced by hand (no longer our hardlink).
+    removed = 0
+    if link and stale:
+        for k, e in stale.items():
+            sub = e["relPath"].replace("\\", os.sep)
+            target = os.path.join(target_data_dir, sub)
+            if not os.path.lexists(target):
+                continue
+            src = os.path.join(staging_dir, e.get("source", ""), sub)
+            try:
+                if os.path.exists(src) and not os.path.samefile(src, target):
+                    continue   # user-modified -> leave it
+            except OSError:
+                pass
+            _force_remove(target)
+            _restore_backup(target)   # bring back any vanilla file we shadowed
+            removed += 1
+
+    manifest = build_manifest(instance_id, game_id, staging_dir, target_data_dir,
+                              entries, deployment_time_ms=deployment_time_ms)
+    manifest_path = save_manifest(staging_dir, target_data_dir, manifest, manifest_name)
+
+    return DeployResult(len(entries), manifest_path, instance_id, linked,
+                        skipped_conflicts=skipped_conflicts, removed_stale=removed)
+
+
+def mark_deployed_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "node"):
+    """Bump ``deploymentCounter`` and clear ``needToDeploy`` so Vortex sees the
+    deployment as current (requires Vortex closed -- guarded by ``vortex_db``)."""
+    from utils import vortex_db
+
+    counter_key = f"persistent###deployment###deploymentCounter###{game_id}"
+    need_key = f"persistent###deployment###needToDeploy###{game_id}"
+    current = vortex_db.read_prefix(db_path, counter_key, node=node).get(counter_key, 0)
+    if not isinstance(current, int):
+        current = 0
+    records = {
+        counter_key: json.dumps(current + 1),
+        need_key: json.dumps(False),
+    }
+    return vortex_db.write_records(db_path, records, backup=True, node=node)
+
+
+def mark_needs_deploy_in_db(db_path: str, game_id: str = GAME_ID, *, node: str = "node"):
+    """Set ``needToDeploy`` so Vortex knows the Data folder no longer matches
+    staging (used after a purge). Requires Vortex closed."""
+    from utils import vortex_db
+    need_key = f"persistent###deployment###needToDeploy###{game_id}"
+    return vortex_db.write_records(db_path, {need_key: json.dumps(True)},
+                                   backup=True, node=node)
+
+
+@dataclass
+class PurgeResult:
+    removed: int          # deployed files unlinked from the game folder
+    skipped: int          # files left in place (not our hardlink, or missing source)
+    manifest_path: str
+    remaining: int        # manifest entries left after the purge
+
+
+def purge(staging_dir: str, target_data_dir: str, game_id: str = GAME_ID, *,
+          only_folders: Optional[Iterable[str]] = None, force: bool = False,
+          prune_empty_dirs: bool = True, workers: int = 1,
+          manifest_name: str = MANIFEST_NAME,
+          progress: Optional[Callable[[int, int, str], None]] = None) -> PurgeResult:
+    """Un-deploy: remove the files this deployment placed, per ``vortex.deployment.json``.
+
+    The inverse of :func:`deploy`. Reads the manifest and deletes each recorded
+    target from the game folder, then rewrites the manifest without the purged
+    entries (empty when purging everything).
+
+    SAFE BY DEFAULT: a target is removed only when it's still *our* hardlink -- the
+    same inode as the staging source. A file you replaced by hand, or a vanilla
+    file the manifest happens to name, is left alone (counted in ``skipped``).
+    ``force=True`` removes manifest targets regardless (Vortex's own behavior).
+
+    ``only_folders`` purges just those mods' files (partial un-deploy); otherwise
+    everything in the manifest is purged. ``workers > 1`` removes files across a
+    thread pool (unlink is latency-bound, so this scales well over many files).
+    """
+    entries = read_manifest_entries(target_data_dir, manifest_name, staging_dir)
+    only = {f for f in only_folders} if only_folders is not None else None
+
+    targets = [e for e in entries.values()
+               if only is None or e.get("source") in only]
+    total = len(targets)
+
+    from threading import Lock
+    lock = Lock()
+    counters = {"removed": 0, "skipped": 0, "done": 0}
+    purged_keys = set()
+
+    def _purge_one(e):
+        rel = e["relPath"]
+        sub = rel.replace("\\", os.sep)
+        target = os.path.join(target_data_dir, sub)
+        src = os.path.join(staging_dir, e.get("source", ""), sub)
+        status = "gone"
+        if os.path.lexists(target):
+            if not force and os.path.exists(src):
+                try:
+                    same = os.path.samefile(src, target)
+                except OSError:
+                    same = False
+                if not same:
+                    status = "skipped"          # user replaced it -> leave it
+            if status != "skipped":
+                _force_remove(target)
+                _restore_backup(target)
+                status = "removed"
+        with lock:
+            if status == "skipped":
+                counters["skipped"] += 1
+            else:
+                purged_keys.add(rel.lower())
+                if status == "removed":
+                    counters["removed"] += 1
+            counters["done"] += 1
+            if progress is not None and (counters["done"] % 200 == 0 or counters["done"] == total):
+                progress(counters["done"], total, rel)
+
+    if workers and workers > 1 and total > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_purge_one, targets))
+    else:
+        for e in targets:
+            _purge_one(e)
+    removed, skipped = counters["removed"], counters["skipped"]
+
+    remaining = {k: v for k, v in entries.items() if k not in purged_keys}
+    if prune_empty_dirs:
+        _prune_empty_dirs(target_data_dir)
+
+    # Rewrite the manifest in BOTH the game-folder and staging copies with what's
+    # left (empty when purging everything), preserving its header fields, so Vortex
+    # reads consistent state from either side. Source the header from whichever copy
+    # still exists -- if Vortex already purged and removed its Data manifest, the
+    # staging copy keeps us from leaving a stale tracking file behind.
+    manifest = _load_manifest(target_data_dir, manifest_name, staging_dir)
+    manifest_path = os.path.join(target_data_dir, manifest_name)
+    if manifest:
+        manifest["files"] = sorted(remaining.values(), key=lambda x: x["relPath"].lower())
+        manifest_path = save_manifest(staging_dir, target_data_dir, manifest, manifest_name)
+
+    return PurgeResult(removed, skipped, manifest_path, len(remaining))
+
+
+def purge_by_inode(staging_dir: str, target_data_dir: str,
+                   progress: Optional[Callable[[int, int, str], None]] = None) -> int:
+    """Vortex-style deep purge (mirrors hardlink_activator ``purgeLinks``).
+
+    Independent of the manifest: collect the inodes of every hard-linked file under
+    staging, then walk the game folder and remove any file that shares one of those
+    inodes (i.e. is a hard link INTO staging). Catches orphaned links a stale
+    manifest no longer lists -- e.g. files left behind by an older deploy. Hardlinks
+    only exist within one volume, so an inode match here is unambiguous.
+
+    Returns the number of files removed. Requires st_ino/st_nlink (native Windows /
+    Linux; not 9p mounts).
+    """
+    inodes = set()
+    for dirpath, _dirs, files in os.walk(staging_dir):
+        for fn in files:
+            try:
+                st = os.stat(os.path.join(dirpath, fn))
+                if st.st_nlink > 1:
+                    inodes.add((st.st_dev, st.st_ino))
+            except OSError:
+                pass
+    if not inodes:
+        return 0
+    removed = 0
+    for dirpath, _dirs, files in os.walk(target_data_dir):
+        for fn in files:
+            full = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if st.st_nlink > 1 and (st.st_dev, st.st_ino) in inodes:
+                _force_remove(full)
+                _restore_backup(full)
+                removed += 1
+                if progress is not None and removed % 1000 == 0:
+                    progress(removed, len(inodes), fn)
+    return removed
+
+
+def _tag_managed_dirs(target_dir: str, dir_relpaths: Iterable[str]) -> None:
+    """Drop the ``__folder_managed_by_vortex`` marker into each given directory
+    (relative to ``target_dir``). Matches Vortex, which tags only the dirs it
+    CREATES during deploy -- so a later purge removes exactly those and never a dir
+    the user/game owned. Marker content mirrors Vortex's text byte-for-byte."""
+    for d in dir_relpaths:
+        tag = os.path.join(target_dir, d.replace("\\", os.sep), MANAGED_TAG)
+        try:
+            if os.path.isdir(os.path.dirname(tag)) and not os.path.lexists(tag):
+                with open(tag, "w", encoding="utf-8") as fh:
+                    fh.write(MANAGED_TAG_CONTENT)
+        except OSError:
+            pass
+
+
+def _prune_empty_dirs(root: str) -> None:
+    """Remove directories left behind by a purge (bottom-up). A dir holding only
+    our managed-tag marker counts as empty: remove the tag, then the dir."""
+    for dirpath, _dirs, _files in os.walk(root, topdown=False):
+        if os.path.abspath(dirpath) == os.path.abspath(root):
+            continue
+        try:
+            contents = os.listdir(dirpath)
+            if contents == [MANAGED_TAG]:
+                os.remove(os.path.join(dirpath, MANAGED_TAG))
+                contents = []
+            if not contents:
+                os.rmdir(dirpath)
+        except OSError:
+            pass
+
+
+def purge_collection(db_path: str, staging_dir: str, target_data_dir: str,
+                     game_id: str = GAME_ID, *, node: str = "node",
+                     only_folders: Optional[Iterable[str]] = None, force: bool = False,
+                     workers: int = 1,
+                     progress: Optional[Callable[[int, int, str], None]] = None
+                     ) -> Tuple[PurgeResult, Any]:
+    """High-level purge: un-deploy files, then flag ``needToDeploy`` in the DB so
+    Vortex knows the Data folder no longer matches staging (requires Vortex closed)."""
+    result = purge(staging_dir, target_data_dir, game_id,
+                   only_folders=only_folders, force=force, workers=workers,
+                   progress=progress)
+    db_write = mark_needs_deploy_in_db(db_path, game_id, node=node)
+    return result, db_write
+
+
+def order_folders_for_deploy(staging_dir: str, collection: Optional[Dict[str, Any]],
+                             folder_by_modid: Optional[Dict[str, list]] = None,
+                             db_path: Optional[str] = None,
+                             game_id: str = GAME_ID,
+                             node: Optional[str] = None) -> list:
+    """Resolve the staging folders into deploy order.
+
+    Order of preference:
+      1. **Vortex's effective rules** from ``state.v2`` (``db_path`` given, DB
+         readable) -- the collection rules Vortex imported PLUS any user overrides
+         / conflict resolutions. This is what a real Vortex deploy would use.
+      2. The collection's own ``modRules`` (offline fallback / DB had no rules).
+      3. Plain sorted folder order (no collection at all).
+
+    The returned order is ascending priority (later folders win file conflicts),
+    matching Vortex's own ``sortMods`` topsort direction.
+    """
+    folders = sorted(d for d in os.listdir(staging_dir)
+                     if os.path.isdir(os.path.join(staging_dir, d)))
+    if not folders:
+        return folders
+
+    from utils import vortex_loadorder as lo
+    from utils.vortex_sync import index_by_modid
+    if folder_by_modid is None:
+        folder_by_modid = index_by_modid(folders)
+    coll_resolve = (lo.build_mod_resolver(collection.get("mods", []), folder_by_modid)
+                    if collection else None)
+
+    # 1) Vortex's effective rules (collection import + user overrides). Best-effort:
+    # if the DB is locked / Node is missing, silently fall through to the collection.
+    if db_path:
+        try:
+            from utils import vortex_db
+            rules_by_folder = vortex_db.read_mod_rules(db_path, game_id, node=node)
+            ordered, n_edges = lo.order_mods_from_db(folders, rules_by_folder, coll_resolve)
+            if n_edges:
+                return ordered
+        except Exception:
+            pass
+
+    # 2) collection.json modRules.
+    if collection:
+        return lo.order_mods(folders, collection.get("modRules", []), coll_resolve)
+
+    # 3) plain sorted order.
+    return folders
+
+
+def _aggregate(results: Dict[str, DeployResult], primary_path: str) -> DeployResult:
+    """Collapse per-modtype DeployResults into one (for callers expecting a single
+    result). Counts sum; manifest_path is the default type's."""
+    files = sum(r.files for r in results.values())
+    linked = sum(r.linked for r in results.values())
+    stale = sum(r.removed_stale for r in results.values())
+    conflicts = sum(r.skipped_conflicts for r in results.values())
+    inst = next((r.instance_id for r in results.values()), "")
+    path = results[""].manifest_path if "" in results else primary_path
+    return DeployResult(files, path, inst, linked,
+                        skipped_conflicts=conflicts, removed_stale=stale)
+
+
+def deploy_collection(db_path: str, staging_dir: str, target_data_dir: str,
+                      enabled_folders: Optional[Iterable[str]] = None,
+                      game_id: str = GAME_ID, *, collection: Optional[Dict[str, Any]] = None,
+                      game_root: Optional[str] = None,
+                      node: str = "node", deployment_time_ms: int = 0,
+                      workers: int = 1, only_folders: Optional[Iterable[str]] = None,
+                      progress: Optional[Callable[[int, int, str], None]] = None,
+                      activity: Optional[Callable[[int, str], None]] = None
+                      ) -> Tuple[DeployResult, Any]:
+    """High-level: hard-link + write manifest(s), then mark the deployment in the DB.
+
+    Deploy order (which decides file-conflict winners) comes from the collection's
+    modRules when ``collection`` is supplied; otherwise from an explicit
+    ``enabled_folders`` list, else sorted folder order.
+
+    Modtype-aware: each mod is routed to its type's target (default -> Data; skse/
+    dinput/engine-injector -> the game root). ``game_root`` defaults to the parent
+    of ``target_data_dir`` (``<game_root>/Data`` is the Data folder). An all-default
+    collection behaves exactly like the old single-Data deploy.
+
+    ``only_folders`` runs an incremental deploy -- just those folders, merged into
+    the live per-type manifests.
+    """
+    from utils import deploy_engine
+    if enabled_folders is None:
+        enabled_folders = order_folders_for_deploy(
+            staging_dir, collection, db_path=db_path, game_id=game_id, node=node)
+    if game_root is None:
+        game_root = os.path.dirname(os.path.normpath(target_data_dir))
+    # Use Vortex's authoritative app.instanceId for the manifest so Vortex accepts
+    # our deployment as its own instead of purging + re-linking everything.
+    from utils import vortex_db
+    instance_id = None
+    try:
+        instance_id = vortex_db.read_app_instance_id(db_path, node=node)
+    except Exception:
+        instance_id = None
+    # Stamp the staging marker so Vortex stops warning "Mod Staging Folder
+    # invalid" (our staging is built by us, not Vortex, so it lacks the tag).
+    write_staging_tag(staging_dir, instance_id, game_id)
+    results = deploy_engine.deploy_all(
+        staging_dir, target_data_dir, game_root, enabled_folders,
+        instance_id=instance_id, game_id=game_id,
+        deployment_time_ms=deployment_time_ms, workers=workers,
+        only_folders=only_folders, progress=progress, activity=activity)
+    result = _aggregate(results, os.path.join(target_data_dir, MANIFEST_NAME))
+    db_write = mark_deployed_in_db(db_path, game_id, node=node)
+    return result, db_write
+
+
+@dataclass
+class FinalizeResult:
+    deploy: DeployResult
+    loadorder_path: str
+    plugins_path: str
+    active_plugins: int
+    esl_flagged: int = 0          # plugins auto-flagged light (ESL) this run
+
+
+def finalize_collection(db_path: str, collection: Dict[str, Any], staging_dir: str,
+                        game_data_dir: str, localappdata_dir: str,
+                        game_id: str = GAME_ID, *, node: str = "node",
+                        deployment_time_ms: int = 0, backup: bool = True,
+                        workers: int = 1, eslify: bool = True,
+                        only_folders: Optional[Iterable[str]] = None,
+                        progress: Optional[Callable[[int, int, str], None]] = None,
+                        activity: Optional[Callable[[int, str], None]] = None) -> FinalizeResult:
+    """Full post-install pipeline: order mods -> deploy -> sort plugins.
+
+    Resolves deploy order from ``collection.modRules``, hard-links + writes the
+    deployment manifest, marks the DB deployed, then writes loadorder.txt /
+    plugins.txt from ``collection.pluginRules`` (masters-first; existing files
+    backed up). ``localappdata_dir`` is the game's ``%LOCALAPPDATA%/<Game>`` dir.
+
+    ``only_folders`` runs an incremental deploy (delta-merge into the live
+    manifest) instead of a full redeploy -- for reinstalling a handful of mods.
+    ``workers > 1`` parallelizes the deploy's file walk + hard-linking.
+    """
+    from utils import vortex_loadorder as lo
+    from utils import esl_flagging as esl
+
+    result, _ = deploy_collection(db_path, staging_dir, game_data_dir, game_id=game_id,
+                                  collection=collection, node=node,
+                                  deployment_time_ms=deployment_time_ms, workers=workers,
+                                  only_folders=only_folders, progress=progress, activity=activity)
+
+    # Auto-flag eligible plugins as light (ESL) -- our equivalent of Vortex's
+    # "mark could-be-light as light". Without it the full-plugin count blows past
+    # Skyrim's 254 cap and the game won't launch. Runs before the sort so the
+    # load order reflects the newly-light masters.
+    esl_flagged = 0
+    if eslify:
+        enabled = lo.enabled_map(collection)
+        active_names = [n for n in lo.scan_plugins(game_data_dir)
+                        if n.lower() in enabled] if enabled else lo.scan_plugins(game_data_dir)
+        eres = esl.mark_eligible_as_light(game_data_dir, active_names,
+                                          workers=max(8, workers))
+        esl_flagged = eres.flagged
+
+    lo_path, pl_path, active = lo.sort_plugins(collection, game_data_dir,
+                                               localappdata_dir, backup=backup)
+    return FinalizeResult(result, lo_path, pl_path, active, esl_flagged=esl_flagged)

@@ -1,0 +1,134 @@
+"""Tests for the Vortex DB guard layer (lock/concurrency checks, guarded writes)."""
+import json
+import subprocess
+
+import pytest
+
+from utils import vortex_db as vdb
+
+
+def _completed(rc, out="", err=""):
+    return subprocess.CompletedProcess(args=[], returncode=rc, stdout=out, stderr=err)
+
+
+def test_probe_available(monkeypatch):
+    monkeypatch.setattr(vdb, "_run_bridge", lambda *a, **k: _completed(0, "AVAILABLE\n"))
+    assert vdb.probe("/db") is True
+
+
+def test_probe_locked(monkeypatch):
+    monkeypatch.setattr(vdb, "_run_bridge", lambda *a, **k: _completed(3, "LOCKED\n"))
+    assert vdb.probe("/db") is False
+
+
+def test_probe_handles_missing_node(monkeypatch):
+    def boom(*a, **k):
+        raise FileNotFoundError("node not found")
+    monkeypatch.setattr(vdb, "_run_bridge", boom)
+    assert vdb.probe("/db") is False
+
+
+def test_ensure_available_blocks_when_vortex_running(monkeypatch):
+    monkeypatch.setattr(vdb, "is_vortex_running", lambda: True)
+    with pytest.raises(vdb.VortexBusyError, match="running"):
+        vdb.ensure_available("/db")
+
+
+def test_ensure_available_blocks_when_locked(monkeypatch):
+    monkeypatch.setattr(vdb, "is_vortex_running", lambda: False)
+    monkeypatch.setattr(vdb, "probe", lambda *a, **k: False)
+    with pytest.raises(vdb.VortexBusyError, match="locked"):
+        vdb.ensure_available("/db")
+
+
+def test_ensure_available_passes_when_free(monkeypatch):
+    monkeypatch.setattr(vdb, "is_vortex_running", lambda: False)
+    monkeypatch.setattr(vdb, "probe", lambda *a, **k: True)
+    vdb.ensure_available("/db")  # should not raise
+
+
+def test_write_records_guards_and_writes(monkeypatch, tmp_path):
+    monkeypatch.setattr(vdb, "ensure_available", lambda *a, **k: None)
+    monkeypatch.setattr(vdb, "backup_db", lambda db: str(tmp_path / "bak"))
+    monkeypatch.setattr(vdb, "_run_bridge", lambda *a, **k: _completed(0, "2\n"))
+    res = vdb.write_records("/db", {"a": "1", "b": "2"})
+    assert res.keys_written == 2
+    assert res.backup_path.endswith("bak")
+
+
+def test_write_records_aborts_if_locked_midwrite(monkeypatch, tmp_path):
+    monkeypatch.setattr(vdb, "ensure_available", lambda *a, **k: None)
+    monkeypatch.setattr(vdb, "backup_db", lambda db: str(tmp_path / "bak"))
+    monkeypatch.setattr(vdb, "_run_bridge", lambda *a, **k: _completed(3, "", "LOCKED"))
+    with pytest.raises(vdb.VortexBusyError):
+        vdb.write_records("/db", {"a": "1"})
+
+
+def test_write_records_includes_delete_prefixes(monkeypatch, tmp_path):
+    monkeypatch.setattr(vdb, "ensure_available", lambda *a, **k: None)
+    monkeypatch.setattr(vdb, "backup_db", lambda db: str(tmp_path / "bak"))
+    captured = {}
+
+    def fake_bridge(cmd, db, arg=None, **k):
+        if cmd == "write":
+            with open(arg) as fh:
+                captured["batch"] = json.load(fh)
+        return _completed(0, "3\n")
+
+    monkeypatch.setattr(vdb, "_run_bridge", fake_bridge)
+    vdb.write_records("/db", {"a": "1"}, delete_prefixes=["p1", "p2"])
+    assert captured["batch"]["put"] == {"a": "1"}
+    assert captured["batch"]["delPrefixes"] == ["p1", "p2"]
+
+
+def test_read_prefix_decodes_json(monkeypatch):
+    payload = '{"persistent###x": "123", "persistent###y": "\\"hi\\""}'
+    monkeypatch.setattr(vdb, "_run_bridge", lambda *a, **k: _completed(0, payload))
+    out = vdb.read_prefix("/db", "persistent###")
+    assert out == {"persistent###x": 123, "persistent###y": "hi"}
+
+
+def test_is_vortex_running_without_psutil(monkeypatch):
+    monkeypatch.setattr(vdb, "psutil", None)
+    assert vdb.is_vortex_running() is False
+
+
+def test_find_state_db_picks_most_recently_used_mode(monkeypatch, tmp_path):
+    import time
+    appdata = tmp_path / "Roaming"
+    programdata = tmp_path / "ProgramData"
+    per_user = appdata / "Vortex" / "state.v2"
+    shared = programdata / "vortex" / "state.v2"
+    per_user.mkdir(parents=True)
+    shared.mkdir(parents=True)
+    (per_user / "000001.log").write_text("x")
+    time.sleep(0.02)
+    (shared / "000001.log").write_text("y")   # shared written more recently
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("PROGRAMDATA", str(programdata))
+    # HOME candidate won't exist -> ignored
+    assert vdb.find_state_db() == str(shared)
+
+    # now make per-user the most recent -> it should win
+    time.sleep(0.02)
+    (per_user / "000001.log").write_text("xx")
+    assert vdb.find_state_db() == str(per_user)
+
+
+def test_read_active_profile(monkeypatch):
+    monkeypatch.setattr(vdb, "read_prefix",
+                        lambda *a, **k: {"settings###profiles###activeProfileId": "PROF1"})
+    assert vdb.read_active_profile("/db") == "PROF1"
+
+
+def test_read_collection_identity(monkeypatch):
+    monkeypatch.setattr(vdb, "read_prefix", lambda *a, **k: {
+        "persistent###mods###skyrimse###Coll###attributes###collectionId": 26945,
+        "persistent###mods###skyrimse###Coll###attributes###collectionSlug": "gnfjwh",
+    })
+    assert vdb.read_collection_identity("/db") == (26945, "gnfjwh")
+
+
+def test_read_collection_identity_none_when_absent(monkeypatch):
+    monkeypatch.setattr(vdb, "read_prefix", lambda *a, **k: {})
+    assert vdb.read_collection_identity("/db") is None

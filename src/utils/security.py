@@ -7,11 +7,9 @@ import os
 import time
 import json
 import base64
-import hashlib
 import logging
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any
 from collections import deque
-from datetime import datetime, timedelta
 import re
 
 # Optional imports for enhanced security

@@ -11,8 +11,6 @@ from PySide6.QtWidgets import (
     QLineEdit, QPushButton, QSpinBox, QCheckBox, QComboBox, QGroupBox,
     QDialogButtonBox, QFileDialog, QMessageBox, QLabel
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
 from typing import Optional
 import logging
 
@@ -185,8 +183,29 @@ class SettingsDialog(QDialog):
         self.chunk_size.setRange(1024, 1048576)
         self.chunk_size.setSuffix(" bytes")
         performance_layout.addRow("Chunk Size:", self.chunk_size)
-        
+
         layout.addRow(performance_group)
+
+        # Installation scratch / temp directory override
+        temp_group = QGroupBox("Installation Temp Folder")
+        temp_layout = QFormLayout(temp_group)
+
+        temp_container = QHBoxLayout()
+        self.install_temp_dir_edit = QLineEdit()
+        self.install_temp_dir_edit.setPlaceholderText("(blank = system %TEMP%)")
+        temp_container.addWidget(self.install_temp_dir_edit)
+        temp_browse_button = QPushButton("Browse...")
+        temp_browse_button.clicked.connect(self._browse_install_temp_dir)
+        temp_container.addWidget(temp_browse_button)
+        temp_layout.addRow("Temp/Scratch Folder:", temp_container)
+
+        temp_hint = QLabel("Where archives are unpacked during install. Point this at "
+                           "a drive with plenty of free space if your %TEMP% is a "
+                           "small RAM disk.")
+        temp_hint.setWordWrap(True)
+        temp_layout.addRow(temp_hint)
+
+        layout.addRow(temp_group)
         
         # Download options
         options_group = QGroupBox("Download Options")
@@ -395,6 +414,7 @@ class SettingsDialog(QDialog):
             self.verify_checksums.setChecked(config.downloads.verify_checksums)
             self.resume_downloads.setChecked(config.downloads.resume_partial_downloads)
             self.cleanup_failed.setChecked(config.downloads.cleanup_failed_downloads)
+            self.install_temp_dir_edit.setText(config.downloads.install_temp_dir)
             
             # Load Vortex settings
             self.downloads_folder_edit.setText(config.vortex.downloads_folder_root)
@@ -463,7 +483,8 @@ class SettingsDialog(QDialog):
                     'chunk_size_bytes': self.chunk_size.value(),
                     'verify_checksums': self.verify_checksums.isChecked(),
                     'resume_partial_downloads': self.resume_downloads.isChecked(),
-                    'cleanup_failed_downloads': self.cleanup_failed.isChecked()
+                    'cleanup_failed_downloads': self.cleanup_failed.isChecked(),
+                    'install_temp_dir': self.install_temp_dir_edit.text().strip()
                 },
                 vortex={
                     'downloads_folder_root': self.downloads_folder_edit.text().strip(),
@@ -532,6 +553,12 @@ class SettingsDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "Select Downloads Folder")
         if folder:
             self.downloads_folder_edit.setText(folder)
+
+    def _browse_install_temp_dir(self):
+        """Browse for and select the installation temp/scratch folder."""
+        folder = QFileDialog.getExistingDirectory(self, "Select Installation Temp Folder")
+        if folder:
+            self.install_temp_dir_edit.setText(folder)
 
     def _browse_vortex_executable(self):
         """Browse for and select the Vortex executable."""
