@@ -324,14 +324,21 @@ class FomodInstaller:
                     error_message="Downloaded archive not found"
                 )
             
-            # Check if mod has installation choices
+            # Choose the installer the way Vortex does: a scripted FOMOD (an archive
+            # carrying fomod/ModuleConfig.xml) ALWAYS goes through the scripted
+            # installer -- with the collection's recorded choices when present, else
+            # with preset/required defaults. Only a genuinely non-scripted archive
+            # takes the simple path. (Routing a choice-less FOMOD to simple was
+            # burying option folders like "00 Core/" / "<ModName>/" in staging, so
+            # the plugin deployed to a Data subfolder Skyrim can't see.)
             choices = mod_data.get("choices", {})
-            if not choices or choices.get("type") != "fomod":
-                # Simple extraction without FOMOD
-                return self._install_simple(mod_name, archive_path, mod_data)
-            else:
-                # FOMOD installation with choices
+            if choices and choices.get("type") == "fomod":
                 return self._install_fomod(mod_name, archive_path, choices, mod_data)
+            if self._archive_has_fomod(archive_path):
+                self.logger.info(f"{mod_name}: scripted FOMOD with no recorded choices "
+                                 f"-> running installer with preset defaults")
+                return self._install_fomod(mod_name, archive_path, {}, mod_data)
+            return self._install_simple(mod_name, archive_path, mod_data)
         
         except Exception as e:
             self.logger.error(f"Failed to install {mod_name}: {str(e)}")
@@ -510,84 +517,53 @@ class FomodInstaller:
         
         return folder_name
     
-    def _find_mod_root(self, extract_path: Path) -> Path:
-        """
-        Find the actual mod root directory, skipping unnecessary wrapper folders.
-        
-        This mimics Vortex's smart detection that looks for:
-        1. Direct mod content (esp, bsa, meshes, textures, etc.)
-        2. Single subdirectory containing mod content
-        3. Data folder containing mod content
-        """
-        # Gamebryo "stop patterns" -- the top-level Data folders/markers Vortex's
-        # installer uses to recognize a mod root (gameSupport.ts gamebryoPatterns).
-        # Source/meta.ini were ours, not Vortex's, and could anchor the root a level
-        # too deep, so they're dropped.
-        mod_indicators = [
-            "*.esp", "*.esm", "*.esl",  # Plugin files
-            "*.bsa", "*.ba2",           # Archive files
-            "distantlod", "textures", "meshes", "music", "shaders", "video",
-            "interface", "fonts", "scripts", "facegen", "menus", "lodsettings",
-            "lsdata", "sound", "strings", "trees", "asi", "tools", "calientetools",
-            "skse",                     # Data/SKSE/Plugins is valid mod content
-            "nemesis_engine", "pandora_engine",  # behaviour-patch inputs (all .txt)
-            "fomod",
-        ]
-
-        def has_mod_content(path: Path) -> bool:
-            """True if a directory holds recognized mod content. Case-insensitive:
-            archives use arbitrary casing (Textures/textures, Nemesis_Engine) and
-            the install runs on case-insensitive Windows, so match on lowercased
-            entry names rather than exact-case path probes."""
-            if not path.is_dir():
-                return False
-            try:
-                entries = {e.name.lower() for e in path.iterdir()}
-            except OSError:
-                return False
-            for pattern in mod_indicators:
-                if pattern.startswith("*"):
-                    ext = pattern[1:]  # e.g. ".esp" (mod_indicators are lowercase)
-                    if any(n.endswith(ext) for n in entries):
-                        return True
-                elif pattern in entries:
-                    return True
+    def _archive_has_fomod(self, archive_path: Path) -> bool:
+        """True if the archive carries a ``fomod/ModuleConfig.xml`` (a scripted
+        FOMOD). Read from the archive's central directory -- no extraction."""
+        try:
+            return any(
+                n.lower().replace("\\", "/").endswith("fomod/moduleconfig.xml")
+                for n in self.archive_handler.list_archive_contents(archive_path))
+        except Exception:
             return False
-        
-        # Check if extract_path itself has mod content
-        if has_mod_content(extract_path):
-            self.logger.debug(f"Mod root found at extraction root: {extract_path}")
+
+    # Gamebryo "stop patterns" -- the Data-level markers Vortex's basic installer
+    # (ArchiveStructure.FindPathPrefix + gameSupport.ts gamebryoPatterns) uses to
+    # find a mod's real root. Everything ABOVE the first stop marker is a wrapper
+    # and gets stripped -- including a redundant nested ``Data/`` (its child folders
+    # like ``textures`` are the markers, so ``Data/`` itself falls in the prefix).
+    _STOP_FOLDERS = {
+        "distantlod", "textures", "meshes", "music", "shaders", "video", "interface",
+        "fonts", "scripts", "facegen", "menus", "lodsettings", "lsdata", "sound",
+        "strings", "trees", "asi", "tools", "calientetools", "skse", "fomod",
+    }
+    _STOP_EXTS = (".esp", ".esm", ".esl", ".bsa", ".ba2")
+
+    def _find_mod_root(self, extract_path: Path) -> Path:
+        """Find the mod root, stripping any number of leading wrapper folders.
+
+        Faithful port of Vortex's ``ArchiveStructure.FindPathPrefix`` (used by
+        ``BasicModInstall``): the root is the shallowest directory that DIRECTLY
+        contains a Data-level marker -- a content folder (``meshes``/``textures``/
+        ``fomod``/...) or a plugin/archive file (``*.esp``/``*.bsa``/...). This peels
+        ``wrap/wrap/x.esp`` and ``wrap/Data/textures`` in one shot, unlike the old
+        one-level heuristic that left those buried in a Data subfolder.
+        """
+        if not extract_path.is_dir():
             return extract_path
-        
-        # Look for single subdirectory with mod content
-        subdirs = [d for d in extract_path.iterdir() if d.is_dir()]
-        
-        if len(subdirs) == 1:
-            single_subdir = subdirs[0]
-            if has_mod_content(single_subdir):
-                self.logger.debug(f"Mod root found in single subdirectory: {single_subdir}")
-                return single_subdir
-            
-            # Check for Data folder inside single subdirectory
-            data_folder = single_subdir / "Data"
-            if data_folder.exists() and has_mod_content(data_folder):
-                self.logger.debug(f"Mod root found in Data subfolder: {data_folder}")
-                return data_folder
-        
-        # Look for Data folder at extraction root
-        data_folder = extract_path / "Data"
-        if data_folder.exists() and has_mod_content(data_folder):
-            self.logger.debug(f"Mod root found in Data folder: {data_folder}")
-            return data_folder
-        
-        # Look for any subdirectory with mod content
-        for subdir in subdirs:
-            if has_mod_content(subdir):
-                self.logger.debug(f"Mod root found in subdirectory: {subdir}")
-                return subdir
-        
-        # Fallback to extraction path
-        self.logger.warning(f"No clear mod root found, using extraction path: {extract_path}")
+        # Top-down walk returns the shallowest matching dir first; prune macOS junk
+        # and descend deterministically.
+        for dirpath, dirnames, filenames in os.walk(extract_path):
+            dirnames[:] = sorted(d for d in dirnames if not d.lower().startswith("__macosx"))
+            if any(d.lower() in self._STOP_FOLDERS for d in dirnames):
+                self.logger.debug(f"Mod root (content folder) at: {dirpath}")
+                return Path(dirpath)
+            if any(f.lower().endswith(self._STOP_EXTS) for f in filenames):
+                self.logger.debug(f"Mod root (plugin/archive file) at: {dirpath}")
+                return Path(dirpath)
+        # No recognized marker anywhere -- stage from the extraction root (Vortex's
+        # empty-prefix case: nothing to strip).
+        self.logger.warning(f"No stop-pattern marker found; using extraction root: {extract_path}")
         return extract_path
     
     def _mod_container(self, temp_extract: Path) -> Path:

@@ -277,14 +277,53 @@ def _parse_group(group_elem) -> Group:
     return group
 
 
+_XML_DECL_RE = re.compile(r"^\s*<\?xml[^>]*\?>", re.IGNORECASE)
+
+
+def _decode_xml_bytes(data: bytes) -> str:
+    """Decode raw XML bytes, sniffing the real encoding from any BOM (a mod's
+    ModuleConfig.xml often DECLARES one encoding while its bytes are another --
+    e.g. declared UTF-8 but actually UTF-16/cp1252 -- which makes the strict
+    parser reject a perfectly good FOMOD)."""
+    if data[:2] == b"\xff\xfe":
+        return data.decode("utf-16-le", "replace")
+    if data[:2] == b"\xfe\xff":
+        return data.decode("utf-16-be", "replace")
+    if data[:3] == b"\xef\xbb\xbf":
+        return data.decode("utf-8-sig", "replace")
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def _xml_root_from_bytes(data: bytes):
+    """Parse XML bytes, recovering from a wrong/mismatched encoding declaration.
+
+    First try the bytes verbatim (fast path, honors a correct declaration). On a
+    ParseError, sniff the actual encoding, DROP the ``<?xml ... ?>`` declaration
+    (its bogus ``encoding=`` is what made expat reject the file), and re-parse the
+    decoded text. Mirrors Vortex's tolerant reader so a mod isn't lost to the weak
+    simple-install fallback over a cosmetic header issue."""
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError:
+        # _decode_xml_bytes already drops any BOM (utf-8-sig / utf-16 decoders).
+        text = _XML_DECL_RE.sub("", _decode_xml_bytes(data), count=1)
+        return ET.fromstring(text)
+
+
 def parse_moduleconfig(xml_data) -> FomodConfig:
     """Parse ModuleConfig.xml (bytes, str, or path) into a :class:`FomodConfig`."""
     if isinstance(xml_data, (bytes, bytearray)):
-        root = ET.fromstring(xml_data)
+        root = _xml_root_from_bytes(bytes(xml_data))
     elif isinstance(xml_data, str) and "<" in xml_data:
         root = ET.fromstring(xml_data)
     else:
-        root = ET.parse(str(xml_data)).getroot()
+        with open(str(xml_data), "rb") as _fh:
+            root = _xml_root_from_bytes(_fh.read())
 
     config = FomodConfig()
     name_elem = _find(root, "moduleName")
