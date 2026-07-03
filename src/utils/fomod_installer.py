@@ -1914,11 +1914,29 @@ class ParallelFomodInstaller(FomodInstaller):
                         error_message="Downloaded archive not found"
                     )
                 else:
-                    # Check if mod has installation choices
+                    # Decide FOMOD vs simple exactly like install_mod: recorded
+                    # fomod choices, OR any scripted FOMOD (archive carries
+                    # fomod/ModuleConfig.xml) run with preset/required defaults --
+                    # never the simple copy, which buries option folders. List the
+                    # archive index ONCE and derive both the file count and the FOMOD
+                    # marker from it (no extra header read vs the old file-count call).
                     choices = mod_data.get("choices", {})
                     fomod = bool(choices) and choices.get("type") == "fomod"
-                    self._emit_status(mod_name, "extracting", None,
-                                      self._archive_file_count(archive_path),
+                    fomod_choices = choices
+                    try:
+                        names = self.archive_handler.list_archive_contents(archive_path)
+                    except Exception:
+                        names = None
+                    file_count = (sum(1 for x in names if not str(x).endswith("/")) or None) \
+                        if names else None
+                    if not fomod and names and any(
+                            str(n).lower().replace("\\", "/").endswith("fomod/moduleconfig.xml")
+                            for n in names):
+                        fomod = True
+                        fomod_choices = {}
+                        self.logger.info(f"{mod_name}: scripted FOMOD, no recorded choices "
+                                         f"-> running installer with preset defaults")
+                    self._emit_status(mod_name, "extracting", None, file_count,
                                       self.archive_handler.extractor_name(archive_path))
 
                     # Retry the "empty result" race. Tiny mods (a single file, a
@@ -1933,7 +1951,7 @@ class ParallelFomodInstaller(FomodInstaller):
                     # message and fall straight through.
                     for attempt in range(3):
                         if fomod:
-                            result = self._install_fomod(mod_name, archive_path, choices, mod_data)
+                            result = self._install_fomod(mod_name, archive_path, fomod_choices, mod_data)
                         else:
                             result = self._install_simple(mod_name, archive_path, mod_data)
                         msg = (result.error_message or "").lower()
